@@ -70,6 +70,7 @@ enum SettingId {
     kSsao,
     kMotionBlur,
     kAntiAlias,
+    kDlss,
     kDepthOfField,
     kChromaticAberration,
     kBloom,
@@ -160,6 +161,11 @@ Setting g_set[kSettingCount] = {
      "The blur on fast camera and character movement.", false},
     {"anti_alias", "Anti-aliasing", {"On", "Off"}, 0,
      "The game's own AA pass.", false},
+    // NVIDIA DLSS at the render size (host/dlss.cpp): the scene resolved from
+    // jittered frames, in place of the game's AA. Needs an RTX card and
+    // nvngx_dlss.dll beside bbhost.exe; without them it stays off.
+    {"dlss", "DLSS", {"Off", "DLAA"}, 0,
+     "NVIDIA DLSS anti-aliasing at the render resolution, in place of the game's own (RTX cards; nvngx_dlss.dll beside bbhost.exe).", false},
     {"depth_of_field", "Depth of field", {"On", "Off"}, 0,
      "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
     {"chromatic_aberration", "Chromatic aberration", {"On", "Off"}, 0,
@@ -249,6 +255,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSsao},
     {Row::Option, nullptr, kMotionBlur},
     {Row::Option, nullptr, kAntiAlias},
+    {Row::Option, nullptr, kDlss},
     {Row::Option, nullptr, kDepthOfField},
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kBloom},
@@ -599,6 +606,7 @@ void apply(int id) {
         case kSsao:
         case kMotionBlur:
         case kAntiAlias:
+        case kDlss:
         case kDepthOfField:
         case kChromaticAberration:
         case kResolution: {
@@ -722,6 +730,7 @@ void rebuild_settings() {
     h.ssao = on_of(kSsao);
     h.motion_blur = on_of(kMotionBlur);
     h.anti_alias = on_of(kAntiAlias);
+    h.dlss = index_of(kDlss) == 1;
     h.depth_of_field = on_of(kDepthOfField);
     h.chromatic_aberration = on_of(kChromaticAberration);
     h.vignette = on_of(kVignette);

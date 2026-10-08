@@ -141,6 +141,14 @@ bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate. The frame
 cap (30, 60 or higher) is an in-game setting.
 
+On an NVIDIA RTX card the F10 screen's Graphics section has **DLSS**: DLAA,
+NVIDIA's anti-aliasing at the render resolution, in place of the game's own
+(`dlss = "DLAA"` in `bbhost-options.toml`, or `BBHOST_DLSS=1`). It needs
+`nvngx_dlss.dll`, which NVIDIA distributes with its DLSS SDK
+(github.com/NVIDIA/DLSS, `lib/Windows_x86_64/rel`), next to `bbhost.exe`;
+bbhost does not ship it. Without the file, the card or a recent driver the
+log says why and the game's AA stays.
+
 ## Online
 
 bbhost implements the PlayStation Network calls the game makes against a

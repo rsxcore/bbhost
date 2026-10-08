@@ -1076,6 +1076,39 @@ bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, V
 bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, std::uint32_t src_w, std::uint32_t src_h,
                         std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, VkImage dst, VkRect2D area,
                         VkImageView dst_view = VK_NULL_HANDLE);
+// host/dlss.cpp: DLSS as the scene's anti-aliasing (DLAA), run just after
+// YEBIS's velocity pass. The extensions NGX needs, added before the instance
+// and the device are made (the device's once g.instance and g.phys are set).
+void dlss_instance_extensions(std::vector<const char*>& exts);
+void dlss_device_extensions(std::vector<const char*>& exts);
+// A depth target copied into a snapshot (render_copy_target_locked): which
+// depth target the snapshot DLSS reads stands for, and so which one the
+// jitter moves.
+void dlss_note_depth_snapshot_locked(std::uint64_t depth_base, std::uint64_t snapshot_base);
+// The target YEBIS's depth of field composited into this frame (...+111fce32):
+// the scene colour DLSS resolves.
+void dlss_note_scene_colour_locked(std::uint64_t base);
+// The first draw of the motion blur's velocity post-pass (...+abf92450) has
+// read the characters' velocity map, which the second widens in place: DLSS
+// copies it now.
+void dlss_note_velocity_post_locked(RtImage* map);
+// A draw's viewport offset in pixels, when it draws the scene into the depth
+// buffer DLSS reads; false for every other draw.
+bool dlss_jitter_locked(std::uint64_t depth_base, bool depth_test, std::uint32_t prim, std::uint32_t count, float* dx, float* dy);
+// YEBIS's velocity pass (7ea47480+d3c8bb21) was just recorded: its depth
+// snapshot, the characters' velocity map and its 912 constant dwords.
+struct DlssVelocityPass {
+    RtImage* depth_snapshot = nullptr;
+    RtImage* object_velocity = nullptr;
+    const std::uint32_t* constants = nullptr;
+    std::uint32_t constant_dwords = 0;
+    // The same constants as the pass's shader binds them (they reach that
+    // memory on the GPU, so the CPU's view of it can be another frame's):
+    // the binding and the dword they start at. A null buffer: not bound.
+    VkDescriptorBufferInfo constants_binding{};
+    std::uint32_t constants_bias_dw = 0;
+};
+void dlss_after_velocity_locked(const DlssVelocityPass& pass);
 // A CP DMA fill that covers a render target: clear the image instead.
 bool render_clear_by_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t value);
 // A render target whose memory a shader fills with one value: clear the image.

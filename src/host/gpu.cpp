@@ -1500,6 +1500,7 @@ bool init_locked() {
     app.apiVersion = VK_API_VERSION_1_3;
     std::vector<const char*> iext;
     for (const std::string& e : g_instance_exts) iext.push_back(e.c_str());
+    dlss_instance_extensions(iext);  // what NGX needs, when the driver has it (host/dlss.cpp)
     std::vector<const char*> layers;
     if (g_validate) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
@@ -1921,6 +1922,7 @@ bool init_locked() {
             host_log("gpu: bindless asked for, but the device lacks descriptor indexing or push descriptors; off");
         }
     }
+    dlss_device_extensions(dext);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;

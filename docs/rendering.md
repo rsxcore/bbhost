@@ -69,6 +69,65 @@ path at all:
   abstraction layer.
 - Depth snapshots, the on-screen overlay and FSR 1 upscaling are bbhost's
   own.
+- DLSS, as anti-aliasing at the render size (DLAA), below.
+
+## DLSS
+
+DLSS needs what a temporal upscaler always needs: the scene's colour before
+the HUD, its depth, every pixel's motion since the last frame, and a sub-pixel
+jitter that moves the scene a little each frame. The game has three of the
+four. YEBIS's motion blur already takes the colour, the depth snapshot and a
+velocity pass of its own (`7ea47480+d3c8bb21`): it rebuilds each pixel's clip
+position from the depth, reprojects it with a clip-to-previous-clip matrix the
+game hands it every frame, and blends in the characters' velocity map, which
+the scene renderer draws at half size. DLSS runs right after that pass
+(`src/host/dlss.cpp`):
+
+1. motion vectors at the render size, from that pass's own constants
+   (`shaders/dlss_mv.comp`) - the pass without the blur's scale and its clamp.
+   The constants are read on the GPU from the pass's own binding: they come
+   in a dynamic buffer whose bytes are copied into place by the GPU just
+   before the pass, so what the CPU sees at that address when the command
+   processor gets there can be an earlier frame's - in real time, now and
+   then, and the picture combed wherever the motion was a frame out;
+2. DLSS on the scene colour (depth of field already composited into it), the
+   depth snapshot and those vectors;
+3. its colour copied back over the scene colour, keeping the alpha the blur
+   reads (`shaders/dlss_merge.comp`). Motion blur, bloom, the tone map and the
+   HUD then run on it as on the game's own.
+
+The jitter is the fourth: a Halton (2, 3) viewport offset on every draw of the
+scene into the depth buffer DLSS reads. Full-screen passes keep their
+viewport, since they read the jittered buffers pixel for pixel, and so does
+the HUD, which draws without a depth test. The game's own AA pass is off while
+DLSS runs.
+
+Three things in the game's data had to be taken care of. The pass's motion
+points the other way from where the picture goes - turning, the scene moves
+31 pixels a frame to the left where it says 31 to the right; a blur does not
+mind, DLSS took its history from the wrong side, and the picture shook while
+moving and for a while after. The reprojection matrix is built in single
+precision from world positions in the thousands, and a still camera's has
+2^-11 where the identity has 0 - a third of a pixel's motion every frame,
+which DLSS followed until the picture drifted soft - so a matrix within two
+ulps of the identity in every entry is taken as the identity; whole, because
+the camera eases in for two seconds after the player stops, and while it does
+some entries are that small and real. And the velocity map has 8 bits a
+component - a step is 4.5 pixels at 1280 wide, and rest is 127 where 127.5
+would be zero - so a character takes the camera's exact motion wherever the
+map agrees with it to within a step, and the map's own only where it really
+moved.
+
+NGX itself is loaded at run time: its core is the driver's `_nvngx.dll`, which
+exports the API by name, so bbhost has declarations of its own for the calls
+and structures it uses and links no NVIDIA code. The core's own entry points
+are not always the SDK's wrappers (its `Init_ProjectID` takes no loader entry
+points and the version before the common info), and its parameter maps are
+MSVC C++ objects whose methods are called through the vtable in MSVC's order,
+checked with a value written and read back before anything else.
+
+Upscaling - a scene rendered smaller than the post-processing and the HUD -
+is the next step: the engine renders everything at one size today.
 
 ## Native or emulated
 

@@ -1,0 +1,30 @@
+#version 460
+// DLSS's result made ready to go back into the scene colour (host/dlss.cpp):
+// the colour from DLSS, the alpha the scene had - YEBIS's motion blur reads a
+// weight there that DLSS does not carry. Mode 1 shows the motion vectors
+// instead (BBHOST_DLSS_DEBUG=mv): red and green their size, x and y.
+//
+// Compiled offline (tools/build_shaders.sh) into dlss_merge.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D scene;
+layout(set = 0, binding = 1) uniform texture2D motion;
+layout(set = 0, binding = 2) uniform sampler point_clamp;
+layout(set = 0, binding = 3, rgba16f) uniform image2D result;
+
+layout(push_constant) uniform Params {
+    uvec2 size;
+    uint mode;
+};
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(size.x) || xy.y >= int(size.y)) return;
+    const float alpha = texelFetch(sampler2D(scene, point_clamp), xy, 0).a;
+    vec3 rgb = imageLoad(result, xy).rgb;
+    if (mode == 1u) {
+        const vec2 mv = texelFetch(sampler2D(motion, point_clamp), xy, 0).xy;
+        rgb = vec3(abs(mv) * 0.25, mv.x < 0.0 || mv.y < 0.0 ? 0.25 : 0.0);
+    }
+    imageStore(result, xy, vec4(rgb, alpha));
+}
