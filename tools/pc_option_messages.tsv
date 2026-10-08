@@ -78,6 +78,7 @@
 117035	1280x800 (16:10)
 117036	960x600 (16:10, upscaled)
 117037	1024x640 (16:10, upscaled)
+117038	800x600 (4:3, upscaled)
 118000	Mouse Camera	The mouse turns the camera outside menus.
 118004	Field of View	How wide the camera sees. 0 is the game's own; each step widens it 5%.
 118001	Camera Sensitivity	How fast the mouse turns the camera.

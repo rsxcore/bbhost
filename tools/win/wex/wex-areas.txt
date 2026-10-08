@@ -1,0 +1,4 @@
+# Wex: the areas an invader's sign is sent to. bbhost adds every area it sees (either instance).
+# AreaId AreaRegionId PosX PosY PosZ   # map. A line starting with # is not visited (the blocklist).
+402718720 241010 -197 -28 68   # m24_01
+436207616 260000 -56 974 18   # m26_00

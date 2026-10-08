@@ -140,7 +140,7 @@ Fetch fetch(const std::string& url, bool binary, int timeout_ms) {
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
 #if defined(_WIN32)
-    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT));
+    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT | CURLSSLOPT_NATIVE_CA));
 #endif
     const CURLcode rc = curl_easy_perform(c);
     if (rc != CURLE_OK) r.error = curl_easy_strerror(rc);

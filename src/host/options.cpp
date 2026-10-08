@@ -201,7 +201,7 @@ Setting g_set[kSettingCount] = {
     // (pixel-bound at 1280x800, ~45), and the presenter upscales by FSR 1.
     {"resolution", "Resolution", {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800",
                                   "3840x2160", "2560x1080", "3440x1440", "5120x2160", "3840x1080",
-                                  "5120x1440", "1280x800", "960x600", "1024x640"}, 2,
+                                  "5120x1440", "1280x800", "960x600", "1024x640", "800x600"}, 2,
      "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
      "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
      true},
