@@ -27,12 +27,30 @@ layout(set = 0, binding = 4, std430) readonly buffer Constants {
     uint c[];
 };
 
+// The scene's camera, this frame's and the last one's (host/dlss.cpp copies
+// them from the scene constants every G-buffer draw reads: the dwords from
+// 180, so the camera's position is at 3, 7 and 11 and the camera-relative
+// view-projection's rows at 20..35).
+layout(set = 0, binding = 5, std430) readonly buffer Camera {
+    float cam[];
+};
+
 layout(push_constant) uniform Params {
     uvec2 size;
-    uint bias;  // the dword where they start in the binding (StageParams::cb_bias_dw)
+    uint bias;    // the dword where the pass's constants start in their binding (StageParams::cb_bias_dw)
+    uint use_camera;  // 1: reproject from the camera (cur, prev); 0: by the pass's own matrix
+    uint cur, prev;  // the two frames' camera blocks, in floats
 };
 
 float k(uint i) { return uintBitsToFloat(c[bias + i]); }
+
+mat4 view_projection(uint at) {
+    // Rows in the block, so transposed into GLSL's columns.
+    return transpose(mat4(cam[at + 20u], cam[at + 21u], cam[at + 22u], cam[at + 23u], cam[at + 24u], cam[at + 25u], cam[at + 26u],
+                          cam[at + 27u], cam[at + 28u], cam[at + 29u], cam[at + 30u], cam[at + 31u], cam[at + 32u], cam[at + 33u],
+                          cam[at + 34u], cam[at + 35u]));
+}
+vec3 position(uint at) { return vec3(cam[at + 3u], cam[at + 7u], cam[at + 11u]); }
 
 void main() {
     const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
@@ -67,7 +85,24 @@ void main() {
     const float w = -view_k.y / (d * view_k.z - view_k.x);
     const vec4 p = vec4(ndc * w, d * w, w);
     const vec4 q = vec4(dot(reproject[0], p), dot(reproject[1], p), dot(reproject[2], p), dot(reproject[3], p));
-    const vec2 camera = q.xy / max(q.w, 0.0009765625) - ndc;
+    vec2 camera = q.xy / max(q.w, 0.0009765625) - ndc;
+    if (use_camera == 1u) {
+        // The pass's matrix is the game's prevVP * inverse(VP) made in single
+        // precision from world positions in the thousands: frame to frame it
+        // moves a far point by several pixels either way while the camera
+        // turns steadily (measured: the best correction to it jumped -7..+5
+        // px from one frame to the next), which only a blur forgives. The
+        // scene draws are camera-relative - clip = VP * (world - camera) -
+        // so the same reprojection made from the two frames' VP and the
+        // camera's move between them (nearly equal floats: their difference
+        // is exact) has no large number left in it.
+        const vec4 h = inverse(view_projection(cur)) * vec4(ndc, z, 1.0);
+        const vec3 rel = h.xyz / h.w + (position(cur) - position(prev));
+        const vec4 cp = view_projection(prev) * vec4(rel, 1.0);
+        // In the pass's own sense of direction (the opposite of where the
+        // surface was: see the store below), like the velocity map's.
+        camera = ndc - cp.xy / cp.w;
+    }
     const vec4 o = textureLod(sampler2D(object_velocity, linear_clamp), uv, 0.0);
     // The map holds 8 bits a component: a step is 4.5 pixels at 1280 wide,
     // and rest is 127 where 127.5 would be zero. So a character takes the

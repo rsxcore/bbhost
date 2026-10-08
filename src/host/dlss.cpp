@@ -209,8 +209,13 @@ struct Pass {
 
 struct MvPush {
     std::uint32_t width, height;
-    std::uint32_t bias;  // the dword the pass's constants start at in their binding
+    std::uint32_t bias;        // the dword the pass's constants start at in their binding
+    std::uint32_t use_camera;  // reproject from the two frames' cameras rather than the pass's matrix
+    std::uint32_t cur, prev;   // their blocks in the camera ring, in floats
 };
+// The scene constants' dwords copied each frame: 180..215, the camera's
+// position at 183, 187, 191 and the camera-relative view-projection at 200.
+constexpr std::uint32_t kCameraFirstDw = 180, kCameraDwords = 36;
 struct MergePush {
     std::uint32_t width, height, mode;
 };
@@ -252,6 +257,13 @@ struct Dlss {
     std::uint32_t raw_width = 0, raw_height = 0;
     VkFormat raw_format = VK_FORMAT_UNDEFINED;
     bool raw_valid = false;
+    // The scene's camera, copied on the GPU from the first G-buffer draw's
+    // constants each frame into one of two blocks: `camera_now` says this
+    // frame's is there (in block camera_block), `camera_last` that the frame
+    // before's is in the other.
+    DevBuffer camera;
+    std::uint32_t camera_block = 0;
+    bool camera_now = false, camera_last = false;
     Pass mv, merge;
     VkSampler linear = VK_NULL_HANDLE, point = VK_NULL_HANDLE;
 
@@ -473,7 +485,7 @@ bool make_image(Image& im, VkFormat format, std::uint32_t w, std::uint32_t h) {
 // Three sampled or sampler bindings and a storage image, a push block.
 bool make_pass(Pass& p, const std::uint32_t* code, std::size_t bytes, const VkDescriptorType* types, std::uint32_t n,
                std::uint32_t push_bytes) {
-    VkDescriptorSetLayoutBinding binds[5] = {};
+    VkDescriptorSetLayoutBinding binds[6] = {};
     for (std::uint32_t i = 0; i < n; ++i) binds[i] = {i, types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     sli.bindingCount = n;
@@ -569,9 +581,13 @@ bool ngx_init_locked() {
         host_log("dlss: NGX gave no parameter map");
         return false;
     }
-    static const VkDescriptorType mv_types[5] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER,
-                                                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    if (!make_pass(g_dlss.mv, k_dlss_mv_spv, sizeof(k_dlss_mv_spv), mv_types, 5, sizeof(MvPush)) ||
+    static const VkDescriptorType mv_types[6] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER,
+                                                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    if (!create_dev_buffer(g_dlss.camera, 2 * kCameraDwords * 4, false)) {
+        host_log("dlss: no memory for the camera blocks");
+        return false;
+    }
+    if (!make_pass(g_dlss.mv, k_dlss_mv_spv, sizeof(k_dlss_mv_spv), mv_types, 6, sizeof(MvPush)) ||
         !make_pass(g_dlss.merge, k_dlss_merge_spv, sizeof(k_dlss_merge_spv), mv_types, 4, sizeof(MergePush))) {
         host_log("dlss: its own passes could not be made");
         return false;
@@ -802,6 +818,28 @@ void dlss_note_velocity_post_locked(RtImage* map) {
     g_dlss.raw_valid = true;
 }
 
+bool dlss_wants_camera_locked(std::uint64_t depth_base) {
+    return g_dlss.ok && !g_dlss.camera_now && depth_base && depth_base == g_dlss.scene_depth && g_dlss.camera.buffer;
+}
+
+void dlss_note_camera_locked(const VkDescriptorBufferInfo& binding, std::uint32_t bias_dw) {
+    const VkDeviceSize from = binding.offset + (static_cast<VkDeviceSize>(bias_dw) + kCameraFirstDw) * 4;
+    if (!binding.buffer || (binding.range != VK_WHOLE_SIZE && binding.range < (static_cast<VkDeviceSize>(bias_dw) + kCameraFirstDw + kCameraDwords) * 4)) {
+        return;
+    }
+    // A copy cannot be recorded inside the pass the draw is in; the next draw opens another.
+    begin_recording_locked();
+    render_end_pass_locked();
+    VkCommandBuffer cmd = g_cmd();
+    barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const VkBufferCopy region{from, static_cast<VkDeviceSize>(g_dlss.camera_block) * kCameraDwords * 4, kCameraDwords * 4};
+    vkCmdCopyBuffer(cmd, binding.buffer, g_dlss.camera.buffer, 1, &region);
+    barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    g_dlss.camera_now = true;
+}
+
 bool dlss_jitter_locked(std::uint64_t depth_base, bool depth_test, std::uint32_t prim, std::uint32_t count, float* dx, float* dy) {
     if (!g_dlss.ok || !depth_base || depth_base != g_dlss.scene_depth || !depth_test) return false;
     if (prim == 6 && count <= 4) return false;  // a full-screen strip: it reads the scene pixel for pixel
@@ -886,7 +924,14 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
     if (!cb.buffer || (cb.range != VK_WHOLE_SIZE && cb.range < (static_cast<VkDeviceSize>(in.constants_bias_dw) + 912) * 4)) {
         return skip("its constants are not bound as a buffer");
     }
-    const MvPush mp{w, h, in.constants_bias_dw};
+    // From the two frames' cameras when both were caught, else the pass's own matrix.
+    const bool by_camera = g_dlss.camera_now && g_dlss.camera_last;
+    const MvPush mp{w, h, in.constants_bias_dw, by_camera ? 1u : 0u, g_dlss.camera_block * kCameraDwords,
+                    (g_dlss.camera_block ^ 1u) * kCameraDwords};
+    // The next frame's goes in the other block; this one is then the last.
+    g_dlss.camera_last = g_dlss.camera_now;
+    if (g_dlss.camera_now) g_dlss.camera_block ^= 1u;
+    g_dlss.camera_now = false;
     const VkDescriptorSet mv_set = alloc_set_locked(g_dlss.mv.set_layout);
     if (!write_set(mv_set, in.depth_snapshot->view, raw_velocity ? g_dlss.raw_velocity.view : in.object_velocity->view, g_dlss.linear,
                    g_dlss.motion.view)) {
@@ -899,6 +944,10 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
         wb.descriptorCount = 1;
         wb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         wb.pBufferInfo = &cb;
+        vkUpdateDescriptorSets(g.device, 1, &wb, 0, nullptr);
+        const VkDescriptorBufferInfo ci{g_dlss.camera.buffer, 0, 2 * kCameraDwords * 4};
+        wb.dstBinding = 5;
+        wb.pBufferInfo = &ci;
         vkUpdateDescriptorSets(g.device, 1, &wb, 0, nullptr);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.mv.pipeline);

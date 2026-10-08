@@ -1092,6 +1092,11 @@ void dlss_note_scene_colour_locked(std::uint64_t base);
 // read the characters' velocity map, which the second widens in place: DLSS
 // copies it now.
 void dlss_note_velocity_post_locked(RtImage* map);
+// A draw into the scene's depth that reads the scene constants (the camera:
+// its position and camera-relative view-projection): whether DLSS still wants
+// this frame's, and the binding to copy them from.
+bool dlss_wants_camera_locked(std::uint64_t depth_base);
+void dlss_note_camera_locked(const VkDescriptorBufferInfo& binding, std::uint32_t bias_dw);
 // A draw's viewport offset in pixels, when it draws the scene into the depth
 // buffer DLSS reads; false for every other draw.
 bool dlss_jitter_locked(std::uint64_t depth_base, bool depth_test, std::uint32_t prim, std::uint32_t count, float* dx, float* dy);

@@ -251,6 +251,10 @@ struct GfxPipeline {
     // blur's velocity post-pass (...+abf92450), whose first draw has read the
     // velocity map it then widens. 0 the rest.
     std::int8_t dlss_role = -1;
+    // Which of the vertex stage's buffers is the scene constants block (the
+    // camera DLSS reprojects with): user_sgpr[6]->load(+16), 216 dwords;
+    // -1 none, -2 not looked at yet.
+    std::int8_t dlss_scene_cb = -2;
     // The optimized relink, queued at the pipeline's first draw
     // (queue_library_relink): its libraries, and the vertex library's
     // specialization - the elements' formats, the state it was made with.
@@ -12858,6 +12862,23 @@ static bool draw_impl(const GpuDraw& d) {
                                                                             : 0;
     }
     if (pl.dlss_role == 1 && s.color[0]) dlss_note_scene_colour_locked(s.color[0]->base);
+    if (pl.dlss_scene_cb == -2) {
+        pl.dlss_scene_cb = -1;
+        const gcn::TranslateResult& vm = pl.vs.meta();
+        for (std::size_t i = 0; i < vm.buffers.size() && i < 16; ++i) {
+            const gcn::BufferBinding& b = vm.buffers[i];
+            if (!b.pointer && b.max_dw >= 216 && b.path.user_sgpr == 6 && b.path.loads.empty() && !b.path.immediate &&
+                b.path.final_offset_dw == 4 && !b.path.final_vsharp) {
+                pl.dlss_scene_cb = static_cast<std::int8_t>(i);
+            }
+        }
+    }
+    if (pl.dlss_scene_cb >= 0 && s.depth && dlss_wants_camera_locked(s.depth->base)) {
+        const std::size_t i = static_cast<std::size_t>(pl.dlss_scene_cb);
+        if ((stage_params[0].cb_valid >> i & 1) && stage_first_buffer[0] + i < buffer_infos.size()) {
+            dlss_note_camera_locked(buffer_infos[stage_first_buffer[0] + i], stage_params[0].cb_bias_dw[i]);
+        }
+    }
     if (pl.dlss_role == 3 && !pl.ps.meta().images.empty()) {
         std::uint32_t tw[8] = {};
         if (resolve_resource_impl(pl.ps.meta().images[0].path, s.ps_user, 8, tw)) dlss_note_velocity_post_locked(find_render_target(tsharp_base(tw)));
