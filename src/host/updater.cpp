@@ -43,15 +43,15 @@ namespace fs = std::filesystem;
 // release's SHA256SUMS in the release workflow (the RELEASE_SIGNING_KEY
 // secret); nothing it did not sign is ever installed.
 constexpr std::uint8_t kReleaseKey[32] = {
-    0xce, 0x83, 0x68, 0x4e, 0xe9, 0x4e, 0xc4, 0xb9, 0xc9, 0x1c, 0xf6, 0x24, 0x7a, 0x23, 0xd0, 0x8f,
-    0x50, 0x1c, 0xdd, 0x7a, 0x19, 0x73, 0x3c, 0x83, 0x48, 0xca, 0x3e, 0xd6, 0xae, 0xa7, 0xad, 0x62,
+    0x6e, 0xff, 0x8b, 0x6f, 0x3b, 0xcb, 0x3f, 0x3e, 0x13, 0x02, 0x83, 0x7a, 0x57, 0x77, 0x28, 0x6c,
+    0x13, 0x52, 0x75, 0x13, 0x21, 0xc3, 0x38, 0xa7, 0x28, 0xcb, 0x48, 0xe2, 0x4c, 0x7f, 0x9f, 0xeb,
 };
 }  // namespace
 
 const std::uint8_t* release_key() { return kReleaseKey; }
 
 namespace {
-constexpr const char* kDefaultSource = "https://api.github.com/repos/droogie/bbhost/releases/latest";
+constexpr const char* kDefaultSource = "https://api.github.com/repos/rsxcore/bbhost/releases/latest";
 constexpr std::size_t kMaxDownload = 256u << 20;
 
 struct Release {
@@ -389,6 +389,16 @@ void fetch_plugins_thread(std::string dir) {
 }
 
 const char* current_version() { return BBHOST_VERSION; }
+
+bool download(const std::string& url, int timeout_ms, std::string& body, std::string& error) {
+    Fetch f = fetch(url, true, timeout_ms);
+    if (!f.ok()) {
+        error = f.error.empty() ? "HTTP " + std::to_string(f.status) : f.error;
+        return false;
+    }
+    body = std::move(f.body);
+    return true;
+}
 
 void fetch_plugins(const std::string& dir) {
     if (g_plugins_busy.exchange(true)) return;

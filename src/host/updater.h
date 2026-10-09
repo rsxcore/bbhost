@@ -55,6 +55,11 @@ void fetch_plugins(const std::string& dir);
 std::string plugins_status();
 bool plugins_busy();
 
+// A GET of a file of at most 256 MiB into `body` (no token goes with it but to
+// api.github.com): false, with `error` saying why, unless it came back 200.
+// host/dlss.cpp fetches NVIDIA's DLSS library with it.
+bool download(const std::string& url, int timeout_ms, std::string& body, std::string& error);
+
 // The pieces, for tests (tests/updater_test.cpp).
 // "v1.2.3..." -> 1, 2, 3; false when it does not start that way.
 bool parse_version(const std::string& v, int out[3]);
