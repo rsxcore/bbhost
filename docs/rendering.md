@@ -83,13 +83,26 @@ game hands it every frame, and blends in the characters' velocity map, which
 the scene renderer draws at half size. DLSS runs right after that pass
 (`src/host/dlss.cpp`):
 
-1. motion vectors at the render size, from that pass's own constants
-   (`shaders/dlss_mv.comp`) - the pass without the blur's scale and its clamp.
-   The constants are read on the GPU from the pass's own binding: they come
-   in a dynamic buffer whose bytes are copied into place by the GPU just
-   before the pass, so what the CPU sees at that address when the command
-   processor gets there can be an earlier frame's - in real time, now and
-   then, and the picture combed wherever the motion was a frame out;
+1. motion vectors at the render size (`shaders/dlss_mv.comp`): each pixel's
+   clip position rebuilt from the depth snapshot with that pass's own
+   constants, reprojected by the scene's camera, and the characters' velocity
+   map blended over it. The camera is the scene constants every G-buffer draw
+   reads - its position (dwords 183, 187, 191) and the camera-relative
+   view-projection (200..215), since the scene draws `VP * (world - camera)` -
+   copied on the GPU from the first such draw's binding each frame. The
+   pass's own clip-to-previous-clip matrix is no good to DLSS: the game makes
+   it in single precision from world positions in the thousands, and while
+   the camera turned steadily the shift that best matched one frame to the
+   next was 4.2 pixels away from it on average, -7 to +5 from one frame to
+   the next - a blur forgives that, DLSS laid its history that far off and the
+   picture smeared and combed in motion. From the two frames' VP and the
+   camera's move between them (nearly equal floats, whose difference is
+   exact) the vectors are within a quarter of a pixel of the best match on
+   every frame of a turn or a walk. The pass's matrix is the fallback for a
+   frame whose camera was not caught. Everything is read on the GPU, from the
+   bindings the game's own draws use: those constants come in dynamic
+   buffers the GPU copies into place just before the draw, so the CPU's view
+   of that memory can be an earlier frame's;
 2. DLSS on the scene colour (depth of field already composited into it), the
    depth snapshot and those vectors;
 3. its colour copied back over the scene colour, keeping the alpha the blur
@@ -102,16 +115,14 @@ viewport, since they read the jittered buffers pixel for pixel, and so does
 the HUD, which draws without a depth test. The game's own AA pass is off while
 DLSS runs.
 
-Three things in the game's data had to be taken care of. The pass's motion
-points the other way from where the picture goes - turning, the scene moves
+Three more things in the game's data had to be taken care of. The pass's
+motion points the other way from where the picture goes - turning, the scene moves
 31 pixels a frame to the left where it says 31 to the right; a blur does not
 mind, DLSS took its history from the wrong side, and the picture shook while
-moving and for a while after. The reprojection matrix is built in single
-precision from world positions in the thousands, and a still camera's has
-2^-11 where the identity has 0 - a third of a pixel's motion every frame,
-which DLSS followed until the picture drifted soft - so a matrix within two
-ulps of the identity in every entry is taken as the identity; whole, because
-the camera eases in for two seconds after the player stops, and while it does
+moving and for a while after. The pass's matrix (the fallback) is noisy even
+for a still camera - 2^-11 where the identity has 0, a third of a pixel every
+frame - so one within two ulps of the identity in every entry is taken as the
+identity; whole, because while the camera eases in after the player stops
 some entries are that small and real. And the velocity map has 8 bits a
 component - a step is 4.5 pixels at 1280 wide, and rest is 127 where 127.5
 would be zero - so a character takes the camera's exact motion wherever the
