@@ -32,8 +32,8 @@
 // NVIDIA's SDK links does no more than find it and forward. So bbhost loads
 // it at run time, with declarations of its own for the handful of calls and
 // structures it uses, and links no NVIDIA code. The DLSS model itself,
-// nvngx_dlss.dll, comes from NVIDIA's SDK or the driver's own updates; it
-// goes next to bbhost.exe. NGX's parameter maps are C++ objects built by
+// nvngx_dlss.dll, comes from NVIDIA's SDK repository, downloaded the first
+// time DLSS is wanted (library_ready below); it goes next to bbhost.exe. NGX's parameter maps are C++ objects built by
 // MSVC, so their methods are called through the vtable in MSVC's order
 // (overloads reversed), checked once with a value written and read back.
 //
@@ -43,6 +43,8 @@
 #include "host/gpu_internal.h"
 #include "host/options.h"
 #include "host/settings.h"
+#include "host/updater.h"
+#include "core/sha256.h"
 #include "host/shaders/dlss_merge.spv.h"
 #include "host/shaders/dlss_mv.spv.h"
 #include "core/config.h"
@@ -54,8 +56,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -294,6 +299,73 @@ const std::wstring& feature_dir() {
 const wchar_t* const* feature_paths() {
     static const wchar_t* paths[1] = {feature_dir().c_str()};
     return paths;
+}
+
+// nvngx_dlss.dll, which NVIDIA's license does not let bbhost ship, fetched
+// from NVIDIA's own DLSS SDK repository the first time DLSS is wanted on an
+// NVIDIA card, pinned to one SDK release and its SHA-256 (as
+// tools/win/get-dlss.ps1 does by hand), and kept beside bbhost.exe only when
+// the hash matches. 0 not looked at, 1 there, 2 downloading, 3 failed.
+constexpr const char* kDlssUrl = "https://raw.githubusercontent.com/NVIDIA/DLSS/v310.9.1/lib/Windows_x86_64/rel/nvngx_dlss.dll";
+constexpr const char* kDlssSha256 = "3975567b8943c53acce397f2b72380092f84f162d00b0d2c7d08a1025c563983";
+std::atomic<int> g_library{0};
+
+bool library_ready() {
+    int st = g_library.load();
+    if (st == 1) return true;
+    if (st == 2 || st == 3) return false;
+    const std::filesystem::path dest = std::filesystem::path(config_exe_dir()) / "nvngx_dlss.dll";
+    std::error_code ec;
+    if (std::filesystem::exists(dest, ec)) {
+        g_library.store(1);
+        return true;
+    }
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    if (props.vendorID != 0x10de) {  // DLSS runs on NVIDIA cards only: nothing to fetch it for
+        g_library.store(3);
+        host_log("dlss: not an NVIDIA card (vendor 0x%04x): DLSS stays off", props.vendorID);
+        return false;
+    }
+    g_library.store(2);
+    host_log("dlss: nvngx_dlss.dll is not beside bbhost.exe; downloading NVIDIA DLSS v310.9.1 from %s "
+             "(NVIDIA's license: https://github.com/NVIDIA/DLSS/blob/v310.9.1/LICENSE.txt)", kDlssUrl);
+    std::thread([dest] {
+        std::string body, error;
+        if (!updater::download(kDlssUrl, 300000, body, error)) {
+            host_log("dlss: the download failed (%s); get-dlss.bat beside bbhost.exe tries again", error.c_str());
+            g_library.store(3);
+            return;
+        }
+        const std::string got = sha256_hex(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+        if (got != kDlssSha256) {
+            host_log("dlss: the download's SHA-256 is %s, not %s: not kept", got.c_str(), kDlssSha256);
+            g_library.store(3);
+            return;
+        }
+        std::filesystem::path tmp = dest;
+        tmp += ".download";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out.write(body.data(), static_cast<std::streamsize>(body.size()));
+            if (!out) {
+                host_log("dlss: could not write %s", tmp.string().c_str());
+                g_library.store(3);
+                return;
+            }
+        }
+        std::error_code e;
+        std::filesystem::rename(tmp, dest, e);
+        if (e) {
+            std::filesystem::remove(tmp, e);
+            host_log("dlss: could not put nvngx_dlss.dll beside bbhost.exe");
+            g_library.store(3);
+            return;
+        }
+        host_log("dlss: nvngx_dlss.dll downloaded (%zu bytes, SHA-256 checked)", body.size());
+        g_library.store(1);
+    }).detach();
+    return false;
 }
 
 void log_callback(const char* message, int, int) {
@@ -759,15 +831,24 @@ void dlss_device_extensions(std::vector<const char*>& exts) {
     const ngx::FeatureDiscoveryInfo d = discovery(&info);
     std::uint32_t n = 0;
     VkExtensionProperties* want = nullptr;
+    // Without nvngx_dlss.dll NGX cannot say (the first run, before it is
+    // downloaded): the device then gets what NGX has asked for each time it
+    // could, so the library the download brings works in this very run.
+    static VkExtensionProperties known[3] = {};
     if (!ngx::ok(g_dlss.device_extensions(g.instance, g.phys, &d, &n, &want))) {
-        host_log("dlss: NGX did not say which device extensions it needs");
-        return;
+        std::snprintf(known[0].extensionName, sizeof(known[0].extensionName), "VK_NVX_binary_import");
+        std::snprintf(known[1].extensionName, sizeof(known[1].extensionName), "VK_NVX_image_view_handle");
+        std::snprintf(known[2].extensionName, sizeof(known[2].extensionName), "VK_KHR_buffer_device_address");
+        want = known;
+        n = 3;
+        host_log("dlss: NGX did not say which device extensions it needs: the ones it asks for with its library");
     }
     std::uint32_t count = 0;
     vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> available(count);
     vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &count, available.data());
     g_dlss.extensions_ok = add_extensions(exts, want, n, available, "device");
+    if (wanted()) library_ready();  // the download, if one is needed, starts now: it is done by the time the game is
 }
 
 void dlss_note_depth_snapshot_locked(std::uint64_t depth_base, std::uint64_t snapshot_base) {
@@ -854,6 +935,11 @@ bool dlss_jitter_locked(std::uint64_t depth_base, bool depth_test, std::uint32_t
 
 void dlss_after_velocity_locked(const DlssVelocityPass& in) {
     if (!wanted()) {
+        g_dlss.scene_colour = 0;
+        return;
+    }
+    // Not until NVIDIA's library is there (fetched in the background the first time).
+    if (!g_dlss.tried && !library_ready()) {
         g_dlss.scene_colour = 0;
         return;
     }

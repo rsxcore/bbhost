@@ -41,7 +41,7 @@ bbhost for Windows, build $name
 bbhost runs Bloodborne on PC: the game's own 1.09 executable, its calls into
 the PS4's system libraries answered by bbhost and its graphics recompiled for
 Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE.txt); the
-source is at https://github.com/droogie/bbhost.
+source is at https://github.com/rsxcore/bbhost.
 
 You need
   - Your own copy of Bloodborne, dumped from your own PS4 - nothing from the
@@ -79,9 +79,10 @@ Start the game
 DLSS (NVIDIA RTX cards)
   F10 > Graphics > DLSS swaps the game's anti-aliasing for NVIDIA's DLAA. It
   needs nvngx_dlss.dll beside bbhost.exe, which NVIDIA's license does not let
-  bbhost ship: double-click get-dlss.bat once and it downloads it from
-  NVIDIA's own DLSS repository (github.com/NVIDIA/DLSS), checks its SHA-256
-  and puts it here.
+  bbhost ship: the first time DLSS is on, bbhost downloads it from NVIDIA's
+  own DLSS repository (github.com/NVIDIA/DLSS), checks its SHA-256 and puts it
+  here. get-dlss.bat does the same by hand (with no internet in the game, for
+  instance).
 
   When Windows Defender Firewall asks whether bbhost may communicate on
   networks, tick Private and Public and click Allow access: other players

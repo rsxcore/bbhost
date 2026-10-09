@@ -165,7 +165,7 @@ Setting g_set[kSettingCount] = {
     // jittered frames, in place of the game's AA. Needs an RTX card and
     // nvngx_dlss.dll beside bbhost.exe; without them it stays off.
     {"dlss", "DLSS", {"Off", "DLAA"}, 0,
-     "NVIDIA DLSS anti-aliasing at the render resolution, in place of the game's own (RTX cards; nvngx_dlss.dll beside bbhost.exe: get-dlss.bat downloads it).", false},
+     "NVIDIA DLSS anti-aliasing at the render resolution, in place of the game's own (RTX cards; NVIDIA's nvngx_dlss.dll is downloaded from NVIDIA the first time).", false},
     {"depth_of_field", "Depth of field", {"On", "Off"}, 0,
      "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
     {"chromatic_aberration", "Chromatic aberration", {"On", "Off"}, 0,
