@@ -12,14 +12,20 @@
 #include "bbhost_version.h"
 #include "host/plugins.h"
 #include "net/account.h"
+#include "engine/summon_invite.h"
+#include "replay/json.h"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #if !defined(_WIN32)
@@ -259,9 +265,379 @@ const int g_http_delay_ms = [] {
     return e ? std::atoi(e) : 0;
 }();
 
+// BBHOST_HTTP_TRACE (reverse engineering the game's server traffic): every
+// request logged, not just the first 24, and each one's request and response
+// bodies written to <dir>/NNNN-METHOD-<path>.req and .resp. "1" means the
+// folder http-trace beside the working directory; anything else names it.
+const std::string g_http_trace_dir = [] {
+    const char* e = std::getenv("BBHOST_HTTP_TRACE");
+    if (!e || !*e || std::strcmp(e, "0") == 0) return std::string();
+    return std::strcmp(e, "1") == 0 ? std::string("http-trace") : std::string(e);
+}();
+
+void trace_bodies(int seq, const char* method, const std::string& url, const std::vector<std::uint8_t>& post,
+                  const std::vector<std::uint8_t>& body) {
+    static const bool ready = [] {
+        std::error_code ec;
+        std::filesystem::create_directories(g_http_trace_dir, ec);
+        if (ec) {
+            host_log("http: BBHOST_HTTP_TRACE: cannot create %s (%s); no bodies written", g_http_trace_dir.c_str(),
+                     ec.message().c_str());
+            return false;
+        }
+        host_log("http: writing every request's bodies to %s",
+                 std::filesystem::absolute(g_http_trace_dir, ec).string().c_str());
+        return true;
+    }();
+    if (!ready) return;
+    // The URL's path, past the host, as a file name: /frpg2/ss/x.spd -> frpg2_ss_x.spd.
+    std::size_t p = url.find("://");
+    p = url.find('/', p == std::string::npos ? 0 : p + 3);
+    std::string name = p == std::string::npos ? std::string("root") : url.substr(p + 1);
+    if (std::size_t q = name.find('?'); q != std::string::npos) name.resize(q);
+    for (char& ch : name) {
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '.' && ch != '-') ch = '_';
+    }
+    if (name.size() > 80) name.resize(80);
+    char prefix[32];
+    std::snprintf(prefix, sizeof(prefix), "%04d-%s-", seq, method);
+    const std::filesystem::path base = std::filesystem::path(g_http_trace_dir) / (prefix + name);
+    auto write = [](const std::filesystem::path& path, const std::vector<std::uint8_t>& data) {
+        if (std::FILE* f = std::fopen(path.string().c_str(), "wb")) {
+            if (!data.empty()) std::fwrite(data.data(), 1, data.size(), f);
+            std::fclose(f);
+        }
+    };
+    write(base.string() + ".req", post);
+    write(base.string() + ".resp", body);
+}
+
+// BBHOST_INVADE_AREA (experiment: invading another area, as DS3's Wex Dust
+// does): "AreaId,AreaRegionId" or "AreaId,AreaRegionId,PosX,PosY,PosZ". The
+// summon sign requests (summon_messenger_create / summon_messenger_get) go
+// out with those fields in place of the player's own. BBHOST_INVADE_ON picks
+// which of the two: "create", "get" or "both" (the default). The bodies are
+// the game's JSON; the fields are rewritten in the text, so everything else
+// (CharaId is a 64-bit integer a double would round) goes out byte for byte.
+struct InvadeArea {
+    bool on = false;
+    std::string area_id, region_id, pos[3];
+    bool create = true, get = true;
+};
+const InvadeArea g_invade = [] {
+    InvadeArea a;
+    const char* e = std::getenv("BBHOST_INVADE_AREA");
+    if (!e || !*e) return a;
+    std::vector<std::string> parts(1);
+    for (const char* p = e; *p; ++p) {
+        if (*p == ',') parts.emplace_back();
+        else if (*p != ' ') parts.back() += *p;
+    }
+    if (parts.size() != 2 && parts.size() != 5) return a;
+    for (const auto& s : parts) {
+        if (s.empty() || s.find_first_not_of("-0123456789") != std::string::npos) return a;
+    }
+    a.area_id = parts[0];
+    a.region_id = parts[1];
+    if (parts.size() == 5) {
+        for (int i = 0; i < 3; ++i) a.pos[i] = parts[2 + i];
+    }
+    if (const char* on = std::getenv("BBHOST_INVADE_ON"); on && *on) {
+        a.create = std::strcmp(on, "get") != 0;
+        a.get = std::strcmp(on, "create") != 0;
+    }
+    a.on = true;
+    return a;
+}();
+
+// The integer after "key": in a JSON text, replaced by `value`. False when the
+// key is not there with an integer.
+bool replace_int_field(std::string& text, const char* key, const std::string& value) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const std::size_t at = text.find(needle);
+    if (at == std::string::npos) return false;
+    const std::size_t from = at + needle.size();
+    std::size_t to = from;
+    if (to < text.size() && text[to] == '-') ++to;
+    while (to < text.size() && std::isdigit(static_cast<unsigned char>(text[to]))) ++to;
+    if (to == from || (to == from + 1 && text[from] == '-')) return false;
+    text.replace(from, to - from, value);
+    return true;
+}
+
+// The integer after "key": in a JSON text, as written; empty when absent.
+std::string int_field(const std::string& text, const char* key) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const std::size_t at = text.find(needle);
+    if (at == std::string::npos) return {};
+    const std::size_t from = at + needle.size();
+    std::size_t to = from;
+    if (to < text.size() && text[to] == '-') ++to;
+    while (to < text.size() && std::isdigit(static_cast<unsigned char>(text[to]))) ++to;
+    if (to == from || (to == from + 1 && text[from] == '-')) return {};
+    return text.substr(from, to - from);
+}
+
+// ---- Wex: invading across the whole world (DS3's Wex Dust, for Bloodborne).
+//
+// What the traffic shows: the Sinister Bell makes the invader's game post a
+// sign (summon_messenger_create, SummonType 2) for its own AreaId,
+// AreaRegionId and position, about once a minute; a host whose world has a
+// ringing Chime Maiden asks (summon_messenger_get, SummonType 2) for the signs
+// of its own area, finds one, and summons it. So the sign's area decides who
+// can find the invader. Wex moves it: each new sign goes to the next area of a
+// list, and a host there finds it.
+//
+// The list is learned. Every summon request either instance makes carries its
+// area and the player's position, and a new area is appended to the areas
+// file (BBHOST_WEX_AREAS, default wex-areas.txt in the working directory,
+// beside bbhost.exe for the run scripts), one line each:
+//   AreaId AreaRegionId PosX PosY PosZ   # mNN_NN
+// A line commented out with '#' is not visited (the blocklist).
+//
+// BBHOST_WEX=1 turns the rotation on. Only the invader's own requests are
+// moved: a SummonType 2 sign, and the SummonType 2 search made while one is
+// out. BBHOST_INVADE_AREA, one fixed area, wins over it.
+struct WexArea {
+    std::string area_id, region_id, pos[3];
+    bool blocked = false;
+};
+// BBHOST_WEX=1: the sign goes round the areas, one per sign the game posts
+// (about a minute each). BBHOST_WEX=all: the game's sign stays in its own area
+// and a copy goes to every other open area at once - the host's game asks for
+// signs about every 70 s, so a sign in every area is found at the next ask
+// wherever the host is (if the server keeps one sign per area, not one per
+// player: the log of the copies' answers and the hosts' finds tells).
+enum class WexMode { Off, Rotate, All };
+const WexMode g_wex_mode = [] {
+    const char* e = std::getenv("BBHOST_WEX");
+    if (!e) return WexMode::Off;
+    if (std::strcmp(e, "all") == 0) return WexMode::All;
+    return e[0] == '1' ? WexMode::Rotate : WexMode::Off;
+}();
+const bool g_wex_on = g_wex_mode != WexMode::Off;
+// Set on the thread that posts the copies, so they are not rewritten again.
+thread_local bool t_wex_copy = false;
+const std::string g_wex_file = [] {
+    const char* e = std::getenv("BBHOST_WEX_AREAS");
+    return std::string(e && *e ? e : "wex-areas.txt");
+}();
+std::mutex g_wex_mu;
+bool g_wex_loaded = false;
+std::vector<WexArea> g_wex_areas;  // every area in the file, blocked ones too
+std::size_t g_wex_next = 0;
+int g_wex_current = -1;  // the area the sign out now was placed in
+
+std::string area_name(const std::string& area_id) {
+    const unsigned long long v = std::strtoull(area_id.c_str(), nullptr, 10);
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "m%02llu_%02llu", (v >> 24) & 0xff, (v >> 16) & 0xff);
+    return buf;
+}
+
+void wex_load_locked() {
+    if (g_wex_loaded) return;
+    g_wex_loaded = true;
+    std::FILE* f = std::fopen(g_wex_file.c_str(), "rb");
+    if (!f) return;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        WexArea a;
+        if (*p == '#') {
+            a.blocked = true;
+            ++p;
+        }
+        char id[24] = {}, region[24] = {}, x[24] = {}, y[24] = {}, z[24] = {};
+        if (std::sscanf(p, "%23s %23s %23s %23s %23s", id, region, x, y, z) != 5) continue;
+        const std::string fields[5] = {id, region, x, y, z};
+        bool numeric = true;
+        for (const auto& s : fields) numeric = numeric && s.find_first_not_of("-0123456789") == std::string::npos;
+        if (!numeric) continue;  // a comment line
+        a.area_id = id;
+        a.region_id = region;
+        a.pos[0] = x;
+        a.pos[1] = y;
+        a.pos[2] = z;
+        g_wex_areas.push_back(a);
+    }
+    std::fclose(f);
+    std::size_t open = 0;
+    for (const auto& a : g_wex_areas) open += a.blocked ? 0 : 1;
+    host_log("wex: %zu areas in %s (%zu blocked)%s", g_wex_areas.size(), g_wex_file.c_str(), g_wex_areas.size() - open,
+             g_wex_on ? "; invading across them" : "");
+}
+
+// A request in an area the file does not have yet: append it.
+// The player's position as the game keeps it for its sessions (FrpgNetMan,
+// what a host's room carries as HostPos), rounded like the summon requests'.
+bool player_pos(std::string out[3]) {
+    json::Value extra = json::Value::make_object();
+    summon_invite_host_extra(extra);
+    const json::Value* pos = extra.find("HostPos");
+    if (!pos || pos->type != json::Value::Type::Array || pos->array.size() < 3) return false;
+    for (int i = 0; i < 3; ++i) out[i] = std::to_string(static_cast<long long>(std::lround(pos->array[static_cast<std::size_t>(i)].number)));
+    return !(out[0] == "0" && out[1] == "0" && out[2] == "0");
+}
+
+void wex_learn(const std::string& text) {
+    const std::string id = int_field(text, "AreaId"), region = int_field(text, "AreaRegionId");
+    std::string x = int_field(text, "PosX"), y = int_field(text, "PosY"), z = int_field(text, "PosZ");
+    if (id.empty() || region.empty() || id == "0") return;
+    std::string mem[3];
+    const bool have_mem = player_pos(mem);
+    if (x.empty() || y.empty() || z.empty()) {
+        // A request without a position (the wandering ghosts' post, made about
+        // once a minute anywhere online): the position from the game's memory.
+        if (!have_mem) return;
+        x = mem[0];
+        y = mem[1];
+        z = mem[2];
+    } else if (have_mem) {
+        static std::atomic<int> checks{0};
+        if (checks.fetch_add(1) < 3)
+            host_log("wex: position check: the request says %s %s %s, the game's memory %s %s %s", x.c_str(), y.c_str(),
+                     z.c_str(), mem[0].c_str(), mem[1].c_str(), mem[2].c_str());
+    }
+    std::lock_guard<std::mutex> lk(g_wex_mu);
+    wex_load_locked();
+    for (const auto& a : g_wex_areas) {
+        if (a.area_id == id && a.region_id == region) return;
+    }
+    // Another instance may have added it since this one read the file.
+    if (std::FILE* f = std::fopen(g_wex_file.c_str(), "rb")) {
+        char line[256];
+        bool there = false;
+        const std::string key = id + " " + region + " ";
+        while (!there && std::fgets(line, sizeof(line), f)) {
+            const char* p = line;
+            while (*p == ' ' || *p == '\t' || *p == '#') ++p;
+            there = std::strncmp(p, key.c_str(), key.size()) == 0;
+        }
+        std::fclose(f);
+        if (there) {
+            g_wex_loaded = false;
+            g_wex_areas.clear();
+            wex_load_locked();
+            return;
+        }
+    }
+    WexArea a;
+    a.area_id = id;
+    a.region_id = region;
+    a.pos[0] = x;
+    a.pos[1] = y;
+    a.pos[2] = z;
+    g_wex_areas.push_back(a);
+    if (std::FILE* f = std::fopen(g_wex_file.c_str(), "ab")) {
+        std::fprintf(f, "%s %s %s %s %s   # %s\n", id.c_str(), region.c_str(), x.c_str(), y.c_str(), z.c_str(),
+                     area_name(id).c_str());
+        std::fclose(f);
+    }
+    host_log("wex: learned area %s (%s region %s) at %s %s %s", area_name(id).c_str(), id.c_str(), region.c_str(), x.c_str(),
+             y.c_str(), z.c_str());
+}
+
+void place(std::string& text, const std::string& id, const std::string& region, const std::string* pos) {
+    replace_int_field(text, "AreaId", id);
+    replace_int_field(text, "AreaRegionId", region);
+    if (pos && !pos[0].empty()) {
+        replace_int_field(text, "PosX", pos[0]);
+        replace_int_field(text, "PosY", pos[1]);
+        replace_int_field(text, "PosZ", pos[2]);
+    }
+}
+
+// Rewrites the game's summon request in place; returns the bodies of the
+// copies BBHOST_WEX=all posts after it (the sign in every other open area).
+std::vector<std::vector<std::uint8_t>> invade_rewrite(const std::string& url, std::vector<std::uint8_t>& post) {
+    std::vector<std::vector<std::uint8_t>> copies;
+    if (t_wex_copy) return copies;
+    if (url.find("summon_messenger_delete") != std::string::npos) {
+        // The sign is taken down (the bell rung again, or a summon began).
+        std::lock_guard<std::mutex> lk(g_wex_mu);
+        g_wex_current = -1;
+        return copies;
+    }
+    if (post.empty()) return copies;
+    if (url.find("wandering_ghost_create") != std::string::npos) {
+        // Where the player is now, posted about once a minute: the areas file
+        // fills as the world is walked, no bell needed.
+        wex_learn(std::string(post.begin(), post.end()));
+        return copies;
+    }
+    const bool create = url.find("summon_messenger_create") != std::string::npos;
+    const bool get = url.find("summon_messenger_get") != std::string::npos;
+    if (!create && !get) return copies;
+    std::string text(post.begin(), post.end());
+    wex_learn(text);
+    const std::string own = int_field(text, "AreaId");
+    const bool invader_sign = create && text.find("\"SummonType\":2") != std::string::npos;
+    const bool invader_search = get && text.find("\"SummonType\":2") != std::string::npos;
+
+    if (g_invade.on) {
+        if (!(create && g_invade.create) && !(get && g_invade.get)) return copies;
+        if (own.empty()) {
+            host_log("invade: %s carries no AreaId; sent as the game made it", create ? "create" : "get");
+            return copies;
+        }
+        place(text, g_invade.area_id, g_invade.region_id, g_invade.pos);
+        post.assign(text.begin(), text.end());
+        host_log("invade: %s sent for %s (area %s region %s) from %s", create ? "create" : "get",
+                 area_name(g_invade.area_id).c_str(), g_invade.area_id.c_str(), g_invade.region_id.c_str(),
+                 area_name(own).c_str());
+        return copies;
+    }
+    if (!g_wex_on || own.empty()) return copies;
+
+    std::lock_guard<std::mutex> lk(g_wex_mu);
+    wex_load_locked();
+    if (invader_sign && g_wex_mode == WexMode::All) {
+        // The game's own sign as it is, and a copy for every other open area.
+        std::string names;
+        for (const WexArea& a : g_wex_areas) {
+            if (a.blocked || (a.area_id == own && a.region_id == int_field(text, "AreaRegionId"))) continue;
+            std::string copy = text;
+            place(copy, a.area_id, a.region_id, a.pos);
+            copies.emplace_back(copy.begin(), copy.end());
+            names += " " + area_name(a.area_id) + "/" + a.region_id;
+        }
+        g_wex_current = -1;
+        host_log("wex: sign in %s, and %zu copies:%s", area_name(own).c_str(), copies.size(), names.empty() ? " none" : names.c_str());
+    } else if (invader_sign) {
+        // The next open area after the last one, round the list.
+        const std::size_t n = g_wex_areas.size();
+        int pick = -1;
+        for (std::size_t k = 0; k < n && pick < 0; ++k) {
+            const std::size_t i = (g_wex_next + k) % n;
+            if (!g_wex_areas[i].blocked) pick = static_cast<int>(i);
+        }
+        if (pick < 0) {
+            host_log("wex: no open area in %s; the sign stays in %s", g_wex_file.c_str(), area_name(own).c_str());
+            g_wex_current = -1;
+            return copies;
+        }
+        g_wex_next = static_cast<std::size_t>(pick) + 1;
+        g_wex_current = pick;
+        const WexArea& a = g_wex_areas[static_cast<std::size_t>(pick)];
+        place(text, a.area_id, a.region_id, a.pos);
+        post.assign(text.begin(), text.end());
+        host_log("wex: sign placed in %s (area %s region %s at %s %s %s), %d of %zu; the player is in %s",
+                 area_name(a.area_id).c_str(), a.area_id.c_str(), a.region_id.c_str(), a.pos[0].c_str(), a.pos[1].c_str(),
+                 a.pos[2].c_str(), pick + 1, n, area_name(own).c_str());
+    } else if (invader_search && g_wex_current >= 0) {
+        const WexArea& a = g_wex_areas[static_cast<std::size_t>(g_wex_current)];
+        place(text, a.area_id, a.region_id, a.pos);
+        post.assign(text.begin(), text.end());
+    }
+    return copies;
+}
+
 void perform(const std::string& url, int method, const Effective& eff, std::vector<std::uint8_t> post,
              std::uint64_t content_len, std::shared_ptr<Response> resp, bool rewritten) {
     const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::vector<std::uint8_t>> wex_copies = invade_rewrite(url, post);
 #if defined(BBHOST_HAVE_CURL)
     std::call_once(g_curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
     CURL* c = curl_easy_init();
@@ -294,7 +670,7 @@ void perform(const std::string& url, int method, const Effective& eff, std::vect
         // schannel also asks the CA whether the certificate was revoked and fails
         // when that lookup cannot be made (firewalls, captive networks); the chain
         // and name are still checked.
-        curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT));
+        curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT | CURLSSLOPT_NATIVE_CA));
 #endif
         // The game's own user agent with bbhost's name and version after it,
         // so a server can tell bbhost clients and their versions apart. The
@@ -366,16 +742,34 @@ void perform(const std::string& url, int method, const Effective& eff, std::vect
     if (g_http_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(g_http_delay_ms));
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     static std::atomic<int> logs{0};
-    if (logs.fetch_add(1) < 24) {
-        host_log("http: %s %s -> %ld (%zu bytes, %.0f ms)%s", method == 1 ? "POST" : method == 4 ? "PUT" : "GET", url.c_str(), status,
-                 body.size(), ms, err ? " error" : "");
+    const int seq = logs.fetch_add(1);
+    const char* method_name = method == 1 ? "POST" : method == 4 ? "PUT" : "GET";
+    if (seq < 24 || !g_http_trace_dir.empty()) {
+        host_log("http: #%d %s %s -> %ld (%zu bytes out, %zu in, %.0f ms)%s", seq, method_name, url.c_str(), status,
+                 post.size(), body.size(), ms, err ? " error" : "");
     }
+    if (!g_http_trace_dir.empty()) trace_bodies(seq, method_name, url, post, body);
     std::lock_guard<std::mutex> lk(resp->mu);
     resp->status = status;
     resp->error = err;
     resp->body = std::move(body);
     resp->done = true;
     resp->cv.notify_all();
+    if (!wex_copies.empty()) {
+        // BBHOST_WEX=all: the sign's copies, after the game has its own answer.
+        std::thread([url, method, eff, copies = std::move(wex_copies)] {
+            t_wex_copy = true;
+            int ok = 0;
+            for (const auto& copy : copies) {
+                auto r = std::make_shared<Response>();
+                perform(url, method, eff, copy, copy.size(), r, true);
+                std::lock_guard<std::mutex> lk2(r->mu);
+                const std::string reply(r->body.begin(), r->body.end());
+                if (r->status == 200 && reply.find("\"ResKind\":0") != std::string::npos) ++ok;
+            }
+            host_log("wex: %d of %zu copies of the sign taken by the server", ok, copies.size());
+        }).detach();
+    }
 }
 
 void post_event(HttpEpoll* ep, int id, void* user, std::uint32_t events, std::uint32_t detail) {

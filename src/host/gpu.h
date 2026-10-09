@@ -476,6 +476,9 @@ bool host_gpu_display_image(std::uint64_t display_va, void** image, std::uint32_
 bool host_gpu_blit_display(void* cmd, std::uint64_t display_va, void* dst_image, std::int32_t dst_x, std::int32_t dst_y,
                            std::uint32_t dst_w, std::uint32_t dst_h, std::uint32_t src_width, std::uint32_t src_height,
                            std::uint32_t src_x = 0, std::uint32_t src_y = 0, void* dst_storage_view = nullptr);
+// DLSS is resolving the scene (host/dlss.cpp): the game's own anti-aliasing
+// stays off meanwhile (engine/graphics_patch.cpp). Any thread.
+bool host_gpu_dlss_active();
 // Writes the displayed render target as an image: PNG when the path ends in
 // ".png", binary PPM otherwise (headless inspection). `all_targets`: also
 // every colour RT (F12) as <stem>-rt-<base> in the same format and the draw

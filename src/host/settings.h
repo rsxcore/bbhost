@@ -48,6 +48,7 @@ struct HostSettings {
     bool ssao = true;
     bool motion_blur = true;
     bool anti_alias = true;
+    bool dlss = false;          // DLSS resolves the scene at the render size (host/dlss.cpp); the game's AA then stays off
     bool depth_of_field = true;
     bool chromatic_aberration = true;
     bool vignette = true;

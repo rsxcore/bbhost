@@ -41,7 +41,7 @@ bbhost for Windows, build $name
 bbhost runs Bloodborne on PC: the game's own 1.09 executable, its calls into
 the PS4's system libraries answered by bbhost and its graphics recompiled for
 Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE.txt); the
-source is at https://github.com/droogie/bbhost.
+source is at https://github.com/rsxcore/bbhost.
 
 You need
   - Your own copy of Bloodborne, dumped from your own PS4 - nothing from the
@@ -75,6 +75,14 @@ Start the game
   says where the log goes (logs\\bbhost-<date>-<time>.log); the game window
   appears. The first time, Windows may say "Windows protected your PC": click
   More info, then Run anyway.
+
+DLSS (NVIDIA RTX cards)
+  F10 > Graphics > DLSS swaps the game's anti-aliasing for NVIDIA's DLAA. It
+  needs nvngx_dlss.dll beside bbhost.exe, which NVIDIA's license does not let
+  bbhost ship: the first time DLSS is on, bbhost downloads it from NVIDIA's
+  own DLSS repository (github.com/NVIDIA/DLSS), checks its SHA-256 and puts it
+  here. get-dlss.bat does the same by hand (with no internet in the game, for
+  instance).
 
   When Windows Defender Firewall asks whether bbhost may communicate on
   networks, tick Private and Public and click Allow access: other players
@@ -169,6 +177,9 @@ EOF
 # The launcher that keeps a log (tools/win/run-bbhost.bat); CRLF for cmd and
 # Notepad.
 sed 's/\r*$/\r/' tools/win/run-bbhost.bat > "$dir/run-bbhost.bat"
+# NVIDIA's DLSS library, fetched by the player from NVIDIA (bbhost cannot ship it).
+sed 's/\r*$/\r/' tools/win/get-dlss.bat > "$dir/get-dlss.bat"
+sed 's/\r*$/\r/' tools/win/get-dlss.ps1 > "$dir/get-dlss.ps1"
 sed -i 's/\r*$/\r/' "$dir/README.txt"
 mkdir -p "$dir/logs"
 (cd "$out" && rm -f "$name.zip" && zip -qr "$name.zip" "$name")

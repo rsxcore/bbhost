@@ -159,7 +159,7 @@ five_players = true
 # unless this says true.
 # check = true
 # Where releases are: a GitHub "releases/latest" API URL.
-# source = "https://api.github.com/repos/droogie/bbhost/releases/latest"
+# source = "https://api.github.com/repos/rsxcore/bbhost/releases/latest"
 # A private repository's releases need a token: a file holding one with
 # read access to its contents.
 # token_file = "C:/Users/me/bbhost-github-token"
