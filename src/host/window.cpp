@@ -372,12 +372,13 @@ const char* present_mode_name(VkPresentModeKHR m) {
 }
 
 // The present mode for the V-Sync setting, from what the surface offers.
-// V-Sync on: MAILBOX (the newest finished frame goes up at the next refresh, no
-// tearing, no queue of frames behind the display), else FIFO_LATEST_READY (the
-// same thing as a FIFO mode: AMD's Windows driver has it and no MAILBOX), else
-// FIFO - where every frame waits its turn, up to two refreshes behind with
-// three images. V-Sync off: IMMEDIATE (shown at once, tearing), else MAILBOX.
-// FIFO is the only mode a surface must support, so it is what is left.
+// V-Sync on: FIFO - every frame waits its turn, up to two refreshes behind
+// with three images, and none is dropped. MAILBOX (the newest finished frame
+// goes up at the next refresh) judders at the game's steady 60 on NVIDIA at
+// 144 Hz: frames that arrive two in one refresh lose one, and the next is
+// shown twice; BBHOST_PRESENT_MODE=mailbox still asks for it. V-Sync off:
+// IMMEDIATE (shown at once, tearing), else MAILBOX. FIFO is the only mode a
+// surface must support, so it is what is left.
 // BBHOST_PRESENT_MODE=fifo|mailbox|latest|immediate|relaxed asks for one
 // (FIFO when the surface lacks it); =old is the choice before this one (FIFO
 // with V-Sync; MAILBOX, else IMMEDIATE, without).
@@ -409,10 +410,7 @@ VkPresentModeKHR choose_present_mode(bool vsync, std::string& why) {
 #endif
         why += "; BBHOST_PRESENT_MODE=" + f;
     } else if (vsync) {
-        want = {VK_PRESENT_MODE_MAILBOX_KHR};
-#if defined(VK_KHR_present_mode_fifo_latest_ready)
-        want.push_back(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR);
-#endif
+        want = {VK_PRESENT_MODE_FIFO_KHR};
     } else {
         want = {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR};
     }
