@@ -12,6 +12,7 @@
 #include "engine/menu_memory.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
+#include "host/gpu.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/window.h"
@@ -915,7 +916,8 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
         std::uint64_t caps = 0;
         std::memcpy(&caps, r + kCapabilities, sizeof(caps));
         const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
-        const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
+        // DLSS resolves the scene instead of the game's edge filter (host/dlss.cpp).
+        const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability) && !host_gpu_dlss_active();
         if (r[kSsaoFlag] != ssao || r[kAaFlag] != aa) {
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 24) {

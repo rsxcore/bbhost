@@ -1,0 +1,120 @@
+#version 460
+// DLSS's motion vectors (host/dlss.cpp), at the render size: what YEBIS's own
+// velocity pass (7ea47480+d3c8bb21) computes for its motion blur at half size,
+// from the same depth and the same constants, without the blur's scale and
+// its clamp to one unit.
+//
+// Per pixel: the depth's NDC z (the pass's linearisation), the clip
+// position rebuilt from it and reprojected by the pass's matrix, the camera's
+// motion as the reprojected NDC minus the pixel's; then the object velocity
+// map (characters, half size) blended over it by its alpha, decoded as YEBIS
+// decodes it, within its 8 bits' precision. NDC has y up; DLSS wants pixels,
+// y down, pointing from this frame's position to the last one's - which is
+// the opposite way to the pass's (below).
+//
+// Compiled offline (tools/build_shaders.sh) into dlss_mv.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_snapshot;   // device z (R32F)
+layout(set = 0, binding = 1) uniform texture2D object_velocity;  // RGBA8, half size
+layout(set = 0, binding = 2) uniform sampler linear_clamp;
+layout(set = 0, binding = 3, rg16f) uniform writeonly image2D motion;
+
+// The pass's own constants, bound as the pass binds them: the game hands
+// them over in a dynamic buffer whose bytes reach their place on the GPU,
+// just before the pass runs, so only the GPU reads this frame's.
+layout(set = 0, binding = 4, std430) readonly buffer Constants {
+    uint c[];
+};
+
+// The scene's camera, this frame's and the last one's (host/dlss.cpp copies
+// them from the scene constants every G-buffer draw reads: the dwords from
+// 180, so the camera's position is at 3, 7 and 11 and the camera-relative
+// view-projection's rows at 20..35).
+layout(set = 0, binding = 5, std430) readonly buffer Camera {
+    float cam[];
+};
+
+layout(push_constant) uniform Params {
+    uvec2 size;
+    uint bias;    // the dword where the pass's constants start in their binding (StageParams::cb_bias_dw)
+    uint use_camera;  // 1: reproject from the camera (cur, prev); 0: by the pass's own matrix
+    uint cur, prev;  // the two frames' camera blocks, in floats
+};
+
+float k(uint i) { return uintBitsToFloat(c[bias + i]); }
+
+mat4 view_projection(uint at) {
+    // Rows in the block, so transposed into GLSL's columns.
+    return transpose(mat4(cam[at + 20u], cam[at + 21u], cam[at + 22u], cam[at + 23u], cam[at + 24u], cam[at + 25u], cam[at + 26u],
+                          cam[at + 27u], cam[at + 28u], cam[at + 29u], cam[at + 30u], cam[at + 31u], cam[at + 32u], cam[at + 33u],
+                          cam[at + 34u], cam[at + 35u]));
+}
+vec3 position(uint at) { return vec3(cam[at + 3u], cam[at + 7u], cam[at + 11u]); }
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(size.x) || xy.y >= int(size.y)) return;
+    const vec2 uv = (vec2(xy) + 0.5) / vec2(size);
+    const vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    // Rows of clip -> previous clip (C#[896..911]). Built in single precision
+    // from world positions in the thousands, a still camera's has 2^-11 and
+    // 2^-13 where the identity has 0 - a third of a pixel every frame, which
+    // DLSS follows and the picture drifts soft. So a matrix within two ulps
+    // of 4096 of the identity in every entry is the identity - but only whole:
+    // while the camera eases in after the player stops, some entries are that
+    // small and real.
+    vec4 reproject[4];
+    float off_identity = 0.0;
+    for (uint r = 0u; r < 4u; ++r) {
+        reproject[r] = vec4(k(896u + 4u * r), k(897u + 4u * r), k(898u + 4u * r), k(899u + 4u * r));
+        off_identity = max(off_identity, max(max(abs(reproject[r].x - (r == 0u ? 1.0 : 0.0)), abs(reproject[r].y - (r == 1u ? 1.0 : 0.0))),
+                                             max(abs(reproject[r].z - (r == 2u ? 1.0 : 0.0)), abs(reproject[r].w - (r == 3u ? 1.0 : 0.0)))));
+    }
+    if (off_identity <= 1.0e-3) {
+        reproject[0] = vec4(1.0, 0.0, 0.0, 0.0);
+        reproject[1] = vec4(0.0, 1.0, 0.0, 0.0);
+        reproject[2] = vec4(0.0, 0.0, 1.0, 0.0);
+        reproject[3] = vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    const vec4 depth_k = vec4(k(0u), k(1u), k(620u), k(621u));   // z to NDC z
+    const vec3 view_k = vec3(k(61u), k(62u), k(63u));             // NDC z to clip w
+    const vec4 object_k = vec4(k(624u), k(625u), k(626u), k(627u));  // the velocity map's decode
+    const float z = texelFetch(sampler2D(depth_snapshot, linear_clamp), xy, 0).r;
+    const float d = clamp(depth_k.z * (depth_k.x * z + depth_k.y) + depth_k.w, 0.0, 1.0);
+    const float w = -view_k.y / (d * view_k.z - view_k.x);
+    const vec4 p = vec4(ndc * w, d * w, w);
+    const vec4 q = vec4(dot(reproject[0], p), dot(reproject[1], p), dot(reproject[2], p), dot(reproject[3], p));
+    vec2 camera = q.xy / max(q.w, 0.0009765625) - ndc;
+    if (use_camera == 1u) {
+        // The pass's matrix is the game's prevVP * inverse(VP) made in single
+        // precision from world positions in the thousands: frame to frame it
+        // moves a far point by several pixels either way while the camera
+        // turns steadily (measured: the best correction to it jumped -7..+5
+        // px from one frame to the next), which only a blur forgives. The
+        // scene draws are camera-relative - clip = VP * (world - camera) -
+        // so the same reprojection made from the two frames' VP and the
+        // camera's move between them (nearly equal floats: their difference
+        // is exact) has no large number left in it.
+        const vec4 h = inverse(view_projection(cur)) * vec4(ndc, z, 1.0);
+        const vec3 rel = h.xyz / h.w + (position(cur) - position(prev));
+        const vec4 cp = view_projection(prev) * vec4(rel, 1.0);
+        // In the pass's own sense of direction (the opposite of where the
+        // surface was: see the store below), like the velocity map's.
+        camera = ndc - cp.xy / cp.w;
+    }
+    const vec4 o = textureLod(sampler2D(object_velocity, linear_clamp), uv, 0.0);
+    // The map holds 8 bits a component: a step is 4.5 pixels at 1280 wide,
+    // and rest is 127 where 127.5 would be zero. So a character takes the
+    // camera's exact motion where the map's value is that motion to within a
+    // step - it stands still in the world - and the map's own where it moved.
+    const vec2 object = object_k.xy * (o.xy * object_k.z + object_k.w);
+    const vec2 step = abs(object_k.xy * object_k.z) / 255.0;
+    const bool still = all(lessThanEqual(abs(camera - object), step));
+    const vec2 v = mix(camera, still ? camera : object, clamp(o.w, 0.0, 1.0));
+    // `v` is the way the pass has it, which only matters to a blur in size:
+    // turning, the picture moves the other way from it (31 pixels a frame to
+    // the left where v said 31 to the right). DLSS wants where the surface
+    // was, so it goes in turned round.
+    imageStore(motion, xy, vec4(-v.x * 0.5 * float(size.x), v.y * 0.5 * float(size.y), 0.0, 0.0));
+}

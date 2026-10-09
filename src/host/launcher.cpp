@@ -189,7 +189,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
                                                "3200x1800",        "3840x2160",        "2560x1080 (21:9)", "3440x1440 (21:9)",
                                                "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
-                                               "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)"};
+                                               "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)", "800x600 (4:3, upscaled)"};
     static const int kCaps[] = {30, 60, 0};
     int cap_choice = frame_cap == 30 ? 0 : frame_cap == 60 ? 1 : 2;
     // The PC enhancements, through the same calls: each is read when the

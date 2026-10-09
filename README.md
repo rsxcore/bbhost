@@ -41,7 +41,7 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 
 | | |
 |---|---|
-| ![Yharnam in 21:9](docs/images/yharnam-ultrawide.jpg) | **Any resolution, ultrawide included.** 21:9 and 32:9 with a wider field of view and the HUD where it belongs, and the resolution can be changed while playing. FSR 1 upscaling for slower GPUs. |
+| ![Yharnam in 21:9](docs/images/yharnam-ultrawide.jpg) | **Any resolution, ultrawide included.** 21:9 and 32:9 with a wider field of view and the HUD where it belongs, and the resolution can be changed while playing. FSR 1 upscaling for slower GPUs, DLSS anti-aliasing (DLAA) on RTX cards. |
 | ![PC Graphics settings](docs/images/pc-graphics.jpg) | **Settings in the game's own menus.** The System menu gains PC Settings, PC Graphics, PC Effects, PC Controls, PC Camera and Key Bindings, drawn in the game's style: anti-aliasing, ambient occlusion, shadow distance, fog, motion blur, field of view, frame cap and more. |
 
 - **60 fps**, with the game's timing corrected so physics, animation and

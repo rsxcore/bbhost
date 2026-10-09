@@ -70,6 +70,7 @@ enum SettingId {
     kSsao,
     kMotionBlur,
     kAntiAlias,
+    kDlss,
     kDepthOfField,
     kChromaticAberration,
     kBloom,
@@ -160,6 +161,11 @@ Setting g_set[kSettingCount] = {
      "The blur on fast camera and character movement.", false},
     {"anti_alias", "Anti-aliasing", {"On", "Off"}, 0,
      "The game's own AA pass.", false},
+    // NVIDIA DLSS at the render size (host/dlss.cpp): the scene resolved from
+    // jittered frames, in place of the game's AA. Needs an RTX card and
+    // nvngx_dlss.dll beside bbhost.exe; without them it stays off.
+    {"dlss", "DLSS", {"Off", "DLAA"}, 0,
+     "NVIDIA DLSS anti-aliasing at the render resolution, in place of the game's own (RTX cards; nvngx_dlss.dll beside bbhost.exe).", false},
     {"depth_of_field", "Depth of field", {"On", "Off"}, 0,
      "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
     {"chromatic_aberration", "Chromatic aberration", {"On", "Off"}, 0,
@@ -201,7 +207,7 @@ Setting g_set[kSettingCount] = {
     // (pixel-bound at 1280x800, ~45), and the presenter upscales by FSR 1.
     {"resolution", "Resolution", {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800",
                                   "3840x2160", "2560x1080", "3440x1440", "5120x2160", "3840x1080",
-                                  "5120x1440", "1280x800", "960x600", "1024x640"}, 2,
+                                  "5120x1440", "1280x800", "960x600", "1024x640", "800x600"}, 2,
      "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
      "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
      true},
@@ -249,6 +255,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSsao},
     {Row::Option, nullptr, kMotionBlur},
     {Row::Option, nullptr, kAntiAlias},
+    {Row::Option, nullptr, kDlss},
     {Row::Option, nullptr, kDepthOfField},
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kBloom},
@@ -599,6 +606,7 @@ void apply(int id) {
         case kSsao:
         case kMotionBlur:
         case kAntiAlias:
+        case kDlss:
         case kDepthOfField:
         case kChromaticAberration:
         case kResolution: {
@@ -722,6 +730,7 @@ void rebuild_settings() {
     h.ssao = on_of(kSsao);
     h.motion_blur = on_of(kMotionBlur);
     h.anti_alias = on_of(kAntiAlias);
+    h.dlss = index_of(kDlss) == 1;
     h.depth_of_field = on_of(kDepthOfField);
     h.chromatic_aberration = on_of(kChromaticAberration);
     h.vignette = on_of(kVignette);

@@ -245,6 +245,16 @@ struct GfxPipeline {
     // 1 for d3ca03f3+111fce32, 2 for 7d668276+e0305cef (the YEBIS probes in
     // draw_impl, which log once), 0 for the rest; -1 until a draw asks.
     std::int8_t yebis_probe = -1;
+    // DLSS's points in the frame (host/dlss.cpp): 1 the depth-of-field
+    // composite (...+111fce32), whose target is the scene colour; 2 YEBIS's
+    // velocity pass (7ea47480+d3c8bb21), after which DLSS runs; 3 the motion
+    // blur's velocity post-pass (...+abf92450), whose first draw has read the
+    // velocity map it then widens. 0 the rest.
+    std::int8_t dlss_role = -1;
+    // Which of the vertex stage's buffers is the scene constants block (the
+    // camera DLSS reprojects with): user_sgpr[6]->load(+16), 216 dwords;
+    // -1 none, -2 not looked at yet.
+    std::int8_t dlss_scene_cb = -2;
     // The optimized relink, queued at the pipeline's first draw
     // (queue_library_relink): its libraries, and the vertex library's
     // specialization - the elements' formats, the state it was made with.
@@ -7077,6 +7087,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         }
     }
     RtImage& dst = into ? *into : st->second;
+    if (from_depth) dlss_note_depth_snapshot_locked(src_base, dst_base);
     begin_recording_locked();
     render_end_pass_locked();
     if (!dst.initialised) {
@@ -12702,6 +12713,11 @@ static bool draw_impl(const GpuDraw& d) {
     // both ends inside [0, 1].
     vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f);
     vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
+    // DLSS's sub-pixel jitter, on the draws of the scene into its depth buffer.
+    if (float jx = 0.0f, jy = 0.0f; dlss_jitter_locked(s.depth ? s.depth->base : 0, (s.depth_control & 0x2) != 0, s.prim, d.index_count, &jx, &jy)) {
+        vp.x += jx;
+        vp.y += jy;
+    }
     if (!g_recorded.viewport_set || std::memcmp(&g_recorded.viewport, &vp, sizeof(vp)) != 0) {
         cmds.viewport(vp);
         g_recorded.viewport = vp;
@@ -12839,6 +12855,62 @@ static bool draw_impl(const GpuDraw& d) {
     }
     if (!g.profile_passes) profile_end_locked();
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
+    if (pl.dlss_role < 0) {
+        pl.dlss_role = pl.name.size() >= 17 && pl.name.compare(9, 8, "111fce32") == 0   ? 1
+                       : pl.name.compare(0, 17, "7ea47480+d3c8bb21") == 0 ? 2
+                       : pl.name.size() >= 17 && pl.name.compare(9, 8, "abf92450") == 0 ? 3
+                                                                            : 0;
+    }
+    if (pl.dlss_role == 1 && s.color[0]) dlss_note_scene_colour_locked(s.color[0]->base);
+    if (pl.dlss_scene_cb == -2) {
+        pl.dlss_scene_cb = -1;
+        const gcn::TranslateResult& vm = pl.vs.meta();
+        for (std::size_t i = 0; i < vm.buffers.size() && i < 16; ++i) {
+            const gcn::BufferBinding& b = vm.buffers[i];
+            if (!b.pointer && b.max_dw >= 216 && b.path.user_sgpr == 6 && b.path.loads.empty() && !b.path.immediate &&
+                b.path.final_offset_dw == 4 && !b.path.final_vsharp) {
+                pl.dlss_scene_cb = static_cast<std::int8_t>(i);
+            }
+        }
+    }
+    if (pl.dlss_scene_cb >= 0 && s.depth && dlss_wants_camera_locked(s.depth->base)) {
+        const std::size_t i = static_cast<std::size_t>(pl.dlss_scene_cb);
+        if ((stage_params[0].cb_valid >> i & 1) && stage_first_buffer[0] + i < buffer_infos.size()) {
+            dlss_note_camera_locked(buffer_infos[stage_first_buffer[0] + i], stage_params[0].cb_bias_dw[i]);
+        }
+    }
+    if (pl.dlss_role == 3 && !pl.ps.meta().images.empty()) {
+        std::uint32_t tw[8] = {};
+        if (resolve_resource_impl(pl.ps.meta().images[0].path, s.ps_user, 8, tw)) dlss_note_velocity_post_locked(find_render_target(tsharp_base(tw)));
+    }
+    if (pl.dlss_role == 2) {
+        // Its depth snapshot, the velocity map and its constants, as the shader reaches them.
+        DlssVelocityPass pass;
+        const gcn::TranslateResult& meta = pl.ps.meta();
+        for (const gcn::ImageBinding& im : meta.images) {
+            std::uint32_t tw[8] = {};
+            if (!resolve_resource_impl(im.path, s.ps_user, 8, tw)) continue;
+            RtImage* r = find_render_target(tsharp_base(tw));
+            if (!r) continue;
+            if (r->format == VK_FORMAT_R32_SFLOAT) pass.depth_snapshot = r;
+            else pass.object_velocity = r;
+        }
+        for (std::size_t i = 0; i < meta.buffers.size(); ++i) {
+            const gcn::BufferBinding& b = meta.buffers[i];
+            if (b.pointer || b.max_dw < 912) continue;
+            if (i < 16 && (stage_params[1].cb_valid >> i & 1) && stage_first_buffer[1] + i < buffer_infos.size()) {
+                pass.constants_binding = buffer_infos[stage_first_buffer[1] + i];
+                pass.constants_bias_dw = stage_params[1].cb_bias_dw[i];
+            }
+            std::uint32_t vw[4] = {};
+            if (!resolve_resource_impl(b.path, s.ps_user, 4, vw)) continue;
+            const std::uint64_t base = interp_base(vw, true);
+            if (!hle_kernel_va_mapped(base, 912 * 4)) continue;
+            pass.constants = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(base));
+            pass.constant_dwords = 912;
+        }
+        dlss_after_velocity_locked(pass);
+    }
     bump(g.draws);  // the one writer, under g.mu: no locked add
     draw_stamp.to(kRenderCostRecord);
     if (g_render_cost_enabled) report_render_split(false);
