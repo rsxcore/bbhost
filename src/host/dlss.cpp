@@ -572,7 +572,7 @@ bool ngx_init_locked() {
     ngx::get_i(caps, "SuperSampling.FeatureInitResult", &init_result);
     if (g_dlss.destroy_parameters) g_dlss.destroy_parameters(caps);
     if (!available) {
-        host_log("dlss: DLSS not available (%s; feature init 0x%x) - nvngx_dlss.dll belongs next to bbhost.exe",
+        host_log("dlss: DLSS not available (%s; feature init 0x%x) - nvngx_dlss.dll belongs next to bbhost.exe (get-dlss.bat downloads it from NVIDIA)",
                  needs_driver ? "the driver is too old" : "no model found", static_cast<unsigned>(init_result));
         if (needs_driver) host_log("dlss: it needs driver %u.%u or newer", major, minor);
         return false;

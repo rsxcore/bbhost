@@ -146,7 +146,9 @@ NVIDIA's anti-aliasing at the render resolution, in place of the game's own
 (`dlss = "DLAA"` in `bbhost-options.toml`, or `BBHOST_DLSS=1`). It needs
 `nvngx_dlss.dll`, which NVIDIA distributes with its DLSS SDK
 (github.com/NVIDIA/DLSS, `lib/Windows_x86_64/rel`), next to `bbhost.exe`;
-bbhost does not ship it. Without the file, the card or a recent driver the
+its license does not let bbhost ship it. The Windows package's
+`get-dlss.bat` (`tools/win/get-dlss.ps1`) downloads it from that repository,
+pinned to one SDK release and its SHA-256. Without the file, the card or a recent driver the
 log says why and the game's AA stays.
 
 ## Online

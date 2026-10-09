@@ -76,6 +76,13 @@ Start the game
   appears. The first time, Windows may say "Windows protected your PC": click
   More info, then Run anyway.
 
+DLSS (NVIDIA RTX cards)
+  F10 > Graphics > DLSS swaps the game's anti-aliasing for NVIDIA's DLAA. It
+  needs nvngx_dlss.dll beside bbhost.exe, which NVIDIA's license does not let
+  bbhost ship: double-click get-dlss.bat once and it downloads it from
+  NVIDIA's own DLSS repository (github.com/NVIDIA/DLSS), checks its SHA-256
+  and puts it here.
+
   When Windows Defender Firewall asks whether bbhost may communicate on
   networks, tick Private and Public and click Allow access: other players
   reach you on UDP port 9307, and a blocked port is the most common reason
@@ -169,6 +176,9 @@ EOF
 # The launcher that keeps a log (tools/win/run-bbhost.bat); CRLF for cmd and
 # Notepad.
 sed 's/\r*$/\r/' tools/win/run-bbhost.bat > "$dir/run-bbhost.bat"
+# NVIDIA's DLSS library, fetched by the player from NVIDIA (bbhost cannot ship it).
+sed 's/\r*$/\r/' tools/win/get-dlss.bat > "$dir/get-dlss.bat"
+sed 's/\r*$/\r/' tools/win/get-dlss.ps1 > "$dir/get-dlss.ps1"
 sed -i 's/\r*$/\r/' "$dir/README.txt"
 mkdir -p "$dir/logs"
 (cd "$out" && rm -f "$name.zip" && zip -qr "$name.zip" "$name")
