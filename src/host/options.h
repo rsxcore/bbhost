@@ -21,6 +21,8 @@ void host_options_load();
 void host_options_apply();
 
 bool host_options_open();
+// One of the screen's own text fields (the account rows) is being typed.
+bool host_options_editing();
 // Opening drains the latched pointer edges, so a click from before it opened
 // does not land on a row. Closing saves.
 void host_options_set_open(bool open);

@@ -160,7 +160,10 @@ gives the Binary Ninja address.
   each UTF-16 string in the image - the lea instructions that load its address
   and the pointers to it in the image's data - names the new text instead; the
   string itself stays. From `bb_plugin_image` only. The Debug Menu plugin's
-  English is made this way.
+  English is made this way. Replace only text the game shows: a string it also
+  looks up by name stops matching. The character scripts call the game's
+  functions by their Japanese names, and with those names in English every
+  character died at load.
 
 **Online rules** (v10)
 

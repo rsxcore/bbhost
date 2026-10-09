@@ -9,6 +9,18 @@
 #
 # Push a tag v* to publish them as a GitHub release; "Run workflow" on the
 # Actions page builds the same files as artifacts of the run, no release.
+# The tag is annotated and its message holds the release notes:
+#   tools/tag_release.sh v0.2.17 notes.md && git push <remote> v0.2.17
+# (the message: "bbhost v0.2.17", a blank line, the notes verbatim).
+# The release takes them, and the server's bot posts them to the Discord's
+# #releases channel (tools/announce_release.py). A tag without notes gets
+# GitHub's generated notes and no announcement.
+#
+# Every pull request builds them too, to test the branch before it is merged:
+# the packages are artifacts of the run (kept 14 days; the PR gets a comment
+# linking them), never signed (plugins load unsigned unless
+# plugins.signed_only is set) and never published. A newer push to the PR
+# cancels the run still going.
 #
 # The updater (src/host/updater.h) installs the bare executables the publish
 # job adds - bbhost-<version>-windows.exe and bbhost-<version>-linux - and only
@@ -17,17 +29,27 @@
 # than publish unsigned). The same key signs the official plugins each
 # package carries (tools/package_plugins.sh: plugins/<name>.so|.dll + .sig).
 #
+# The jobs' checks - package-linux, package-windows and package-all (the Steam
+# Deck kit, the updater's executables and the bundle check), with build.yml's
+# tests - are the ones master's ruleset requires before a pull request merges.
+#
 # The debug menu's font (engine/debug_menu.h) is the Debug Menu plugin's own,
 # made from public-domain fonts (plugins/debug_menu): nothing is fetched.
 name: release
 on:
   push:
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: write
+  pull-requests: write
 jobs:
   linux:
+    name: package-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -42,10 +64,11 @@ jobs:
         run: CI_PORTABLE=1 CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON" tools/ci_build.sh
       - name: package
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
         run: tools/package_linux.sh build-ci/build/bbhost build/linux
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
           name: linux
           path: |
             build/linux/*.tar.gz
@@ -55,6 +78,7 @@ jobs:
         run: tail -n 80 build-ci/*.log || true
 
   windows:
+    name: package-windows
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     container: archlinux:latest
@@ -72,10 +96,11 @@ jobs:
           key: win-deps-${{ hashFiles('tools/win_deps.sh') }}
       - name: build and package
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
         run: CI_PACMAN=1 CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON" tools/ci_windows.sh
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
           name: windows
           path: |
             build/win/*.zip
@@ -85,6 +110,7 @@ jobs:
         run: tail -n 80 build/win-deps/*.log build-win.*.log || true
 
   publish:
+    name: package-all
     needs: [linux, windows]
     runs-on: ubuntu-24.04
     steps:
@@ -122,11 +148,16 @@ jobs:
           done
           (cd dist/release && sha256sum * > SHA256SUMS)
           ls -la dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
+          name: steamdeck
+          path: dist/steamdeck/*.tar.gz
       - name: the bundles go to the live server
         run: tools/check_release_bundle.sh dist/release
       - name: sign
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
         run: |
           if [ -z "$RELEASE_SIGNING_KEY" ]; then
             if [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then echo "RELEASE_SIGNING_KEY is not set: a release is never published unsigned"; exit 1; fi
@@ -139,10 +170,48 @@ jobs:
           echo "signed: $(wc -c < dist/release/SHA256SUMS.sig) bytes"
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
           name: release
           path: dist/release
+      - name: link the test build on the pull request
+        if: github.event_name == 'pull_request'
+        continue-on-error: true   # a fork's PR has a read-only token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="**Test build** of ${SHA:0:7}: Windows zip, Linux tarball and Steam Deck kit, unsigned, kept 14 days.
+          Download \`windows\`, \`linux\` or \`steamdeck\` (each with its package), or \`release\` (everything), from the bottom of the run page:
+          $RUN#artifacts"
+          gh pr comment "$PR" --edit-last --body "$body" 2>/dev/null || gh pr comment "$PR" --body "$body"
       - name: GitHub release
+        id: release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/release/* --title "bbhost $GITHUB_REF_NAME" --generate-notes
+        run: |
+          # The release notes are the annotated tag's message after its first
+          # line (tools/tag_release.sh). A tag without them gets
+          # GitHub's generated notes and no announcement.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          if grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            gh release create "$GITHUB_REF_NAME" dist/release/* --title "bbhost $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "announce=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "the tag carries no notes: generated notes, and no Discord announcement (Actions > announce release, once the notes are written)"
+            gh release create "$GITHUB_REF_NAME" dist/release/* --title "bbhost $GITHUB_REF_NAME" --generate-notes
+          fi
+      # A release created with the workflow's token starts no other workflow
+      # (GitHub's rule), so the announcement is made here; announce-release.yml
+      # stays for announcing by hand.
+      - name: announce in Discord
+        if: steps.release.outputs.announce == '1'
+        continue-on-error: true   # the release is out either way; announce by hand if this fails
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: '1557561169768742986'
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/announce_release.py "$GITHUB_REF_NAME"

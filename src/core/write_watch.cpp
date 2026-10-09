@@ -388,13 +388,38 @@ int write_watch_recent_faults(std::uint64_t va, std::size_t len, std::uint64_t* 
 
 #if defined(_WIN32)
 namespace {
+// bbhost.exe's own addresses, which are not the game's: the census takes the
+// first guest address of a frame for the writer, and on Linux the host's
+// addresses lie above the guest's range anyway.
+std::uint64_t g_host_lo = 0, g_host_hi = 0;
+
+std::uint64_t not_host(std::uint64_t a) { return a >= g_host_lo && a < g_host_hi ? 0 : a; }
+
 // The vectored handler, first in line: a write to a watched page is made
 // writable, recorded, and the instruction retried; anything else goes on to
-// the next handler (win_watch's, then the crash reporter).
+// the next handler (win_watch's, then the crash reporter). The writer goes
+// to the census as the Linux handler reads it: the pc, the top of the stack
+// (return addresses when the write is in a leaf) and [rbp+8], from the
+// stack's own page. The words below rsp are already Windows' exception
+// frame by now; the ones above it are the thread's.
 LONG CALLBACK write_watch_veh(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
-    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2 &&
-        write_watch_on_fault(static_cast<std::uint64_t>(r->ExceptionInformation[1]), r->ExceptionInformation[0] == 1, nullptr)) {
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const bool is_write = r->ExceptionInformation[0] == 1;
+    std::uint64_t frame[kWriteWatchFrame] = {};
+    if (is_write) {
+        const CONTEXT* c = ep->ContextRecord;
+        frame[0] = not_host(c->Rip);
+        const std::uint64_t rsp = c->Rsp, rbp = c->Rbp;
+        const auto page_ok = [](std::uint64_t a) { return a > 0x10000 && (a & 0xfff) <= 0xff8; };
+        for (int k = 0; k < 6; ++k) {
+            const std::uint64_t at = rsp + 8ull * static_cast<std::uint64_t>(k);
+            if (!page_ok(at) || (at >> 12) != (rsp >> 12)) break;
+            frame[1 + k] = not_host(*reinterpret_cast<const std::uint64_t*>(at));
+        }
+        if (page_ok(rbp + 8) && ((rbp + 8) >> 12) == (rsp >> 12)) frame[7] = not_host(*reinterpret_cast<const std::uint64_t*>(rbp + 8));
+    }
+    if (write_watch_on_fault(static_cast<std::uint64_t>(r->ExceptionInformation[1]), is_write, frame)) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -403,6 +428,12 @@ LONG CALLBACK write_watch_veh(EXCEPTION_POINTERS* ep) {
 
 bool write_watch_install() {
     if (!g_enabled) return false;
+    if (const auto* base = reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr))) {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        g_host_lo = reinterpret_cast<std::uintptr_t>(base);
+        g_host_hi = g_host_lo + nt->OptionalHeader.SizeOfImage;
+    }
     static PVOID h = AddVectoredExceptionHandler(1, write_watch_veh);
     return h != nullptr;
 }

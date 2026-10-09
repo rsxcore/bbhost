@@ -16,11 +16,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 8 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 10 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **129** |
-| With any code byte changed (including byte patches and redirected calls) | 152; 234 at 60 fps |
+| **Taken over in all** | **131** |
+| With any code byte changed (including byte patches and redirected calls) | 154; 236 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -41,6 +41,19 @@ when there is a reason to change them, not for their own sake.
 | flush wait (`sub_15d7030`) | `0x15d7030` | the render thread's wait for the GPU to finish a flush | the same condition, yielding the core instead of spinning on it |
 | the game's `memcpy` (`sub_2a1a1b0`) | `0x2a1a1b0` | the engine's own memory copy, 1,440 call sites | checked by what it copies |
 | parallel resource copy (`sub_23bde30`) | `0x23bde30` | the copy of streamed resource data across the engine's worker pool | copies on the calling thread; removes a ~1 s wait per area tour |
+| effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code (`tests/sfx_ribbon_test.cpp`), 21 calls compared in a world session: 0 differences |
+| effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips, 426 calls compared in a world session: 0 differences |
+
+The two ribbon writers are rewritten for Windows. The game's versions keep
+their arguments in the 128 bytes below the stack pointer - the red zone, which
+the SysV convention the game is built for promises no signal will touch.
+Windows has no red zone: an exception writes its frame there. The texture
+write watch takes an exception at the first write to a page it watches, and
+the ribbons' vertices often land in such pages, so on Windows the game read
+its own pointers back as zero and crashed at `0x2cce9b5` (the crash the
+community's "Intel 12th Gen+ SFX workaround" patch avoids by not drawing
+those effects). The rewrites keep nothing below the stack pointer. Linux
+skips the red zone when it delivers a signal, so only Windows crashed.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With

@@ -11,6 +11,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   linux:
+    # The check master's ruleset requires: one name per job, across workflows.
+    name: tests
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

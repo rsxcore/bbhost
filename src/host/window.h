@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <string>
 
+#include "host/text_entry.h"
+
 // The DualShock 4 touchpad surface, in its own pixels. This is what
 // scePadGetControllerInformation reports, so the fingers below are in the same
 // space the game is told to expect.
@@ -99,20 +101,29 @@ bool host_key_strong();
 // also hides the window system's.
 void host_mouse_set_visible(bool visible);
 
-// Text entry for the game's IME dialog: while active the window collects
-// typed text (shown in the title bar; the keyboard no longer drives the
-// pad), Enter accepts, Escape cancels. Safe to call from any thread.
-// hidden: the title shows a star per character (a password).
 // A line of text over the game for `seconds` (plugins' show_message); a new
 // one replaces the last. Any thread.
 void host_message_show(const char* text, float seconds);
+// Text entry for the game's IME dialog: while active the window collects
+// typed text in a box over the game, and the box owns the input - the game
+// sees a connected pad with nothing pressed and no pointer, as a PS4 game
+// does while the system's keyboard is up. Enter (or a controller's confirm)
+// accepts, Escape (or its back) cancels. Safe to call from any thread.
+// hidden: a star per character (a password).
 // label: what the box over the game asks for (the game's own dialog title,
 // "Enter Chalice Glyph"); "Enter name" without one. Ctrl+V (or Shift+Insert)
 // pastes the clipboard.
-void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden = false, const char* label = nullptr);
+// charset: what the box takes (host/text_entry.h); typed characters outside
+// it are left out.
+// select_initial: the starting text is a suggestion that the first key typed
+// replaces (host/text_entry.h).
+void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden = false, const char* label = nullptr,
+                           TextCharset charset = TextCharset::Any, bool select_initial = false);
 // 0 = editing, 1 = accepted, 2 = cancelled (or no window); fills `text`.
 int host_text_entry_poll(std::string& text_utf8);
 void host_text_entry_end();
+// Whether a text entry is open (begun and not yet ended), whoever opened it.
+bool host_text_entry_open();
 void host_pad_rumble(std::uint8_t small, std::uint8_t large);
 // A gamepad is open. What the port shows for a button prompt follows it when
 // the setting is on Auto (engine/key_prompts.h).

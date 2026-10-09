@@ -35,8 +35,8 @@ struct HostConfig {
     int update_check = -1;           // update.check: true/false
     std::string update_source;       // update.source: a GitHub "releases/latest" API URL
     std::string update_token_file;   // update.token_file
-    std::string player_name;   // player.name: what the game's text dialogs receive (default online_id)
-    std::string ime_mode;      // player.ime: "type" (default: type in the window) or "auto" (enter player.name at once)
+    std::string player_name;   // player.name: what the name box starts from, or receives with "auto" (default online_id)
+    std::string ime_mode;      // player.ime / BBHOST_IME: "type" (default: type in the window) or "auto" (the name is player.name at once)
     int width = 1920;          // video.width
     int height = 1080;         // video.height
     int fps_cap = 30;          // video.fps_cap
@@ -97,7 +97,12 @@ void config_set_skip_intro(bool on);
 //       players; a file that still has the old plain-http settings for it is
 //       rewritten with the new ones (scheme, verify_tls, require_account,
 //       auth_server).
-constexpr int kUserConfigVersion = 3;
+//   4 - the first-start template wrote player.ime = "auto", which answered
+//       the name before it could be typed and cancelled the chalice glyph
+//       and network password boxes as they opened; a file that still has it
+//       is rewritten to "type", the default (BBHOST_IME=auto keeps a
+//       harness's).
+constexpr int kUserConfigVersion = 4;
 // The game folder and its update. The PS4 applies an update by putting its
 // files in place of the game's; a dump can keep the update in a folder of its
 // own beside the game's, named after it with "-UPDATE" or "-patch" appended

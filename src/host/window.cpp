@@ -102,24 +102,10 @@ int g_text_result = 0;
 // until it is let go: still held when the entry closed, it read as the menu's
 // confirm (or Options) and the game opened the name entry again at once.
 std::atomic<int> g_text_end_key{-1};
-unsigned g_text_max = 0;
-std::string g_text;
+// The same for a controller's button (an SDL_GamepadButton), when one ended it.
+std::atomic<int> g_text_end_button{-1};
+TextEntry g_entry;  // the text and what the box takes (host/text_entry.h)
 std::string g_text_label = "Enter name";  // what the box over the game asks for
-
-// Appends typed or pasted UTF-8 to the entry, up to its length in code points;
-// control characters (a pasted line's end, a tab) are left out. Under g_text_mu.
-void text_insert_locked(const char* utf8) {
-    unsigned cps = 0;
-    for (const char* q = g_text.c_str(); *q; ++q) cps += (static_cast<unsigned char>(*q) & 0xc0) != 0x80;
-    for (const char* c = utf8; *c; ++c) {
-        const unsigned char u = static_cast<unsigned char>(*c);
-        if (u < 0x20 || u == 0x7f) continue;
-        const bool lead = (u & 0xc0) != 0x80;
-        if (lead && cps >= g_text_max) break;
-        g_text.push_back(*c);
-        cps += lead;
-    }
-}
 
 
 #if defined(BBHOST_HAVE_SDL3)
@@ -840,14 +826,34 @@ void text_title_locked() {
 #if defined(BBHOST_HAVE_SDL3)
     if (!g_window) return;
     if (g_text_want) {
-        std::string shown = g_text;
-        if (g_text_hidden) shown.assign(shown.size(), '*');
+        std::string shown = g_entry.text;
+        if (g_text_hidden) shown.assign(g_entry.length(), '*');
         const std::string t = "Bloodborne (bbhost)  |  " + g_text_label + ": " + shown +
                               "_   (Enter = OK, Esc = cancel, Ctrl+V = paste)";
         SDL_SetWindowTitle(g_window, t.c_str());
     } else {
         SDL_SetWindowTitle(g_window, "Bloodborne (bbhost)");
     }
+#endif
+}
+
+// A box that takes ASCII alone - each of the game's three - has no use for an
+// IME: whatever it composed (kana, hanzi) the box would leave out, and the
+// console's basic-Latin keyboard has no such thing either. On Windows the
+// window's IME is taken off while such a box is up, so the keys type the
+// layout's own letters whichever input method is chosen. SDL puts the IME back
+// each time text input starts, a focus gain included, which is when this runs.
+// Under g_text_mu.
+void ime_off_for_ascii_locked() {
+#if defined(_WIN32)
+    if (!g_window || !text_charset_ascii(g_entry.charset)) return;
+    using AssociateContext = void* (*)(void* hwnd, void* himc);  // imm32's ImmAssociateContext
+    static const AssociateContext associate = [] {
+        SDL_SharedObject* imm = SDL_LoadObject("imm32.dll");  // SDL's own IME support has it loaded already
+        return imm ? reinterpret_cast<AssociateContext>(SDL_LoadFunction(imm, "ImmAssociateContext")) : nullptr;
+    }();
+    void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(g_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    if (associate && hwnd) associate(hwnd, nullptr);
 #endif
 }
 
@@ -889,11 +895,33 @@ void update_pad() {
                      static_cast<unsigned>(mb));
         }
     }
-    if (host_options_open() || ingame_menu_open() || binding) {
+    // And so is a text box. On the console the keyboard is the system's, and
+    // while it is up the game's pad reads nothing pressed (the controller is
+    // the system's); here the box takes the keys and a controller's confirm
+    // and back, and a Circle or a d-pad press meant for it must not also work
+    // the menu behind.
+    bool typing;
+    {
+        std::lock_guard<std::mutex> lock(g_text_mu);
+        typing = g_text_want;
+    }
+    if (host_options_open() || ingame_menu_open() || binding || typing) {
         p.connected = true;
+        g_key_strong.store(false, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(g_pad_mu);
         g_pad = p;
         return;
+    }
+    // The controller button that ended a text entry stays out of the pad
+    // until it is let go, as the key does (g_text_end_key).
+    int end_button = g_text_end_button.load(std::memory_order_relaxed);
+    if (end_button >= 0) {
+        bool held = false;
+        for (SDL_Gamepad* g : g_pads) held = held || SDL_GetGamepadButton(g, static_cast<SDL_GamepadButton>(end_button));
+        if (!held) {
+            g_text_end_button.store(-1, std::memory_order_relaxed);
+            end_button = -1;
+        }
     }
     // Each pad's buttons are or-ed together, and each stick axis and trigger
     // is whichever pad pushes it furthest, so two pads never fight.
@@ -901,7 +929,7 @@ void update_pad() {
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
         auto btn = [&](SDL_GamepadButton b, std::uint32_t bit) {
-            if (SDL_GetGamepadButton(g_gamepad, b)) {
+            if (static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b)) {
                 p.buttons |= bit;
             }
         };
@@ -980,15 +1008,10 @@ void update_pad() {
     // whichever device the player reaches for wins without a mode anywhere.
     int nkeys = 0;
     const bool* keys = SDL_GetKeyboardState(&nkeys);
-    bool typing;
-    {
-        std::lock_guard<std::mutex> lock(g_text_mu);
-        typing = g_text_want;
-    }
     // The key that ended a text entry stays out of the pad until released.
     const int end_key = g_text_end_key.load(std::memory_order_relaxed);
-    if (end_key >= 0 && !typing && !(keys && end_key < nkeys && keys[end_key])) g_text_end_key.store(-1, std::memory_order_relaxed);
-    if (keys && !typing && SDL_GetKeyboardFocus() == g_window) {
+    if (end_key >= 0 && !(keys && end_key < nkeys && keys[end_key])) g_text_end_key.store(-1, std::memory_order_relaxed);
+    if (keys && SDL_GetKeyboardFocus() == g_window) {
         auto down = [&](SDL_Scancode sc) { return sc < nkeys && keys[sc] && static_cast<int>(sc) != g_text_end_key.load(std::memory_order_relaxed); };
         if (down(SDL_SCANCODE_UP)) p.menu_buttons |= kUp;
         if (down(SDL_SCANCODE_DOWN)) p.menu_buttons |= kDown;
@@ -1231,7 +1254,12 @@ bool host_window_pump() {
         std::lock_guard<std::mutex> lock(g_text_mu);
         if (g_text_want != g_text_on) {
             g_text_on = g_text_want;
-            if (g_text_on) SDL_StartTextInput(g_window); else SDL_StopTextInput(g_window);
+            if (g_text_on) {
+                SDL_StartTextInput(g_window);
+                ime_off_for_ascii_locked();
+            } else {
+                SDL_StopTextInput(g_window);
+            }
             text_title_locked();
         }
     }
@@ -1257,9 +1285,11 @@ bool host_window_pump() {
             case SDL_EVENT_QUIT:
                 return false;
             case SDL_EVENT_TEXT_INPUT: {
+                // Not while F10's screen is up over the game's box, unless
+                // one of the screen's own fields is being typed: it is modal.
                 std::lock_guard<std::mutex> lock(g_text_mu);
-                if (g_text_on && e.text.text) {
-                    text_insert_locked(e.text.text);
+                if (g_text_on && e.text.text && (!host_options_open() || host_options_editing())) {
+                    g_entry.insert(e.text.text);
                     text_title_locked();
                 }
                 break;
@@ -1293,17 +1323,24 @@ bool host_window_pump() {
                 }
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (g_text_on) {
-                    if (e.key.key == SDLK_BACKSPACE && !g_text.empty()) {
-                        do { g_text.pop_back(); } while (!g_text.empty() && (static_cast<unsigned char>(g_text.back()) & 0xc0) == 0x80);
+                    const SDL_Keycode k = e.key.key;
+                    if (k == SDLK_BACKSPACE) {
+                        g_entry.backspace();
                         text_title_locked();
-                    } else if (e.key.key == SDLK_RETURN || e.key.key == SDLK_KP_ENTER) {
-                        g_text_result = 1;
+                    } else if (k == SDLK_DELETE) {
+                        g_entry.erase_selection();
+                        text_title_locked();
+                    } else if (k == SDLK_RIGHT || k == SDLK_END) {
+                        g_entry.keep();  // to the suggestion's end, to type after it
+                    } else if ((k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_ESCAPE) && !e.key.repeat) {
+                        // A fresh press only. The Enter that opened the box is
+                        // often still down when it appears, and held into the
+                        // key's auto-repeat it accepted the box before a
+                        // letter could be typed.
+                        g_text_result = k == SDLK_ESCAPE ? 2 : 1;
                         g_text_end_key.store(e.key.scancode, std::memory_order_relaxed);
-                    } else if (e.key.key == SDLK_ESCAPE) {
-                        g_text_result = 2;
-                        g_text_end_key.store(e.key.scancode, std::memory_order_relaxed);
-                    } else if ((e.key.key == SDLK_V && (e.key.mod & SDL_KMOD_CTRL)) ||
-                               (e.key.key == SDLK_INSERT && (e.key.mod & SDL_KMOD_SHIFT))) {
+                    } else if ((k == SDLK_V && (e.key.mod & SDL_KMOD_CTRL)) ||
+                               (k == SDLK_INSERT && (e.key.mod & SDL_KMOD_SHIFT))) {
                         // Paste: a chalice glyph copied from a web page or a
                         // chat, its surrounding spaces and line ends dropped.
                         if (char* clip = SDL_GetClipboardText()) {
@@ -1312,7 +1349,7 @@ bool host_window_pump() {
                             const std::size_t b = s.find_first_not_of(" \t\r\n");
                             const std::size_t e2 = s.find_last_not_of(" \t\r\n");
                             s = b == std::string::npos ? std::string() : s.substr(b, e2 - b + 1);
-                            text_insert_locked(s.c_str());
+                            g_entry.insert(s.c_str());
                             text_title_locked();
                         }
                     }
@@ -1385,16 +1422,40 @@ bool host_window_pump() {
             // (SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS is off), so a game
             // that ignores every input may be a window that lost focus.
             case SDL_EVENT_WINDOW_FOCUS_GAINED:
-            case SDL_EVENT_WINDOW_FOCUS_LOST:
+            case SDL_EVENT_WINDOW_FOCUS_LOST: {
                 host_log("window: keyboard focus %s", e.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "gained" : "lost");
+                // SDL restarted text input with the focus, and the IME with it.
+                std::lock_guard<std::mutex> lock(g_text_mu);
+                if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED && g_text_on) ime_off_for_ascii_locked();
                 break;
+            }
             case SDL_EVENT_GAMEPAD_ADDED:
                 pad_open(e.gdevice.which);
                 break;
-            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
                 note_input(InputDevice::Pad);
                 g_last_pad_press = std::chrono::steady_clock::now();
+                // A text box takes a controller's confirm as Enter and its
+                // back as Escape (Options accepts too), the game's region
+                // deciding which button is which: a player with only a
+                // controller in hand is never left in a box that only a
+                // keyboard can close. A press, so the button that opened the
+                // box - still held when it appears - does not close it.
+                std::lock_guard<std::mutex> lock(g_text_mu);
+                if (!g_text_on || host_options_open()) break;
+                const std::uint32_t bit = e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH  ? kCross
+                                          : e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST ? kCircle
+                                                                                         : 0u;
+                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START || (bit && bit == menu_confirm_button())) {
+                    g_text_result = 1;
+                } else if (bit && bit == menu_back_button()) {
+                    g_text_result = 2;
+                } else {
+                    break;
+                }
+                g_text_end_button.store(e.gbutton.button, std::memory_order_relaxed);
                 break;
+            }
             case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
                 // Past the dead zone: half a stick's throw, a quarter of a
                 // trigger's - a resting stick reads a few hundred either way.
@@ -1411,10 +1472,12 @@ bool host_window_pump() {
     }
     update_pad();
     // BBHOST_IME_TEST=1: open the text box at startup, so the overlay's font
-    // and layout can be seen without reaching character creation.
-    static const bool ime_test = [] {
+    // and layout can be seen without reaching character creation. It opens as
+    // the name box does (hle/dialog.cpp); =glyph and =password open it as the
+    // other two of the game's boxes, which are deeper in than a test reaches.
+    static const int ime_test = [] {
         const char* e = std::getenv("BBHOST_IME_TEST");
-        return e && e[0] == '1';
+        return !e ? 0 : !std::strcmp(e, "1") ? 1 : !std::strcmp(e, "glyph") ? 2 : !std::strcmp(e, "password") ? 3 : 0;
     }();
     if (ime_test) {
         // It has to close the way a real dialog does. While text entry is
@@ -1425,7 +1488,9 @@ bool host_window_pump() {
         static bool opened = false;
         if (!opened && g_ime_test_reopen.exchange(false)) {
             opened = true;
-            host_text_entry_begin("Hunter", 16);
+            if (ime_test == 1) host_text_entry_begin("Hunter", 16, false, "Please Enter Name", TextCharset::BasicLatin, true);
+            if (ime_test == 2) host_text_entry_begin("", 8, false, "Enter Chalice Glyph", TextCharset::Glyph);
+            if (ime_test == 3) host_text_entry_begin("", 8, false, "Enter password", TextCharset::BasicLatin);
         }
         if (opened) {
             std::string typed;
@@ -1511,13 +1576,25 @@ bool host_window_pump() {
             host_overlay_rect(bx, by, bw, bh, 0x0a0a0aee);
             host_overlay_text(bx + 20.0f, by + 16.0f, 0.8f, 0xc8a05aff, g_text_label.c_str());
             const float tx = bx + 20.0f, ty = by + 58.0f;
-            const float w = host_overlay_text(tx, ty, 1.4f, 0xffffffffu, g_text.c_str());
+            const std::string shown = g_text_hidden ? std::string(g_entry.length(), '*') : g_entry.text;
+            // A suggestion is drawn selected, the way a PC text field shows
+            // text the first key will type over.
+            if (g_entry.selected) {
+                host_overlay_rect(tx - 3.0f, ty - 2.0f, host_overlay_text_width(1.4f, shown.c_str()) + 6.0f, 38.0f, 0xc8a05a80u);
+            }
+            const float w = host_overlay_text(tx, ty, 1.4f, 0xffffffffu, shown.c_str());
             // A caret that blinks, so an empty field still looks like one that
             // is waiting for typing rather than one that is broken.
             static std::uint64_t ticks = 0;
             if ((++ticks / 30) % 2 == 0) host_overlay_rect(tx + w + 2.0f, ty, 2.0f, 34.0f, 0xffffffffu);
-            host_overlay_text(bx + 20.0f, by + bh - 30.0f, 0.62f, 0x9a9a9aff,
-                              "Enter accepts    Esc cancels    Backspace deletes    Ctrl+V pastes");
+            // With a controller in hand, the buttons that close the box; the
+            // typing itself is the keyboard's, or Steam's on-screen one.
+            const char* help = "Enter accepts    Esc cancels    Backspace deletes    Ctrl+V pastes";
+            if (host_input_device() == InputDevice::Pad) {
+                help = menu_confirm_button() == kCross ? "Cross / A accepts    Circle / B cancels    Type on a keyboard"
+                                                       : "Circle / B accepts    Cross / A cancels    Type on a keyboard";
+            }
+            host_overlay_text(bx + 20.0f, by + bh - 30.0f, 0.62f, 0x9a9a9aff, help);
         }
     }
     // The rows the port adds to the game's own System menu write their bytes
@@ -1604,19 +1681,19 @@ void host_message_show(const char* text, float seconds) {
                      std::chrono::milliseconds(static_cast<long long>((seconds > 0.0f ? seconds : 3.0f) * 1000.0f));
 }
 
-void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden, const char* label) {
+void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden, const char* label, TextCharset charset,
+                           bool select_initial) {
     std::lock_guard<std::mutex> lock(g_text_mu);
-    g_text = initial_utf8 ? initial_utf8 : "";
+    g_entry.begin(initial_utf8, max_chars, charset, select_initial);
     g_text_label = label && label[0] ? label : "Enter name";
     g_text_hidden = hidden;
-    g_text_max = max_chars ? max_chars : 32;
     g_text_result = 0;
     g_text_want = true;
 }
 
 int host_text_entry_poll(std::string& text_utf8) {
     std::lock_guard<std::mutex> lock(g_text_mu);
-    text_utf8 = g_text;
+    text_utf8 = g_entry.text;
     if (!g_active) return 2;
     return g_text_result;
 }
@@ -1625,6 +1702,11 @@ void host_text_entry_end() {
     std::lock_guard<std::mutex> lock(g_text_mu);
     g_text_want = false;
     g_text_result = 0;
+}
+
+bool host_text_entry_open() {
+    std::lock_guard<std::mutex> lock(g_text_mu);
+    return g_text_want;
 }
 
 // Presentation runs on its own thread. vkAcquireNextImageKHR on a FIFO

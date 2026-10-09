@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -149,6 +150,36 @@ int main() {
     {
         HostConfig c = load("[online]\nhost = \"thehuntersdream.com\"\nscheme = \"http\"\n\n[bbhost]\nconfig_version = 3\n");
         CHECK(c.online_scheme == "http");
+    }
+
+    // The first-start template's player.ime = "auto", which kept the game's
+    // text boxes from being typed in: rewritten to "type", in a file the
+    // setup window never saved and in one it saved before version 4.
+    {
+        HostConfig c = load("[player]\nname = \"Hunter\"\n# auto: the dialog is answered with `name` at once.\nime = \"auto\"\n");
+        CHECK(c.ime_mode == "type");
+        std::string f = read(g_dir / "config" / "bbhost.toml");
+        CHECK(f.find("ime = \"type\"") != std::string::npos && f.find("ime = \"auto\"") == std::string::npos);
+        CHECK(f.find("# auto: the dialog is answered") != std::string::npos);  // the rest of the file as it was
+        c = load("[player]\nime = \"auto\"\n\n[bbhost]\nconfig_version = 3\n");
+        CHECK(c.ime_mode == "type");
+        // From version 4 on, "auto" was set by the player: kept.
+        c = load("[player]\nime = \"auto\"\n\n[bbhost]\nconfig_version = 4\n");
+        CHECK(c.ime_mode == "auto");
+        // And a harness keeps its own either way.
+        setenv("BBHOST_IME", "auto", 1);
+        c = load("[player]\nime = \"type\"\n");
+        CHECK(c.ime_mode == "auto");
+        unsetenv("BBHOST_IME");
+    }
+    // The template a first start writes types in the window.
+    {
+        const fs::path t = g_dir / "template.toml";
+        CHECK(config_write_template(t.string()));
+        std::map<std::string, std::string> kv;
+        std::string err;
+        CHECK(config_parse_toml(t.string(), &kv, &err));
+        CHECK(kv["player.ime"] == "\"type\"");
     }
 
     // The game folder, then an update folder beside it: "-patch", and

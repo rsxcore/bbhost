@@ -494,6 +494,13 @@ std::string account_detail() {
 }
 
 void edit_begin(int field) {
+    // The window has one text entry. Taken from the game's own box while that
+    // is open, it ended the box with this field's text - or, closed with the
+    // screen, left the game waiting on a box nobody could type into again.
+    if (g_edit_field < 0 && host_text_entry_open()) {
+        set_account_lines("Finish the game's text box first (Enter or Escape)", "");
+        return;
+    }
     g_edit_field = field;
     host_text_entry_begin(g_field[field].c_str(), field == 0 ? 16 : 48, false, field == 0 ? "Account name" : "Recovery code");
 }
@@ -986,6 +993,7 @@ void host_options_load() {
 }
 
 bool host_options_open() { return g_open.load(std::memory_order_relaxed); }
+bool host_options_editing() { return g_edit_field >= 0; }
 
 void host_options_set_open(bool open) {
     if (open == g_open.load(std::memory_order_relaxed)) {

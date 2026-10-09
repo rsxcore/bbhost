@@ -445,6 +445,31 @@ void move_live_server_to_https(const std::string& path) {
              keys.c_str());
 }
 
+// The first-start template wrote player.ime = "auto" (below config_version
+// 4): the character's name was answered with player.name before it could be
+// typed, and the chalice glyph and network password boxes were cancelled the
+// moment they opened, so none of the three could be typed in. That was the
+// template's value, not a choice, and a file that still has it is set to
+// "type", the default.
+void move_ime_to_type(const std::string& path) {
+    std::map<std::string, std::string> kv;
+    std::string err;
+    if (!parse_file(path, &kv, &err)) return;
+    const auto get = [&](const std::string& k) {
+        auto it = kv.find(k);
+        return it == kv.end() ? std::string() : unquote(it->second);
+    };
+    const std::string ver = get("bbhost.config_version");
+    if ((ver.empty() ? 1 : std::atoi(ver.c_str())) >= 4 || get("player.ime") != "auto") return;
+    if (!config_set_values(path, {{"player", "ime", "\"type\""}})) {
+        host_log("config: could not set player.ime to \"type\" in %s", path.c_str());
+        return;
+    }
+    host_log("config: %s: player.ime was the old template's \"auto\", which kept the game's text boxes from being typed in; "
+             "set to \"type\"",
+             path.c_str());
+}
+
 // A bbhost.toml from before the per-user config (beside an older package's
 // exe, or in the working directory) that names the game: copied to the user
 // config once, its relative paths made absolute - the saves stay where they
@@ -572,6 +597,7 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     if (file_exists(user_cfg)) {
         upgrade_user_config(user_cfg);
         move_live_server_to_https(user_cfg);
+        move_ime_to_type(user_cfg);
     }
     std::map<std::string, std::string> merged;
     std::string layers;
@@ -703,6 +729,9 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     if (const char* e = std::getenv("BBHOST_SETUP_WINDOW")) {
         if (std::strcmp(e, "1") == 0) c.setup_always = true;
         else if (std::strcmp(e, "0") == 0) c.setup_always = false;
+    }
+    if (const char* e = std::getenv("BBHOST_IME")) {
+        if (std::strcmp(e, "type") == 0 || std::strcmp(e, "auto") == 0) c.ime_mode = e;
     }
     g_cfg = c;
     *out = c;
@@ -914,11 +943,13 @@ bool config_write_template(const std::string& path) {
            "# \"off\" never asks.\n"
            "# stun_server = \"thehuntersdream.com:3478\"\n"
            "\n[player]\n"
-           "# Text the game's name dialog receives (character name). Default: online_id.\n"
+           "# The character's name the name box starts from (the first key typed\n"
+           "# replaces it). Default: online_id.\n"
            "name = \"Hunter\"\n"
-           "# auto: the dialog is answered with `name` at once. type: type it in the\n"
-           "# window (the title bar shows the text; Enter accepts, Escape cancels).\n"
-           "ime = \"auto\"\n"
+           "# type: the game's text boxes - the character's name, a chalice glyph,\n"
+           "# the network password - are typed in a box over the game (Enter\n"
+           "# accepts, Escape cancels). auto: the name is `name` at once.\n"
+           "ime = \"type\"\n"
            "\n[video]\n"
            "width = 1920\n"
            "height = 1080\n"

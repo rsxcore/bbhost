@@ -73,6 +73,15 @@ take over and the button prompts follow: the mouse turns the camera and works
 in the menus, and every action can be rebound (F10 or the game's Key Bindings
 menu). F9 opens the plugin menu and F10 bbhost's own settings.
 
+The character's name, a chalice glyph and the network password are typed in
+a box over the game, which stands in for the console's on-screen keyboard:
+Enter accepts, Escape cancels, Backspace deletes and Ctrl+V pastes. A
+controller's Cross (A) accepts and Circle (B) cancels. The boxes take what the
+console's keyboard offers - letters, digits and punctuation from plain ASCII -
+and a glyph takes its own 32 characters, lowercased as they are typed. The
+name box starts from `[player] name`, which the first key typed replaces;
+`[player] ime = "auto"` answers it with that name instead.
+
 ## Logs
 
 bbhost logs to standard error. The packages' `run-bbhost.bat` (Windows) and
@@ -175,7 +184,9 @@ The English is `plugins/debug_menu/strings_en.tsv`: each string's address in the
 `tools/debug_menu_strings.py list` shows the Japanese beside it from your own
 eboot, `missing` what has no English yet, and `check` tests every row (the
 hash, the printf conversions, the font). Corrections are welcome as pull
-requests.
+requests. A few strings keep the developers' text because the game looks them
+up by name - the names the character scripts call the game's functions by, for
+one - and `check` refuses a row for any of them.
 
 The menu draws with a debug font the game does not ship. The plugin makes one
 from the public-domain X11 fonts k14 and 7x14, so nothing has to be

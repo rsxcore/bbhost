@@ -1516,7 +1516,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         // who wants the pad to own the camera.
         const HostSettings hs = host_settings();
         const bool want = hs.mouse_camera && !host_options_open() && !ingame_menu_open() &&
-                          !menu_pointer_in_menu();
+                          !menu_pointer_in_menu() && !host_text_entry_open();
         if (want != host_mouse_relative()) {
             host_mouse_set_relative(want);
         }
@@ -1592,6 +1592,12 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     if (p.menu_buttons && (menu_pointer_in_menu() || debug_menu_open())) {
         p.buttons |= p.menu_buttons;
     }
+    // A text box over the game (the IME dialog's, host/window.h) holds the
+    // pointer as it holds the pad: a click or a wheel notch there is the
+    // box's, so it is taken and dropped rather than kept latched for the menu
+    // behind to act on once the box has closed. F10's screen, when it is up
+    // as well, is the pointer's reader instead.
+    const bool typing = host_text_entry_open();
     // The pointer drives the menus only while one is open - otherwise a click
     // in the world would send Circle at whatever the last menu was.
     if (host_settings().mouse_menu && !host_options_open() && !host_mouse_relative() &&
@@ -1601,61 +1607,74 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         static std::uint32_t held = 0;
         static int hold_polls = 0;
         static std::uint64_t hold_until_flip = 0;
-        const MouseState m = host_mouse_state();
-        std::uint32_t want = 0;
-        // Which button decides is the game's region's convention - Cross in
-        // the US build, Circle in the Japanese region this host reported by
-        // mistake until 2026-09-18 - so the pointer asks the game
-        // (menu_confirm_button) rather than assuming either.
-        //
-        // A click is a decide **only on an item**, as in DS3: it is handed to
-        // the menu's list update (engine/menu_pointer.h), which hit-tests it,
-        // moves the cursor there, and answers here a frame later. A click on
-        // empty space does nothing.
-        if (m.pressed & 1u) {
-            menu_pointer_click();
-        }
-        // DS3's arrow selector steps on its click action while it is *held*
-        // (sub_140ac8860 reads action 0x13 through the held/repeat query), so
-        // holding the button on an arrow keeps stepping. The same here: a
-        // click the menu resolved to Left or Right stays pressed while the
-        // button does and the pointer stays put, and the game's own
-        // auto-repeat on a held direction does the stepping.
-        const std::uint32_t pressed_now = menu_pointer_take_press();
-        want |= pressed_now;
         static std::uint32_t repeat = 0;
         static float rx = 0.0f, ry = 0.0f;
-        if (pressed_now & 0xa0u) {
-            repeat = pressed_now & 0xa0u;
-            rx = m.x;
-            ry = m.y;
-        }
-        if (repeat && (!(m.buttons & 1u) || std::fabs(m.x - rx) > 24.0f || std::fabs(m.y - ry) > 24.0f)) {
-            repeat = 0;
-        }
-        if (m.pressed & 2u) want |= menu_back_button();  // right returns
-        if (m.wheel > 0.0f) want |= 0x10u;     // wheel up -> Up
-        if (m.wheel < 0.0f) want |= 0x40u;     // wheel down -> Down
-        if (want) {
-            held = want;
-            hold_polls = 8;
-            // The menus sample the pad once a frame, so a press must outlive
-            // a frame: 8 polls (~34 ms) is two frames at 60 fps and none at
-            // all in a paired run at 9 fps, where a click on Use did nothing.
-            hold_until_flip = hle_video_flip_count() + 2;
-            static int logs = 0;
-            if (logs < 12) {
-                ++logs;
-                host_log("mouse: menu press %04x from the pointer at %.0f,%.0f", want, m.x, m.y);
+        const MouseState m = host_mouse_state();
+        if (typing) {
+            // So does a press still held from the click that opened the box:
+            // its hold only counts down here, and kept through the box it
+            // reached the menu the moment the box closed - the game opened
+            // the name box again over the name just typed.
+            held = repeat = 0;
+            hold_polls = 0;
+            hold_until_flip = 0;
+            menu_pointer_take_press();
+        } else {
+            std::uint32_t want = 0;
+            // Which button decides is the game's region's convention - Cross in
+            // the US build, Circle in the Japanese region this host reported by
+            // mistake until 2026-09-18 - so the pointer asks the game
+            // (menu_confirm_button) rather than assuming either.
+            //
+            // A click is a decide **only on an item**, as in DS3: it is handed to
+            // the menu's list update (engine/menu_pointer.h), which hit-tests it,
+            // moves the cursor there, and answers here a frame later. A click on
+            // empty space does nothing.
+            if (m.pressed & 1u) {
+                menu_pointer_click();
             }
+            // DS3's arrow selector steps on its click action while it is *held*
+            // (sub_140ac8860 reads action 0x13 through the held/repeat query), so
+            // holding the button on an arrow keeps stepping. The same here: a
+            // click the menu resolved to Left or Right stays pressed while the
+            // button does and the pointer stays put, and the game's own
+            // auto-repeat on a held direction does the stepping.
+            const std::uint32_t pressed_now = menu_pointer_take_press();
+            want |= pressed_now;
+            if (pressed_now & 0xa0u) {
+                repeat = pressed_now & 0xa0u;
+                rx = m.x;
+                ry = m.y;
+            }
+            if (repeat && (!(m.buttons & 1u) || std::fabs(m.x - rx) > 24.0f || std::fabs(m.y - ry) > 24.0f)) {
+                repeat = 0;
+            }
+            if (m.pressed & 2u) want |= menu_back_button();  // right returns
+            if (m.wheel > 0.0f) want |= 0x10u;     // wheel up -> Up
+            if (m.wheel < 0.0f) want |= 0x40u;     // wheel down -> Down
+            if (want) {
+                held = want;
+                hold_polls = 8;
+                // The menus sample the pad once a frame, so a press must outlive
+                // a frame: 8 polls (~34 ms) is two frames at 60 fps and none at
+                // all in a paired run at 9 fps, where a click on Use did nothing.
+                hold_until_flip = hle_video_flip_count() + 2;
+                static int logs = 0;
+                if (logs < 12) {
+                    ++logs;
+                    host_log("mouse: menu press %04x from the pointer at %.0f,%.0f", want, m.x, m.y);
+                }
+            }
+            if (hold_polls > 0 || hle_video_flip_count() < hold_until_flip) {
+                if (hold_polls > 0) --hold_polls;
+                p.buttons |= held;
+            }
+            p.buttons |= repeat;
+            // Hover is not here: it happens inside the menu's own list update, where
+            // the game moves its cursor (engine/menu_pointer.h).
         }
-        if (hold_polls > 0 || hle_video_flip_count() < hold_until_flip) {
-            if (hold_polls > 0) --hold_polls;
-            p.buttons |= held;
-        }
-        p.buttons |= repeat;
-        // Hover is not here: it happens inside the menu's own list update, where
-        // the game moves its cursor (engine/menu_pointer.h).
+    } else if (typing && !host_options_open()) {
+        host_mouse_state();  // the box's, outside a menu as well
     }
     // BBHOST_AUTOPRESS=1: headless test aid; after 25 s tap Cross, Circle,
     // Options and Down in turn every 1.5 s so title/menu screens advance.

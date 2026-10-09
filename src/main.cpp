@@ -51,6 +51,8 @@
 #include <string>
 #include <vector>
 
+#include <cpuid.h>
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -236,6 +238,33 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
     joiner.join();
     munmap(map, total);
 #endif
+}
+
+// The processor, for reports from other machines: its name, and its family,
+// model and stepping as CPUID gives them, and whether it mixes core types.
+void log_cpu() {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char brand[49] = {};
+    if (__get_cpuid(0x80000000u, &a, &b, &c, &d) && a >= 0x80000004u) {
+        for (unsigned i = 0; i < 3; ++i) {
+            __get_cpuid(0x80000002u + i, &a, &b, &c, &d);
+            const unsigned regs[4] = {a, b, c, d};
+            std::memcpy(brand + 16 * i, regs, sizeof(regs));
+        }
+    }
+    const char* name = brand;
+    while (*name == ' ') ++name;
+    unsigned family = 0, model = 0, stepping = 0;
+    if (__get_cpuid(1, &a, &b, &c, &d)) {
+        stepping = a & 0xf;
+        family = (a >> 8) & 0xf;
+        model = (a >> 4) & 0xf;
+        if (family == 0xf) family += (a >> 20) & 0xff;
+        if (family == 0x6 || family >= 0xf) model |= ((a >> 16) & 0xf) << 4;
+    }
+    const bool hybrid = __get_cpuid_count(7, 0, &a, &b, &c, &d) && ((d >> 15) & 1);
+    host_log("cpu: %s (family 0x%x, model 0x%x, stepping %u%s), %u threads", *name ? name : "unknown", family, model, stepping,
+             hybrid ? ", hybrid" : "", std::thread::hardware_concurrency());
 }
 
 }  // namespace
@@ -800,6 +829,7 @@ int main(int argc, char** argv) {
     win_crash_install();                 // the crash report, behind it
     SetConsoleCtrlHandler(on_console_ctrl, TRUE);
     host_log("bbhost %s (%s, Windows x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
+    log_cpu();
     {
         // The machine's memory, for reports from other machines: the GPU
         // locks the guest's direct memory (6 GiB) in RAM when it imports it.
@@ -814,6 +844,7 @@ int main(int argc, char** argv) {
     }
 #else
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
+    log_cpu();
     std::signal(SIGTERM, on_term);
     {
         struct sigaction sa{};

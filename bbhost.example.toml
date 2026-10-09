@@ -47,12 +47,15 @@ playlog_sample_ms = 500
 sign_timeout_seconds = 30
 
 [player]
-# Text the game's name dialog receives (character name). Default: online_id.
+# The character's name the name box starts from (the first key typed replaces
+# it). Default: online_id.
 name = "Hunter"
-# type (default): type the name in the window; the title bar shows the text,
-# Enter accepts, Escape cancels, and pad/keyboard game input is held off while
-# it is up. auto: the dialog is answered with `name` at once (what a headless
-# run does regardless, since there is no window to type in).
+# type (default): the game's text boxes - the character's name, a chalice
+# glyph, the network password - are typed in a box over the game; Enter
+# accepts, Escape cancels, and the game sees no input while it is up. auto:
+# the name is answered with `name` at once (what a headless run does
+# regardless, since there is no window to type in); a glyph or a password is
+# still typed. BBHOST_IME=type or auto overrides this.
 ime = "type"
 
 [video]

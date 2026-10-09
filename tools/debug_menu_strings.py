@@ -53,6 +53,14 @@ KEEP = [
     (0x4d51080, 0x4d510c0, "debug menu node keys, looked up by name and never shown"),
     (0x4d6f952, 0x4d6f954, "a HUD part's name (F20-00_arms_r), which the game looks up"),
     (0x4d984a0, 0x4d984a2, "the line format of the normal menus' button hints, not the debug menu's"),
+    # The tables at 0x5734490 (56 act names) and 0x5734810 (129 env names)
+    # become maps from name to function number (sub_1e12720, sub_1e15d30), and
+    # SprjChrBehaviorScriptModule looks up every call a character's script
+    # makes in them. A name not found is no act, and an env that answers 0:
+    # in English every env answered 0 (the scripts' HP query among them), and
+    # the player and every enemy died a few seconds into each load.
+    (0x4d91d18, 0x4d92bfa, "the names the character scripts (action/script/*.hks) call the game's act and env "
+                           "functions by"),
 ]
 
 
@@ -257,7 +265,16 @@ def main():
     a = ap.parse_args()
     if not os.path.exists(a.eboot):
         print('no eboot at %s (--eboot or BBHOST_EBOOT)' % a.eboot)
-        return 77 if a.mode == 'check' else 1
+        if a.mode != 'check':
+            return 1
+        # A row for a kept string is wrong whatever the eboot, so a check
+        # without one (CI) still fails on it.
+        bad = 0
+        for bn, (_h, _english, line) in sorted(read_tsv(a.tsv).items()):
+            if kept(bn):
+                print('%s:%d (%x): must keep the game\'s text - %s' % (os.path.basename(a.tsv), line, bn, kept(bn)))
+                bad += 1
+        return 1 if bad else 77
     import hashlib
     if hashlib.sha256(open(a.eboot, 'rb').read()).hexdigest() != SHA_109:
         print('%s is not the 1.09 eboot' % a.eboot)

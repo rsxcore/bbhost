@@ -596,6 +596,13 @@ void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
     const bool moved = !fresh && (sx != s.x || sy != s.y);
     s.x = sx;
     s.y = sy;
+    // Nor under a text box (the IME dialog's): the pointer passing over the
+    // list behind it moved the game's cursor while the box was being typed
+    // in. Where it went is still noted, so that is not a movement to hover on
+    // once the box has closed either.
+    if (host_text_entry_open()) {
+        return;
+    }
     if (g_log && !s.logged) {
         s.logged = true;
         // Whether sub_1edbd20 found a ScrollBarV under the list's root: a list

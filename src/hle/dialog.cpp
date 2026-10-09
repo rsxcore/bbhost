@@ -74,13 +74,13 @@ GUEST_ABI int hle_msg_update() { return g_msg.update(); }
 GUEST_ABI int hle_msg_term() { return g_msg.term(); }
 
 // ---- sceImeDialog: text entry. Windowed, the host window collects the
-// typed text (title bar shows it; Enter accepts, Escape cancels) and it is
-// written back to the game's buffer as UTF-16. Headless, the configured
-// online id is entered.
+// typed text (a box over the game shows it; Enter accepts, Escape cancels)
+// and it is written back to the game's buffer as UTF-16. Headless, the
+// configured name is entered.
 //
-// SceImeDialogParam: +36 maxTextLength, +40 wchar16* inputTextBuffer,
-// +72 const wchar16* title. SceImeDialogResult: +0 endstatus (0 OK,
-// 1 USER_CANCELED, 2 ABORTED).
+// SceImeDialogParam: +4 type, +16 enterLabel, +32 option, +36 maxTextLength,
+// +40 wchar16* inputTextBuffer, +72 const wchar16* title.
+// SceImeDialogResult: +0 endstatus (0 OK, 1 USER_CANCELED, 2 ABORTED).
 // sceImeDialog does NOT use SceCommonDialogStatus: it has its own three-value
 // SceImeDialogStatus (NONE 0, RUNNING 1, FINISHED 2). Bloodborne's name entry
 // polls GetStatus and calls GetResult the moment it sees 2, so returning the
@@ -93,10 +93,14 @@ constexpr int kImeNone = 0, kImeRunning = 1, kImeFinished = 2;
 constexpr int kErrImeBusy = static_cast<int>(0x80bc0001u);
 constexpr int kErrImeInvalidAddress = static_cast<int>(0x80bc0031u);
 constexpr int kErrImeNotFinished = static_cast<int>(0x80bc0106u);
+constexpr std::uint32_t kImeTypeBasicLatin = 1;     // SCE_IME_TYPE_BASIC_LATIN
+constexpr std::uint32_t kImeEnterLabelSearch = 2;   // SCE_IME_ENTER_LABEL_SEARCH
+constexpr std::uint32_t kImeOptionPassword = 0x4;   // SCE_IME_OPTION_PASSWORD
 
 struct ImeSession {
     std::uint16_t* buffer = nullptr;
     unsigned max_chars = 0;
+    TextCharset charset = TextCharset::Any;
     bool windowed = false;
     int status = kImeNone;
     int polls = 0;
@@ -105,13 +109,24 @@ struct ImeSession {
 };
 ImeSession g_ime_session;
 std::string g_default_name = "Hunter";
-// The three text fields the game opens, each built by its own function:
-// the character's name (sub_24169f0, "Please Enter Name") is 16 characters;
-// the chalice glyph (sub_2416b50, "Enter Chalice Glyph") and the network
-// password (sub_2416cb0, "Enter password") are 8. Only the name starts from
-// player.name; the others start blank and wait for the player.
+// The three text fields the game opens, each built by its own function in
+// front of the one sceImeDialogInit call (sub_2d03f80): the character's name
+// (sub_24169f0, "Please Enter Name") is 16 characters; the chalice glyph
+// (sub_2416b50, "Enter Chalice Glyph") and the network password (sub_2416cb0,
+// "Enter password") are 8. All three are basic Latin with the option
+// NO_LEARNING (0x20) alone - so no PASSWORD, and the console shows the network
+// password as it is typed - and only the glyph's Enter key reads Search. Only
+// the name starts from player.name; the others start blank and wait.
 constexpr unsigned kNameChars = 16;
 bool g_ime_type = false;  // player.ime = "type"
+
+// The characters a field takes, from its dialog's parameters (host/text_entry.h).
+// A glyph is the basic-Latin field whose Enter key reads Search; it takes only
+// the glyph alphabet, which is all the game's own glyph editor offers.
+TextCharset ime_charset(std::uint32_t type, std::uint32_t enter_label) {
+    if (type != kImeTypeBasicLatin) return TextCharset::Any;
+    return enter_label == kImeEnterLabelSearch ? TextCharset::Glyph : TextCharset::BasicLatin;
+}
 
 std::string utf16_to_utf8(const std::uint16_t* p, unsigned max) {
     std::string out;
@@ -147,7 +162,11 @@ GUEST_ABI int hle_ime_init(const std::uint8_t* param, const void*) {
     se = ImeSession{};
     se.status = kImeRunning;
     std::string title;
+    std::uint32_t type = 0, enter_label = 0, option = 0;
     if (param) {
+        std::memcpy(&type, param + 4, 4);
+        std::memcpy(&enter_label, param + 16, 4);
+        std::memcpy(&option, param + 32, 4);
         std::memcpy(&se.max_chars, param + 36, 4);
         std::uint64_t buf = 0;
         std::memcpy(&buf, param + 40, 8);
@@ -155,21 +174,33 @@ GUEST_ABI int hle_ime_init(const std::uint8_t* param, const void*) {
         std::uint64_t title_va = 0;
         std::memcpy(&title_va, param + 72, 8);
         title = utf16_to_utf8(reinterpret_cast<const std::uint16_t*>(static_cast<std::uintptr_t>(title_va)), 64);
-        host_log("sceImeDialogInit: \"%s\" max %u chars, current \"%s\"", title.c_str(), se.max_chars,
-                 utf16_to_utf8(se.buffer, se.max_chars).c_str());
+        host_log("sceImeDialogInit: \"%s\" max %u chars, type %u, enter label %u, option 0x%x, current \"%s\"", title.c_str(),
+                 se.max_chars, type, enter_label, option, utf16_to_utf8(se.buffer, se.max_chars).c_str());
     }
     if (se.max_chars == 0 || se.max_chars > 256) se.max_chars = 32;
-    se.windowed = g_ime_type && host_window_active();
+    se.charset = ime_charset(type, enter_label);
+    // player.ime = "auto" answers the name with player.name at once. A glyph
+    // or a password has no answer to give, so with a window it is typed like
+    // "type" would have it - cancelling it the moment it opened, as this did,
+    // left the chalice glyph search and the network password impossible to
+    // use - and only a run with no window to type in (headless) cancels it.
+    const bool name = se.max_chars == kNameChars;
+    se.windowed = host_window_active() && (g_ime_type || !name);
     if (se.windowed) {
         // Start from whatever the game already has. The name, when it has
         // nothing, starts from player.name, so Enter on its own is a valid
-        // answer; a glyph or a password starts blank.
+        // answer - selected, so the first key typed replaces it rather than
+        // adding to it ("HunterGehrman", with six of the sixteen characters
+        // gone); a glyph or a password starts blank.
         std::string initial = utf16_to_utf8(se.buffer, se.max_chars);
-        if (initial.empty() && se.max_chars == kNameChars) initial = g_default_name;
-        host_text_entry_begin(initial.c_str(), se.max_chars, false, title.c_str());
+        const bool suggestion = initial.empty() && name;
+        if (suggestion) initial = g_default_name;
+        host_text_entry_begin(initial.c_str(), se.max_chars, (option & kImeOptionPassword) != 0, title.c_str(), se.charset,
+                              suggestion);
         host_log("sceImeDialog: type the text in the game window (the box over the game shows it); Enter accepts, Escape cancels, Ctrl+V pastes");
-    } else if (se.max_chars == kNameChars) {
-        host_log("sceImeDialog: no window to type in; answering with \"%s\" (player.name)", g_default_name.c_str());
+    } else if (name) {
+        host_log("sceImeDialog: %s; answering with \"%s\" (player.name)",
+                 host_window_active() ? "player.ime = \"auto\"" : "no window to type in", g_default_name.c_str());
     } else {
         host_log("sceImeDialog: no window to type in; cancelling \"%s\" (only the name has an answer)", title.c_str());
     }
@@ -196,7 +227,11 @@ GUEST_ABI int hle_ime_status() {
         se.end_status = r == 1 ? 0 : 1;
     } else {
         if (++se.polls < 2) return kImeRunning;
-        text = g_default_name;
+        // The name as the field would have taken it typed: its characters
+        // and its length.
+        TextEntry answer;
+        answer.begin(g_default_name.c_str(), se.max_chars, se.charset, false);
+        text = answer.text;
         se.end_status = se.max_chars == kNameChars ? 0 : 1;  // a glyph or password has no answer: cancelled
     }
     if (se.end_status == 0 && se.buffer) {

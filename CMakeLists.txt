@@ -82,6 +82,7 @@ add_executable(bbhost
   src/decomp/gx_block_reclaim.cpp
   src/decomp/game_memcpy.cpp
   src/decomp/ez_copy.cpp
+  src/decomp/sfx_ribbon.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -107,6 +108,7 @@ add_executable(bbhost
   src/hle/np_matching2.cpp
   src/hle/np_signaling.cpp
   src/host/window.cpp
+  src/host/text_entry.cpp
   src/host/overlay.cpp
   src/host/ingame_menu.cpp
   src/host/options.cpp
@@ -214,6 +216,12 @@ if(UNIX)
   target_link_libraries(bbhost PRIVATE pthread dl m)
 elseif(WIN32)
   target_link_libraries(bbhost PRIVATE ws2_32 winmm)  # hle/net.cpp, net/session.cpp; timeBeginPeriod
+  # The SysV convention our guest-facing functions follow lets a leaf keep
+  # data in the 128 bytes below rsp, and on Windows an exception - a
+  # write-watch fault in a decomp leaf's write, say - builds its frame right
+  # there (decomp/sfx_ribbon.cpp). Clang leaves it out on this target today;
+  # the flag makes sure no compiler does.
+  target_compile_options(bbhost PRIVATE -mno-red-zone)
   # The image must stay out of the guest's fixed windows (4-10 GiB CPU dmem,
   # 0xff00000000 GPU alias): a fixed base above them, no ASLR.
   target_link_options(bbhost PRIVATE -Wl,--image-base=0x600000000 -Wl,--disable-dynamicbase)
@@ -299,6 +307,9 @@ endif()
 # game's thread state, where FS is the game's, so nothing in its file may read
 # the stack protector's canary through it.
 set_source_files_properties(src/decomp/sprj_event_flag_man.cpp src/decomp/game_memcpy.cpp src/decomp/ez_copy.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
+# The effect ribbons' writers reproduce the game's floating point bit for bit:
+# no multiply-add fused into one rounding.
+set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -349,6 +360,9 @@ if(UNIX)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
+  add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
+  target_include_directories(text_entry_test PRIVATE src)
+  add_test(NAME text_entry_test COMMAND text_entry_test)
   add_executable(engine_layout tests/engine_layout.cpp)
   target_include_directories(engine_layout PRIVATE src)
   add_test(NAME engine_layout COMMAND engine_layout)
@@ -356,6 +370,14 @@ if(UNIX)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
   add_test(NAME write_watch_test COMMAND write_watch_test)
+  # The effect ribbons' writers against the game's code (skips without the eboot).
+  add_executable(sfx_ribbon_test tests/sfx_ribbon_test.cpp src/core/write_watch.cpp src/core/sha256.cpp)
+  target_include_directories(sfx_ribbon_test PRIVATE src)
+  target_compile_definitions(sfx_ribbon_test PRIVATE BBHOST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  target_compile_options(sfx_ribbon_test PRIVATE -ffp-contract=off)
+  target_link_libraries(sfx_ribbon_test PRIVATE pthread)
+  add_test(NAME sfx_ribbon_test COMMAND sfx_ribbon_test)
+  set_tests_properties(sfx_ribbon_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
