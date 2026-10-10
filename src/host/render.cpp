@@ -13146,6 +13146,10 @@ static bool draw_impl(const GpuDraw& d) {
                                                                             : 0;
     }
     if (pl.dlss_role == 1 && s.color[0]) dlss_note_scene_colour_locked(s.color[0]->base);
+    if (s.depth && s.color[0] && (s.depth_control & 0x2) && s.color[0]->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+        !(s.prim == 6 && d.index_count <= 4)) {
+        dlss_note_scene_draw_locked(s.depth->base, s.color[0]->base);
+    }
     if (pl.dlss_scene_cb == -2) {
         pl.dlss_scene_cb = -1;
         const gcn::TranslateResult& vm = pl.vs.meta();

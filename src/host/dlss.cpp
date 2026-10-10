@@ -13,8 +13,10 @@
 //
 //   1. motion vectors at the render size from that pass's own constants
 //      (shaders/dlss_mv.comp - the pass without the blur's scale and clamp);
-//   2. DLSS on the scene colour (the DoF composite's target, ...+111fce32),
-//      the depth snapshot and those vectors, into an image of our own;
+//   2. DLSS on the scene colour (the DoF composite's target, ...+111fce32;
+//      where YEBIS draws no depth of field, the target the scene last drew
+//      into with the snapshot's depth), the depth snapshot and those
+//      vectors, into an image of our own;
 //   3. its colour copied back over the scene colour, keeping the alpha the
 //      motion blur reads (shaders/dlss_merge.comp).
 //
@@ -274,6 +276,14 @@ struct Dlss {
 
     // The frame.
     std::uint64_t scene_colour = 0;  // the DoF composite's target this frame
+    // Where the scene itself last drew, for the frames without that composite:
+    // the RGBA16F colour target of the last depth-tested draw into each depth
+    // target (a few of them: the scene's, the shadow maps', a menu's model).
+    struct SceneDraw {
+        std::uint64_t depth = 0, colour = 0;
+    };
+    SceneDraw scene_draws[4];
+    std::uint32_t scene_draws_next = 0;
     std::map<std::uint64_t, std::uint64_t> depth_of_snapshot;  // snapshot base -> the depth target it copies
     std::uint64_t scene_depth = 0;   // the depth target the jitter applies to
     std::uint32_t phase = 0;         // into the Halton sequence
@@ -857,6 +867,17 @@ void dlss_note_depth_snapshot_locked(std::uint64_t depth_base, std::uint64_t sna
 
 void dlss_note_scene_colour_locked(std::uint64_t base) { g_dlss.scene_colour = base; }
 
+void dlss_note_scene_draw_locked(std::uint64_t depth_base, std::uint64_t colour_base) {
+    if (g_dlss.tried && !g_dlss.ok) return;
+    for (auto& e : g_dlss.scene_draws) {
+        if (e.depth == depth_base) {
+            e.colour = colour_base;
+            return;
+        }
+    }
+    g_dlss.scene_draws[g_dlss.scene_draws_next++ % 4] = {depth_base, colour_base};
+}
+
 void dlss_note_velocity_post_locked(RtImage* map) {
     if (!g_dlss.ok || g_dlss.raw_valid || !map || !map->initialised || map->depth) return;
     if (map->width != g_dlss.raw_width || map->height != g_dlss.raw_height || map->format != g_dlss.raw_format) {
@@ -948,8 +969,23 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
         g_dlss.ok = ngx_init_locked();
         host_log("dlss: %s", g_dlss.ok ? "ready" : "off for this run");
     }
-    const std::uint64_t colour_base = g_dlss.scene_colour;
+    // The scene colour: the depth-of-field composite's target when YEBIS drew
+    // one this frame; where it does not (the area's YEBIS settings have no
+    // depth of field - the Hunter's Dream, much of Yharnam - or the setting
+    // is off), the target the scene itself last drew into with the depth the
+    // pass's snapshot copies, which is then what the motion blur reads.
+    std::uint64_t colour_base = g_dlss.scene_colour;
     g_dlss.scene_colour = 0;
+    const char* colour_from = "the depth-of-field composite";
+    if (!colour_base && in.depth_snapshot) {
+        if (const auto it = g_dlss.depth_of_snapshot.find(in.depth_snapshot->base); it != g_dlss.depth_of_snapshot.end()) {
+            for (const auto& e : g_dlss.scene_draws) {
+                if (e.depth == it->second) colour_base = e.colour;
+            }
+        }
+        colour_from = "the scene's last draw";
+    }
+    for (auto& e : g_dlss.scene_draws) e = {};
     // The undilated map, when the motion blur's post-pass ran this frame (and
     // so widened the one the velocity pass reads).
     const bool raw_velocity = g_dlss.raw_valid && g_dlss.raw_width == (in.object_velocity ? in.object_velocity->width : 0) &&
@@ -963,7 +999,7 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
         host_log("dlss: a velocity pass without DLSS: %s (flip %llu)", why, static_cast<unsigned long long>(hle_video_flip_count()));
     };
     if (!g_dlss.ok) return;
-    if (!colour_base) return skip("no depth-of-field composite before it");
+    if (!colour_base) return skip("no scene colour before it (no depth-of-field composite, no scene draw into its depth)");
     if (!in.depth_snapshot || !in.object_velocity || !in.constants || in.constant_dwords < 912) return skip("its inputs did not resolve");
     RtImage* colour = find_render_target(colour_base);
     if (!colour || !colour->initialised || colour->depth || colour->format != VK_FORMAT_R16G16B16A16_SFLOAT) return skip("the colour is not an RGBA16F target");
@@ -1100,6 +1136,13 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
         return;
     }
     g_dlss.reset = false;
+    // Which colour it resolved, each time that changes (an area with depth of field and one without).
+    static const char* last_from = nullptr;
+    if (colour_from != last_from) {
+        last_from = colour_from;
+        host_log("dlss: resolving %s (0x%llx, %ux%u, flip %llu)", colour_from, static_cast<unsigned long long>(colour_base), w, h,
+                 static_cast<unsigned long long>(flip));
+    }
     barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 

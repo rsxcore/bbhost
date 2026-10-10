@@ -113,7 +113,11 @@ the scene renderer draws at half size. DLSS runs right after that pass
    buffers the GPU copies into place just before the draw, so the CPU's view
    of that memory can be an earlier frame's;
 2. DLSS on the scene colour (depth of field already composited into it), the
-   depth snapshot and those vectors;
+   depth snapshot and those vectors. YEBIS draws that composite only where
+   the area's settings have depth of field; elsewhere (the Hunter's Dream,
+   much of Yharnam) or with the setting off, the scene colour is the RGBA16F
+   target the scene itself last drew into, depth-tested, with the depth the
+   snapshot copies - which is what the motion blur then reads;
 3. its colour copied back over the scene colour, keeping the alpha the blur
    reads (`shaders/dlss_merge.comp`). Motion blur, bloom, the tone map and the
    HUD then run on it as on the game's own.
