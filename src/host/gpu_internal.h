@@ -1174,9 +1174,9 @@ void dlss_note_depth_snapshot_locked(std::uint64_t depth_base, std::uint64_t sna
 // The target YEBIS's depth of field composited into this frame (...+111fce32):
 // the scene colour DLSS resolves.
 void dlss_note_scene_colour_locked(std::uint64_t base);
-// A depth-tested draw into an RGBA16F colour target (not a full-screen
-// strip): where the scene colour is in a frame without that composite.
-void dlss_note_scene_draw_locked(std::uint64_t depth_base, std::uint64_t colour_base);
+// A draw without a depth test into an RGBA16F target (YEBIS's passes): where
+// the scene colour is in a frame without that composite.
+void dlss_note_post_write_locked(std::uint64_t base, std::uint32_t w, std::uint32_t h);
 // The first draw of the motion blur's velocity post-pass (...+abf92450) has
 // read the characters' velocity map, which the second widens in place: DLSS
 // copies it now.

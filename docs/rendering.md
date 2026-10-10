@@ -115,9 +115,12 @@ the scene renderer draws at half size. DLSS runs right after that pass
 2. DLSS on the scene colour (depth of field already composited into it), the
    depth snapshot and those vectors. YEBIS draws that composite only where
    the area's settings have depth of field; elsewhere (the Hunter's Dream,
-   much of Yharnam) or with the setting off, the scene colour is the RGBA16F
-   target the scene itself last drew into, depth-tested, with the depth the
-   snapshot copies - which is what the motion blur then reads;
+   Hemwick, much of Yharnam) or with the setting off, YEBIS still composites
+   the scene into a full-size target of its own (`d3ca03f3+9e1cb278`, then
+   `4c37ae6d+bf368417`) before the velocity pass, and the motion blur reads
+   that: the scene colour is the full-size RGBA16F target YEBIS's passes
+   wrote last. (The target the scene itself draws into is copied away before
+   then - DLSS written there never reached the screen);
 3. its colour copied back over the scene colour, keeping the alpha the blur
    reads (`shaders/dlss_merge.comp`). Motion blur, bloom, the tone map and the
    HUD then run on it as on the game's own.

@@ -14,9 +14,9 @@
 //   1. motion vectors at the render size from that pass's own constants
 //      (shaders/dlss_mv.comp - the pass without the blur's scale and clamp);
 //   2. DLSS on the scene colour (the DoF composite's target, ...+111fce32;
-//      where YEBIS draws no depth of field, the target the scene last drew
-//      into with the snapshot's depth), the depth snapshot and those
-//      vectors, into an image of our own;
+//      where YEBIS draws no depth of field, the full-size target its passes
+//      wrote last, which the motion blur reads), the depth snapshot and
+//      those vectors, into an image of our own;
 //   3. its colour copied back over the scene colour, keeping the alpha the
 //      motion blur reads (shaders/dlss_merge.comp).
 //
@@ -276,14 +276,17 @@ struct Dlss {
 
     // The frame.
     std::uint64_t scene_colour = 0;  // the DoF composite's target this frame
-    // Where the scene itself last drew, for the frames without that composite:
-    // the RGBA16F colour target of the last depth-tested draw into each depth
-    // target (a few of them: the scene's, the shadow maps', a menu's model).
-    struct SceneDraw {
-        std::uint64_t depth = 0, colour = 0;
+    // For the frames without that composite: the last full-res RGBA16F
+    // targets YEBIS's own passes (no depth test) wrote, newest last. The one
+    // it wrote last before the velocity pass is the colour the motion blur
+    // reads - in an area without depth of field YEBIS still composites the
+    // scene into it (d3ca03f3+9e1cb278, 4c37ae6d+bf368417).
+    struct Written {
+        std::uint64_t base = 0;
+        std::uint32_t w = 0, h = 0;
     };
-    SceneDraw scene_draws[4];
-    std::uint32_t scene_draws_next = 0;
+    Written post_writes[4];
+    std::uint32_t post_writes_next = 0;
     std::map<std::uint64_t, std::uint64_t> depth_of_snapshot;  // snapshot base -> the depth target it copies
     std::uint64_t scene_depth = 0;   // the depth target the jitter applies to
     std::uint32_t phase = 0;         // into the Halton sequence
@@ -805,6 +808,14 @@ void barrier(VkCommandBuffer cmd, VkPipelineStageFlags from, VkAccessFlags src, 
     vkCmdPipelineBarrier(cmd, from, to, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
+// The same, as an op in the command stream: no wait for the recorder.
+void stream_barrier(VkPipelineStageFlags from, VkAccessFlags src, VkPipelineStageFlags to, VkAccessFlags dst) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = src;
+    mb.dstAccessMask = dst;
+    rec().pipeline_barrier(from, to, 0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
 ngx::ResourceVk resource(VkImageView view, VkImage image, VkFormat format, std::uint32_t w, std::uint32_t h, bool rw) {
     ngx::ResourceVk r{};
     r.resource.image = {view, image, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, format, w, h};
@@ -867,15 +878,11 @@ void dlss_note_depth_snapshot_locked(std::uint64_t depth_base, std::uint64_t sna
 
 void dlss_note_scene_colour_locked(std::uint64_t base) { g_dlss.scene_colour = base; }
 
-void dlss_note_scene_draw_locked(std::uint64_t depth_base, std::uint64_t colour_base) {
+void dlss_note_post_write_locked(std::uint64_t base, std::uint32_t w, std::uint32_t h) {
     if (g_dlss.tried && !g_dlss.ok) return;
-    for (auto& e : g_dlss.scene_draws) {
-        if (e.depth == depth_base) {
-            e.colour = colour_base;
-            return;
-        }
-    }
-    g_dlss.scene_draws[g_dlss.scene_draws_next++ % 4] = {depth_base, colour_base};
+    auto& last = g_dlss.post_writes[(g_dlss.post_writes_next + 3) % 4];
+    if (last.base == base) return;
+    g_dlss.post_writes[g_dlss.post_writes_next++ % 4] = {base, w, h};
 }
 
 void dlss_note_velocity_post_locked(RtImage* map) {
@@ -903,20 +910,21 @@ void dlss_note_velocity_post_locked(RtImage* map) {
         b.image = g_dlss.raw_velocity.image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
+    // Ops in the command stream, not g_cmd(): that waits for the recorder to
+    // replay everything so far, every frame.
     begin_recording_locked();
     render_end_pass_locked();
-    VkCommandBuffer cmd = g_cmd();
-    barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    stream_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     VkImageCopy region{};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstSubresource = region.srcSubresource;
     region.extent = {map->width, map->height, 1};
-    vkCmdCopyImage(cmd, map->image, VK_IMAGE_LAYOUT_GENERAL, g_dlss.raw_velocity.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    rec().copy_image(map->image, VK_IMAGE_LAYOUT_GENERAL, g_dlss.raw_velocity.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    stream_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     g_dlss.raw_valid = true;
 }
 
@@ -932,13 +940,12 @@ void dlss_note_camera_locked(const VkDescriptorBufferInfo& binding, std::uint32_
     // A copy cannot be recorded inside the pass the draw is in; the next draw opens another.
     begin_recording_locked();
     render_end_pass_locked();
-    VkCommandBuffer cmd = g_cmd();
-    barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    stream_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     const VkBufferCopy region{from, static_cast<VkDeviceSize>(g_dlss.camera_block) * kCameraDwords * 4, kCameraDwords * 4};
-    vkCmdCopyBuffer(cmd, binding.buffer, g_dlss.camera.buffer, 1, &region);
-    barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    rec().copy_buffer(binding.buffer, g_dlss.camera.buffer, 1, &region);
+    stream_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     g_dlss.camera_now = true;
 }
 
@@ -970,22 +977,21 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
         host_log("dlss: %s", g_dlss.ok ? "ready" : "off for this run");
     }
     // The scene colour: the depth-of-field composite's target when YEBIS drew
-    // one this frame; where it does not (the area's YEBIS settings have no
-    // depth of field - the Hunter's Dream, much of Yharnam - or the setting
-    // is off), the target the scene itself last drew into with the depth the
-    // pass's snapshot copies, which is then what the motion blur reads.
+    // one this frame; where it did not (an area whose YEBIS settings have no
+    // depth of field - the Hunter's Dream, Hemwick, much of Yharnam - or the
+    // setting off), the full-res target YEBIS's passes wrote last before this
+    // one, which is what the motion blur reads next.
     std::uint64_t colour_base = g_dlss.scene_colour;
     g_dlss.scene_colour = 0;
     const char* colour_from = "the depth-of-field composite";
     if (!colour_base && in.depth_snapshot) {
-        if (const auto it = g_dlss.depth_of_snapshot.find(in.depth_snapshot->base); it != g_dlss.depth_of_snapshot.end()) {
-            for (const auto& e : g_dlss.scene_draws) {
-                if (e.depth == it->second) colour_base = e.colour;
-            }
+        for (std::uint32_t k = 1; k <= 4 && !colour_base; ++k) {
+            const auto& e = g_dlss.post_writes[(g_dlss.post_writes_next + 4 - k) % 4];
+            if (e.base && e.w == in.depth_snapshot->width && e.h == in.depth_snapshot->height) colour_base = e.base;
         }
-        colour_from = "the scene's last draw";
+        colour_from = "YEBIS's last full-size pass";
     }
-    for (auto& e : g_dlss.scene_draws) e = {};
+    for (auto& e : g_dlss.post_writes) e = {};
     // The undilated map, when the motion blur's post-pass ran this frame (and
     // so widened the one the velocity pass reads).
     const bool raw_velocity = g_dlss.raw_valid && g_dlss.raw_width == (in.object_velocity ? in.object_velocity->width : 0) &&
@@ -999,7 +1005,7 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
         host_log("dlss: a velocity pass without DLSS: %s (flip %llu)", why, static_cast<unsigned long long>(hle_video_flip_count()));
     };
     if (!g_dlss.ok) return;
-    if (!colour_base) return skip("no scene colour before it (no depth-of-field composite, no scene draw into its depth)");
+    if (!colour_base) return skip("no scene colour before it (no depth-of-field composite, no full-size YEBIS pass)");
     if (!in.depth_snapshot || !in.object_velocity || !in.constants || in.constant_dwords < 912) return skip("its inputs did not resolve");
     RtImage* colour = find_render_target(colour_base);
     if (!colour || !colour->initialised || colour->depth || colour->format != VK_FORMAT_R16G16B16A16_SFLOAT) return skip("the colour is not an RGBA16F target");
