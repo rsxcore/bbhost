@@ -31,7 +31,8 @@ def main():
     start = (world_s or 0.0) + after
     rows = []
     for l in open(mon_path, encoding='utf-8', errors='replace'):
-        kv = dict(x.split('=', 1) for x in l.split() if '=' in x)
+        # perfmon.ps1 writes the machine's decimal separator (a comma on some locales).
+        kv = dict(x.split('=', 1) for x in l.replace(',', '.').split() if '=' in x)
         try:
             t = float(kv['t'])
         except (KeyError, ValueError):
