@@ -1792,15 +1792,19 @@ bool init_locked() {
     g.cb_lean = g.cb_ssbo && !(cb_env && cb_env[0] == '1');
     const char* exec_env = std::getenv("BBHOST_EXEC_KNOWN");
     g.exec_known = !(exec_env && exec_env[0] == '0');
-    g.profile = [] {
-        const char* e = std::getenv("BBHOST_GPU_PROFILE");
-        return e && (e[0] == '1' || e[0] == '2' || e[0] == '3');
-    }() && props.limits.timestampComputeAndGraphics;
-    g.profile_gaps = g.profile && std::getenv("BBHOST_GPU_PROFILE")[0] == '2';
+    // The graphics journal (gfx_journal.h) turns the per-draw timestamps on
+    // too, so a slow command buffer says which passes took its time: measured,
+    // they cost nothing (78.4 against 78.8 fps uncapped); BBHOST_GPU_PROFILE=0
+    // keeps them off.
+    const char* profile_env = std::getenv("BBHOST_GPU_PROFILE");
+    if (!profile_env && gfxj::on()) profile_env = "1";
+    g.profile = (profile_env && (profile_env[0] == '1' || profile_env[0] == '2' || profile_env[0] == '3')) &&
+                props.limits.timestampComputeAndGraphics;
+    g.profile_gaps = g.profile && profile_env[0] == '2';
     // =3: a timestamp pair around each render pass, named by its first draw's
     // pipeline. A barrier ends every pass (BBHOST_PASS_BARRIERS=full, the
     // default), so a pass's pair is its own GPU time; draws' pairs overlap.
-    g.profile_passes = g.profile && std::getenv("BBHOST_GPU_PROFILE")[0] == '3';
+    g.profile_passes = g.profile && profile_env[0] == '3';
     // =3, or =1 with BBHOST_GPU_PROFILE_STATS=1: pipeline statistics beside
     // the pairs (gpu_internal.h profile_stats).
     if (g.profile_passes || (g.profile && !g.profile_gaps && std::getenv("BBHOST_GPU_PROFILE_STATS") &&

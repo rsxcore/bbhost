@@ -1349,7 +1349,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             return &kept;
         }
         g.rt_replacements.fetch_add(1);
-        gfxj::note(gfxj::kTargetReplaced, __LINE__);        take_fill(st->second);
+        gfxj::note(gfxj::kTargetReplaced, __LINE__);
+        take_fill(st->second);
         destroy_rt_image(st->second);
         g_snapshots.erase(st);
         ++g_rt_gen;
@@ -1371,7 +1372,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             return &r;
         }
         g.rt_replacements.fetch_add(1);
-        gfxj::note(gfxj::kTargetReplaced, __LINE__);        if (r.format == format && r.width == width && r.height == height) {
+        gfxj::note(gfxj::kTargetReplaced, __LINE__);
+        if (r.format == format && r.width == width && r.height == height) {
             // More slices than before: the faces drawn so far survive. On a
             // cube's first frame this happens once per face.
             static std::atomic<int> logs{0};
@@ -8422,7 +8424,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         if (st != g_snapshots.end() &&
             (st->second.format != snap_format || st->second.width != src.width || st->second.height != src.height)) {
             g.rt_replacements.fetch_add(1);
-            gfxj::note(gfxj::kTargetReplaced, __LINE__);            destroy_rt_image(st->second);
+            gfxj::note(gfxj::kTargetReplaced, __LINE__);
+            destroy_rt_image(st->second);
             g_snapshots.erase(st);
             ++g_rt_gen;
             bump_view_epoch();
@@ -8439,7 +8442,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         // still prefer it over the snapshot. Drop it.
         if (auto rt = g_rts.find(dst_base); rt != g_rts.end()) {
             g.rt_replacements.fetch_add(1);
-            gfxj::note(gfxj::kTargetReplaced, __LINE__);            destroy_rt_image(rt->second);
+            gfxj::note(gfxj::kTargetReplaced, __LINE__);
+            destroy_rt_image(rt->second);
             g_rts.erase(rt);
             ++g_rt_gen;
             bump_view_epoch();
