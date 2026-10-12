@@ -36,6 +36,9 @@ double sysv_va_fp(SysvVaList* ap);
 // UTF-16 and are narrowed as ASCII.
 int sysv_vsnprintf(char* out, std::size_t n, const char* fmt, SysvVaList* ap);
 int sysv_vfprintf(std::FILE* f, const char* fmt, SysvVaList* ap);
+// UTF-16 output, native multibyte %s/%c, UTF-16 %ls/%lc; counts code units.
+// Unlike snprintf, truncation returns -1, leaving a terminated prefix.
+int sysv_vswprintf(char16_t* out, std::size_t n, const char16_t* fmt, SysvVaList* ap);
 int sysv_vsscanf(const char* s, const char* fmt, SysvVaList* ap);
 int sysv_vfscanf(std::FILE* f, const char* fmt, SysvVaList* ap);
 

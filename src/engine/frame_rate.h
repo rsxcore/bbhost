@@ -2,7 +2,7 @@
 
 #include <string>
 
-// The game's own frame pace: 30, 60, 90 or uncapped.
+// The game's own frame pace: 30, 60, 90, 120 or uncapped.
 //
 // FD4's frame-time manager (0x2434770, called once a frame from the main
 // loop) picks an interval by mode - the int at +8, or +0xc while the one-shot
@@ -13,35 +13,48 @@
 // thread reads ~90% busy at 30 fps while half of that is waiting. Ours
 // replaces it (SprjFlipper::Update, BBHOST_FRAME_SOURCE).
 //
-// The Frame rate option (or BBHOST_GAME_FPS=30/60/90/0) when the game starts:
+// The Frame rate option (or BBHOST_GAME_FPS=30/60/90/120/0) when the game starts:
 //  - 30: the game's own.
-//  - 60: mode 2, with the game's fixed steps converted from Kyo's "60 FPS++"
-//    list (frame_rate.cpp's tables and engine/sixty_fps_sites.inc).
-//  - 90: the same with a 1/90 s target, the rate-dependent values at 90 and
-//    Kyo's "90 FPS++" additions (the cloth package: engine/ninety_fps_sites.inc).
-//  - uncapped: the 90 package, a target of the display's refresh rate with
-//    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it), and
-//    the values that depend on the frame's length written every frame from
-//    the measured frame time - the game's own step already follows it through
-//    the FPS++ frame-time cave (0x2418e3d), clamped to [target, 1/30].
-// At 90 and uncapped flips complete as soon as they are recorded (the game
+//  - 60, 90, 120: mode 2 with a 1/fps target, the game's fixed steps converted
+//    (frame_rate.cpp's tables, from Kyo's FPS++ lists and yogesh1239's high-FPS
+//    fixes, each checked against the eboot): the task step and every step that
+//    used a fixed 1/30 read the measured frame time clamped to [target, 1/30]
+//    (the FPS++ cave's slot, engine/sixty_fps_sites.inc and kFrameTimeSites);
+//    per-frame amounts, weights and rates in .rodata are written from that
+//    frame time every frame; code immediates and frame counts take the rate's
+//    value. Above 60 the cloth's six constraint caves (ninety_fps_sites.inc)
+//    scale its stiffness by (60 dt)^2. The play time adds each frame's
+//    milliseconds with the remainder carried (the game truncates them). The
+//    follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
+//    default) or runs the game's own values (Original), either converted to
+//    each frame's length.
+//  - uncapped: the same, with a target of the display's refresh rate with
+//    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it); code
+//    immediates and counts at 120's values.
+// Above 60 and uncapped flips complete as soon as they are recorded (the game
 // paces itself; hle/video.cpp). The one-shot overrides (+0x2bc, +0x2c0,
 // +0x271, +0x272, +0x2c4) are cleared so nothing drops the game back to 30.
 //
 // The choice is made when the game starts: the game's fixed 1/30 s steps are
 // constants in its code, and a rate needs them all changed together.
 
+// The frame time and the camera's flag code on the game's side reads:
+// engine/frame_rate_step.h.
+
 struct ElfImage;
 
 void frame_rate_install(ElfImage* image);
 
-// The pace the game was started at: 30, 60, 90, or 0 for uncapped.
+// The pace the game was started at: 30, 60, 90, 120, or 0 for uncapped.
 int frame_rate_game_fps();
 
 // Game time against real time (plugins' set_time_scale): 0.5 is half speed,
-// 2 double (as far as the machine keeps up), clamped to 0.1-4. The game steps
-// a fixed amount a frame, so this is the frame pacing's interval. (Uncapped,
-// the step follows the frame time, so only the fixed steps slow down.)
+// 2 double, clamped to 0.1-4. At 30 the game steps a fixed amount a frame, so
+// this is the frame pacing's interval (as far as the machine keeps up). At a
+// converted rate every step follows the frame's time, so it scales the task
+// step instead (at most 1/30 s a frame) and the frames keep their pace;
+// what still counts frames (frame_rate.cpp's kCounts and the rate's code
+// immediates) keeps real time.
 void frame_rate_set_time_scale(float scale);
 
 // The limiter since the last call, for the 300-flip report's timing line:

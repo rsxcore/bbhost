@@ -30,7 +30,7 @@
 110008	PC Controls	The mouse: camera, sensitivity and the pointer.
 110009	Key Bindings	Keyboard and mouse bindings.
 110010	PC Effects	Post-processing: blur, bloom, vignette and lens effects.
-110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
+110011	PC Camera	The follow camera: field of view, distance, height, auto-rotation with the mouse, and its tuning above 30 fps.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players. Each needs a restart.
 116000	Vertical Sync	Wait for the display. Off can tear.
@@ -38,12 +38,13 @@
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
-116005	Frame Rate	30 is the game's own pace; 60 and 90 run its logic at that rate; Uncapped steps it by the frame time (the display's refresh rate with V-Sync on). Applies on the next run.
+116005	Frame Rate	30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time (the display's refresh rate with V-Sync on). Applies on the next run.
 116007	FPS Counter	Frames per second actually presented, in the top right corner.
 116020	PC Settings	
 116030	30	
 116031	60	
 116032	90
+116033	120
 116035	Uncapped
 117000	Ambient Occlusion	Screen-space ambient occlusion.
 117005	Motion Blur	The blur on fast camera and character movement.
@@ -62,6 +63,9 @@
 121000	Camera Distance	How far behind the character the camera sits. 5 is the game's own.
 121001	Camera Height	How high above the character the camera looks. 5 is the game's own.
 121002	Mouse Auto-Rotation	Off: while the mouse turns the camera, it stays where you put it instead of swinging behind you as you move. A controller always has the game's own camera.
+121003	Camera Tuning	Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original is the game's own, as at 30.
+121030	FPS++ (Kyo)	
+121031	Original	
 117004	Resolution	What the game renders at (it shipped at 1920x1080). Wide and 16:10 screens are filled, the HUD kept 16:9 in the middle. Changes at once and asks to be kept - the largest may wait for the next start.
 117010	1280x720
 117011	1600x900

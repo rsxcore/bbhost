@@ -62,7 +62,7 @@ ime = "type"
 # The window's size (fullscreen takes the desktop's).
 width = 1920
 height = 1080
-# The default of F10's Frame rate: 30 (the game's own), 60, 90, or 0 for
+# The default of F10's Frame rate: 30 (the game's own), 60, 90, 120, or 0 for
 # uncapped; what F10 saves wins over it.
 fps_cap = 30
 # The defaults of three F10 settings, by an entry's name; what F10 or the

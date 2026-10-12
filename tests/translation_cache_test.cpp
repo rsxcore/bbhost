@@ -96,6 +96,7 @@ void reset_cache() {
     g_tc.made.clear();
     g_tc.file.clear();
     g_tc.bytes = 0;
+    g_tc.saved_bytes = 0;
     g_tc.dirty = false;
     g_tc.loaded = 0;
     for (std::atomic<std::uint64_t>* c : {&g_tc.hits, &g_tc.hit_us, &g_tc.misses, &g_tc.miss_us, &g_tc.stored, &g_tc.store_us, &g_tc.bad,
@@ -238,6 +239,24 @@ int main(int argc, char** argv) {
                 "made them in %.2f s\n",
                 static_cast<unsigned long long>(g_tc.hits.load()), static_cast<unsigned long long>(g_tc.lift_hits.load()),
                 g_tc.file.size() / 1048576.0, (g_tc.hit_us.load() + g_tc.lift_hit_us.load()) / 1e6, made_us / 1e6);
+
+    // 2b. A periodic write waits for a minute since the last and for 4 MiB or
+    // 2% of new entries; the exit's (forced) only for something new.
+    {
+        std::lock_guard<std::mutex> lk(g_tc.mu);
+        CHECK(!save_due_locked(false) && !save_due_locked(true));  // nothing new since the load
+        g_tc.dirty = true;
+        CHECK(save_due_locked(true) && !save_due_locked(false));  // new, within the minute
+        g_tc.saved -= std::chrono::minutes(2);
+        const std::uint64_t at_load = g_tc.bytes, enough = std::max<std::uint64_t>(4ull << 20, at_load / 50);
+        CHECK(g_tc.saved_bytes == at_load);
+        g_tc.bytes = at_load + enough - 1;
+        CHECK(!save_due_locked(false));  // a minute on, not enough new
+        g_tc.bytes = at_load + enough;
+        CHECK(save_due_locked(false));
+        g_tc.bytes = at_load;
+        g_tc.dirty = false;
+    }
 
     // 3. Another switch for the translator: nothing is taken.
     gcn::set_runtime_sample_offsets(!gcn::runtime_sample_offsets());

@@ -26,7 +26,8 @@ And a PC with:
 
 - x86-64 Windows 10/11 or Linux
 - a GPU with a Vulkan 1.3 driver (recent NVIDIA, AMD or Intel; the Steam Deck works)
-- 16 GB of RAM and 8 GB of video memory are recommended
+- 16 GB of RAM and 8 GB of video memory are recommended; 6 GB NVIDIA cards
+  play at 1080p too
 
 ## First run
 
@@ -67,11 +68,14 @@ game writes a save (at most every five minutes) a copy goes to
 copy its files over `<data>/saves/SPRJ0005`.
 
 The shader caches in `<data>/bbhost` (`translation-cache.bin`,
-`vulkan-pipeline-cache.bin`) belong to the build that made them: a new or
-updated bbhost finds another build's name in `shader-cache-build.txt`, throws
-both away (`gpu: shader caches made by ..., this is ...: cleared`) and builds
-them again while the title loads, from `stage-manifest.bin`, the list of the
-game's shaders, which is kept. `BBHOST_KEEP_SHADER_CACHE=1` keeps them.
+`vulkan-pipeline-cache.bin`) belong to the shader translator that made them,
+which `shader-cache-build.txt` names. An update that leaves the translator
+alone keeps them, so it starts as fast as the build before it; one that
+changed the translator throws both away (`gpu: shader caches made by
+translator ..., this is translator ...: cleared`) and builds them again while
+the title and the loading screens are up, from `stage-manifest.bin`, the list
+of the game's shaders, which is kept. `BBHOST_KEEP_SHADER_CACHE=1` keeps them
+anyway. The files are safe to delete: the next start builds them again.
 
 ## Controls
 
@@ -153,10 +157,16 @@ fifth of the size on disk, written over a few seconds in the background.
 `BBHOST_F12_TEXTURES=1` adds every texture the frame sampled, and the game
 pauses while it writes them.
 
-**Black or broken image in the world.** On cards with little video memory,
-check the log for `video memory is full`. bbhost sizes its own buffers to the
-card's budget and falls back to system memory rather than failing, but other
-programs holding video memory reduce what is left.
+**Black or broken image in the world, or slow on a card with little video
+memory.** bbhost follows the driver's video memory budget as the game runs:
+it keeps the last 512 MiB for render targets, puts textures in system memory
+when the card is down to that, and moves them back once there is room. Every
+five seconds the log says `video memory: headroom ...`; look there, and for
+`video memory is full`, before anything else. Other programs holding video
+memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
+7.5 GB free bbhost also holds less memory ahead (the log says `small video
+memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
+an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
@@ -189,19 +199,37 @@ bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
 
 The frame rate is the game's own speed, chosen when it starts (a change
-applies on the next run): 30 is the game as it shipped; 60 and 90 run its
-logic at that rate with its fixed steps converted (Kyo's 60 and 90 FPS++
-lists, `engine/frame_rate.cpp`); Uncapped steps it by the measured frame time
-(1/240 to 1/30 s), at the display's refresh rate with V-Sync on and up to 240
-fps with it off. At 90 and Uncapped the game paces itself and its frames are
-shown as they come, so 90 on a 60 Hz display shows 60 of them a second.
-`BBHOST_GAME_FPS=30|60|90|0` overrides the setting for a run (0 is uncapped),
-`BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever V-Sync says,
-and `BBHOST_UNCAPPED_LOG=1` logs once a second the frame time uncapped steps
-by and the values it wrote. The start of the log says which rate runs and how
-many values and code sites were converted (`frame rate:` lines), and names
-any site whose bytes were not the expected ones (that rate is then refused:
-90 or uncapped falls back to 60).
+applies on the next run): 30 is the game as it shipped; 60, 90 and 120 run its
+logic at that rate; Uncapped steps it by the measured frame time (1/240 to 1/30
+s), at the display's refresh rate with V-Sync on and up to 240 fps with it off.
+Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
+places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
+grass, the camera's easing, momentum, fades - follow it, so the game runs at
+the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
+and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
+with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
+120). Above 60 and Uncapped the game paces itself
+and its frames are shown as they come, so 90 on a 60 Hz display shows 60 of
+them a second; a rate the machine cannot hold runs slower than real time in
+the few places that count frames.
+The follow camera runs the game's own values at every frame rate, converted
+to each frame's length, so above 30 it moves as it does at 30.
+`BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
+`BBHOST_GAME_FPS=30|60|90|120|0` overrides the setting for a run (0 is
+uncapped), `BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever
+V-Sync says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
+game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
+switch, at 60, 90, 120 or uncapped) moves the target while the game runs:
+`square:LO:HI:S` alternates LO and HI fps every S seconds, `random:LO:HI:S` picks
+a new rate in that range every S seconds, `jitter:LO:HI` every frame, and
+`sine:LO:HI:S` sweeps it - one process at two rates, or at one that never holds
+still, as a variable-refresh display or a busy scene makes it.
+`BBHOST_FIXED_TICK=<address>:<bytes>[,...]` (a test switch, same rates) runs
+a game function as a 30 Hz tick - once every other frame at 60, and so on, with
+the remainder carried - for logic that counts frames (`engine/frame_tick.h`). The start of the log says which rate
+runs and how many values and code sites were converted (`frame rate:` lines),
+and names any site whose bytes were not the expected ones (that rate is then
+refused: 90, 120 or uncapped falls back to 60).
 A frame goes to the screen as soon as the game has finished it; only its flip,
 which the game paces itself on, waits for the next tick of that clock. The game
 keeps two flips queued, and showing each frame at the tick that completed it
@@ -209,6 +237,16 @@ held every frame two refreshes behind (`BBHOST_PRESENT_ON_ARRIVAL=0` brings that
 back, to compare). Every 300 flips the log's `pacing:` line says how late the
 clock's ticks woke and how long flips took from queued to shown and to
 completed.
+A flip completes - and what the frame used goes back to the game - only once
+the GPU has rendered that frame: on the console a flip is the GPU reaching it,
+and the game writes the next frames' data over what a completed frame read. A
+loading screen's flips, and those above 60 and Uncapped, do not wait for the
+clock, so they complete as soon as their frame has rendered; the log says how
+many of a loading screen's flips waited (`video: the loading screen's ...
+flips`). `BBHOST_FLIP_AFTER_GPU=0` completes a flip once the frame is recorded,
+as before: the game could then run several frames ahead of the GPU after a
+loading screen and overwrite what it had not read yet, which could hold the
+GPU for minutes.
 
 On an NVIDIA RTX card the F10 screen's Graphics section has **DLSS**: DLAA,
 NVIDIA's anti-aliasing at the render resolution, in place of the game's own

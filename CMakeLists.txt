@@ -25,7 +25,7 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
@@ -45,6 +45,7 @@ add_executable(bbhost
   src/core/imports.cpp
   src/core/thunk.cpp
   src/core/portable.cpp
+  src/core/paced_file.cpp
   src/core/host_clock.cpp
   src/core/futex.cpp
   src/core/win_vm.cpp
@@ -76,6 +77,7 @@ add_executable(bbhost
   src/engine/rebirth.cpp
   src/engine/rebirth_script.cpp
   src/engine/dream_mirror_layout.cpp
+  src/engine/chara_id.cpp
   src/engine/five_players.cpp
   src/engine/maiden_events.cpp
   src/engine/option_menu.cpp
@@ -93,6 +95,7 @@ add_executable(bbhost
   src/engine/fmod_probe.cpp
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp
+  src/engine/frame_tick.cpp
   src/engine/frame_pool.cpp
   src/engine/sf_heap_probe.cpp
   src/engine/debug_menu.cpp
@@ -149,15 +152,15 @@ target_link_libraries(bbhost PRIVATE ZLIB::ZLIB)
 
 # The git revision the binary logs on its first line (build/gen/bbhost_version.h,
 # rewritten by every build only when it changes): a crash report from a
-# machine names the build to symbolize it against. bbhost_build_id.h beside it:
-# the shader caches' stamp for "the same build".
+# machine names the build to symbolize it against.
 add_custom_target(bbhost_version
   COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/bbhost_version.h
-          -DBUILD_ID_OUT=${CMAKE_BINARY_DIR}/gen/bbhost_build_id.h -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
-  BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h ${CMAKE_BINARY_DIR}/gen/bbhost_build_id.h)
+          -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h)
 add_dependencies(bbhost bbhost_version)
 # The translator's fingerprint (build/gen/translator_fingerprint.h): the
-# translation cache's key for "the same translator".
+# translation cache's key for "the same translator" - its sources and the
+# cache's own key and entry code.
 add_custom_target(bbhost_translator_fingerprint
   COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/translator_fingerprint.h
           -P ${CMAKE_SOURCE_DIR}/cmake/translator_fingerprint.cmake
@@ -261,7 +264,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlss.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/dlss.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
@@ -305,7 +308,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/ingame_menu.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/buffer_shadow.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
-  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlss.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/dlss.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
 else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
@@ -344,16 +347,60 @@ else()
   target_compile_options(bbhost PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
+enable_testing()
+add_executable(libc_abi_test tests/libc_abi_test.cpp)
+target_include_directories(libc_abi_test PRIVATE src)
+target_compile_features(libc_abi_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET libc_abi_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME libc_abi_test COMMAND libc_abi_test)
+add_executable(libc_stdio_test tests/libc_stdio_test.cpp src/hle/sysv_va.cpp)
+target_include_directories(libc_stdio_test PRIVATE src)
+target_compile_features(libc_stdio_test PRIVATE cxx_std_17)
+find_package(Threads REQUIRED)
+target_link_libraries(libc_stdio_test PRIVATE Threads::Threads)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET libc_stdio_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME libc_stdio_test COMMAND libc_stdio_test)
+add_executable(libc_errno_test tests/libc_errno_test.cpp)
+target_include_directories(libc_errno_test PRIVATE src)
+target_compile_features(libc_errno_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET libc_errno_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME libc_errno_test COMMAND libc_errno_test)
+add_executable(libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp)
+target_include_directories(libc_wide_test PRIVATE src)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET libc_wide_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME libc_wide_test COMMAND libc_wide_test)
+
 if(UNIX)
-  enable_testing()
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(NAME world_baseline_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/world_baseline_test.py)
+    add_test(NAME area_check_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/area_check_test.py)
+    add_test(NAME lift_verify_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lift_verify_test.py)
     # The Debug Menu plugin's English against the 1.09 eboot: skipped without
     # one (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
     add_test(NAME debug_menu_strings_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/debug_menu_strings.py check)
     set_tests_properties(debug_menu_strings_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # The map-validation probe's tour steps (tools/area_check.py's) on a pretend
+  # host. Built beside the tests, never into plugins/, where bbhost would load it.
+  add_library(mapval_probe MODULE tools/mapval_plugin.c)
+  target_include_directories(mapval_probe PRIVATE include)
+  target_link_libraries(mapval_probe PRIVATE m)
+  set_target_properties(mapval_probe PROPERTIES PREFIX "")
+  add_executable(mapval_probe_test tests/mapval_probe_test.cpp)
+  target_include_directories(mapval_probe_test PRIVATE include)
+  target_link_libraries(mapval_probe_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(mapval_probe_test mapval_probe)
+  add_test(NAME mapval_probe_test COMMAND mapval_probe_test $<TARGET_FILE:mapval_probe>)
+  set_tests_properties(mapval_probe_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   target_include_directories(thunk_args PRIVATE src)
   target_link_libraries(thunk_args PRIVATE pthread)
@@ -366,6 +413,19 @@ if(UNIX)
   target_include_directories(sdk_headers_test PRIVATE include)
   target_compile_features(sdk_headers_test PRIVATE cxx_std_17)
   add_test(NAME sdk_headers_test COMMAND sdk_headers_test)
+  add_executable(libc_native_test tests/libc_native_test.cpp src/hle/sysv_va.cpp)
+  target_include_directories(libc_native_test PRIVATE src)
+  target_compile_features(libc_native_test PRIVATE cxx_std_17)
+  add_test(NAME libc_native_test COMMAND libc_native_test)
+  set_tests_properties(libc_native_test PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(libc_ctype_test tests/libc_ctype_test.cpp)
+  target_include_directories(libc_ctype_test PRIVATE src)
+  target_compile_features(libc_ctype_test PRIVATE cxx_std_17)
+  add_test(NAME libc_ctype_test COMMAND libc_ctype_test)
+  add_executable(libc_random_test tests/libc_random_test.cpp)
+  target_include_directories(libc_random_test PRIVATE src)
+  target_compile_features(libc_random_test PRIVATE cxx_std_17)
+  add_test(NAME libc_random_test COMMAND libc_random_test)
   add_executable(sysv_va_test tests/sysv_va_test.cpp src/hle/sysv_va.cpp)
   target_include_directories(sysv_va_test PRIVATE src)
   add_test(NAME sysv_va_test COMMAND sysv_va_test)
@@ -397,6 +457,9 @@ if(UNIX)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
   add_test(NAME write_watch_test COMMAND write_watch_test)
+  add_executable(paced_file_test tests/paced_file_test.cpp src/core/paced_file.cpp)
+  target_include_directories(paced_file_test PRIVATE src)
+  add_test(NAME paced_file_test COMMAND paced_file_test)
   # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
   # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
   # trap, and a test runs the game's functions beside ours. They skip (77)
@@ -486,7 +549,7 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB)
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
@@ -495,6 +558,10 @@ if(UNIX)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
+  add_executable(gcn_bindings_test tests/gcn_bindings_test.cpp)
+  target_link_libraries(gcn_bindings_test PRIVATE gcn)
+  add_test(NAME gcn_bindings_test COMMAND gcn_bindings_test)
+  set_tests_properties(gcn_bindings_test PROPERTIES SKIP_RETURN_CODE 77)
   if(SPIRV_TOOLS_LIB)
     add_executable(gcn_translate_test tests/gcn_translate_test.cpp)
     target_link_libraries(gcn_translate_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
@@ -507,11 +574,24 @@ if(UNIX)
     target_link_libraries(gcn_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_lift_test COMMAND gcn_lift_test)
   set_tests_properties(gcn_lift_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(gcn_tess_lift_test tests/gcn_tess_lift_test.cpp)
+    target_link_libraries(gcn_tess_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+    add_test(NAME gcn_tess_lift_test COMMAND gcn_tess_lift_test)
+    set_tests_properties(gcn_tess_lift_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(gcn_names_test tests/gcn_names_test.cpp)
+    target_link_libraries(gcn_names_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+    add_test(NAME gcn_names_test COMMAND gcn_names_test)
+    set_tests_properties(gcn_names_test PROPERTIES SKIP_RETURN_CODE 77)
     if(Vulkan_FOUND)
       add_executable(gcn_sampling_test tests/gcn_sampling_test.cpp)
       target_link_libraries(gcn_sampling_test PRIVATE gcn ${SPIRV_TOOLS_LIB} Vulkan::Vulkan)
       add_test(NAME gcn_sampling_test COMMAND gcn_sampling_test)
       set_tests_properties(gcn_sampling_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      add_executable(indirect_clamp_test tests/indirect_clamp_test.cpp)
+      target_include_directories(indirect_clamp_test PRIVATE src)
+      target_link_libraries(indirect_clamp_test PRIVATE Vulkan::Vulkan)
+      add_test(NAME indirect_clamp_test COMMAND indirect_clamp_test)
+      set_tests_properties(indirect_clamp_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     endif()
   endif()
 endif()

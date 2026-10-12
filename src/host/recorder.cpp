@@ -115,6 +115,13 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSet sets[2] = {};
     std::uint32_t dynamic_count = 0, dynamic[2] = {};
+    // A set of the pipeline's own past the shared ones (bind_stage_set),
+    // bound after them: a native hull pipeline's LS and hull resources.
+    bool stage_set_bound = false;
+    std::uint32_t stage_set_index = 0;
+    VkPipelineLayout stage_set_layout = VK_NULL_HANDLE;
+    VkDescriptorSet stage_set = VK_NULL_HANDLE;
+    std::uint32_t stage_set_dynamic_count = 0, stage_set_dynamic[2] = {};
     std::uint32_t pushes = 0;  // constant buffers pushed into set 2 after the binds: binding and range
     std::uint32_t push_binding[2 * gcn::kMaxBuffers];
     VkDescriptorBufferInfo push_infos[2 * gcn::kMaxBuffers];
@@ -174,6 +181,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
         write_image.clear();
         pipeline = VK_NULL_HANDLE;
         library = bind_sets = viewport = scissor = bounds = stencil = blend = index = draw = marker = false;
+        stage_set_bound = false;
         end_pass = begin_pass = false;
         end_pass_barrier = true;
         pass_barrier = false;
@@ -188,7 +196,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
 
 // Nothing a pass change must precede is in the packet yet.
 bool before_binds(const DrawPacket& p) {
-    return !p.pipeline && !p.library && !p.bind_sets && !p.pushes && !p.viewport && !p.scissor && !p.bounds && !p.stencil && !p.blend &&
+    return !p.pipeline && !p.library && !p.bind_sets && !p.stage_set_bound && !p.pushes && !p.viewport && !p.scissor && !p.bounds && !p.stencil && !p.blend &&
            !p.index && !p.vertex_buffers && !p.draw;
 }
 
@@ -333,6 +341,10 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
     if (p.library) record_library_state(cmd, p.lib, p.has_depth_bounds);
     if (p.bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p.dynamic);
     if (p.bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
+    if (p.stage_set_bound) {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.stage_set_layout, p.stage_set_index, 1, &p.stage_set,
+                                p.stage_set_dynamic_count, p.stage_set_dynamic);
+    }
     if (p.pushes) {
         VkWriteDescriptorSet writes[2 * gcn::kMaxBuffers];
         for (std::uint32_t k = 0; k < p.pushes; ++k) {
@@ -1434,6 +1446,22 @@ void DrawCmds::bind_sets(VkPipelineLayout layout, const VkDescriptorSet sets[2],
         p.dynamic[0] = dynamic[0];
         p.dynamic[1] = dynamic[1];
     }
+}
+
+void DrawCmds::bind_stage_set(VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set, std::uint32_t dynamic_count,
+                              const std::uint32_t* dynamic) {
+    dynamic_count = std::min<std::uint32_t>(dynamic_count, 2);
+    if (!packet_) {
+        vkCmdBindDescriptorSets(g_cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, layout, index, 1, &set, dynamic_count, dynamic);
+        return;
+    }
+    DrawPacket& p = *static_cast<DrawPacket*>(packet_);
+    p.stage_set_bound = true;
+    p.stage_set_index = index;
+    p.stage_set_layout = layout;
+    p.stage_set = set;
+    p.stage_set_dynamic_count = dynamic_count;
+    for (std::uint32_t k = 0; k < dynamic_count; ++k) p.stage_set_dynamic[k] = dynamic[k];
 }
 
 void DrawCmds::push_buffers(VkPipelineLayout layout, const std::uint32_t* bindings, const VkDescriptorBufferInfo* infos, std::uint32_t n) {

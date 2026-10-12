@@ -2,6 +2,8 @@
 #include "log.h"
 
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -74,6 +76,38 @@ static bool win_protect(void* p, std::size_t size, DWORD prot) {
 }
 #endif
 
+// The pages guest_keep_writable keeps writable (host addresses), and their
+// protection given back after a change that covered one.
+static std::mutex g_kept_mu;
+static std::vector<std::uintptr_t> g_kept;
+
+static void protect_page_rwx(std::uintptr_t page) {
+#if defined(_WIN32)
+    win_protect(reinterpret_cast<void*>(page), 0x1000, PAGE_EXECUTE_READWRITE);
+#else
+    mprotect(reinterpret_cast<void*>(page), 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+#endif
+}
+
+static void keep_kept_writable(const void* p, std::size_t size) {
+    std::lock_guard<std::mutex> lock(g_kept_mu);
+    const auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + size;
+    for (const std::uintptr_t page : g_kept) {
+        if (page < hi && page + 0x1000 > lo) protect_page_rwx(page);
+    }
+}
+
+void guest_keep_writable(GuestMemory* mem, std::uint64_t va) {
+    const auto page = reinterpret_cast<std::uintptr_t>(guest_ptr(*mem, va & ~0xfffull));
+    {
+        std::lock_guard<std::mutex> lock(g_kept_mu);
+        bool have = false;
+        for (const std::uintptr_t k : g_kept) have = have || k == page;
+        if (!have) g_kept.push_back(page);
+    }
+    protect_page_rwx(page);
+}
+
 bool guest_protect_rx(GuestMemory* mem, std::uint64_t va, std::size_t size) {
     void* p = guest_ptr(*mem, va);
 #if defined(_WIN32)
@@ -87,16 +121,19 @@ bool guest_protect_rx(GuestMemory* mem, std::uint64_t va, std::size_t size) {
         return false;
     }
 #endif
+    keep_kept_writable(p, size);
     return true;
 }
 
 bool guest_protect_rw(GuestMemory* mem, std::uint64_t va, std::size_t size) {
     void* p = guest_ptr(*mem, va);
 #if defined(_WIN32)
-    return win_protect(p, size, PAGE_READWRITE);
+    const bool ok = win_protect(p, size, PAGE_READWRITE);
 #else
-    return mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
+    const bool ok = mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
 #endif
+    keep_kept_writable(p, size);
+    return ok;
 }
 
 bool guest_protect_rwx(GuestMemory* mem, std::uint64_t va, std::size_t size) {

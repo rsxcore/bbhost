@@ -46,6 +46,8 @@ struct Config {
     int count = 1;
     int every = 1;  // capture one of every n matching draws (distinct light instances)
     bool each = false;  // '*': the first draw of each pipeline whose no-fallback variant is ready (tools/lift_verify.py)
+    bool each_ps = false;  // '*ps': the same, one draw for each pixel shader
+    bool armed = false;    // BBHOST_CAPTURE_ARMED=1: only while armed (host_gpu_capture_arm)
 };
 
 const Config& config() {
@@ -59,8 +61,10 @@ const Config& config() {
             s.resize(pc);
         }
         c.prefix = s;
-        c.each = s == "*";
+        c.each_ps = s == "*ps";
+        c.each = s == "*" || c.each_ps;
         c.enabled = !s.empty();
+        if (const char* a = std::getenv("BBHOST_CAPTURE_ARMED")) c.armed = a[0] == '1';
         if (const char* f = std::getenv("BBHOST_CAPTURE_MIN_FLIP")) c.min_flip = std::strtoull(f, nullptr, 10);
         if (const char* d = std::getenv("BBHOST_CAPTURE_DIR"); d && *d) c.dir = d;
         if (const char* n = std::getenv("BBHOST_CAPTURE_COUNT")) c.count = std::max(1, std::atoi(n));
@@ -71,8 +75,11 @@ const Config& config() {
 }
 
 int g_captured = 0;  // under g.mu
-std::set<std::string> g_each_seen;  // BBHOST_CAPTURE_DRAW=*: pipelines already captured (under g.mu)
+std::set<std::string> g_each_seen;  // BBHOST_CAPTURE_DRAW=*: pipelines (*ps: pixel shaders) already captured (under g.mu)
 int g_rejected = 0;
+// BBHOST_CAPTURE_ARMED=1: the draws still to take, and where (under g.mu).
+int g_armed = 0;
+std::string g_armed_dir;
 std::uint64_t g_matches = 0;  // matching draws seen, for BBHOST_CAPTURE_EVERY
 
 struct Readback {
@@ -232,6 +239,8 @@ public:
     std::vector<std::pair<std::string, std::vector<std::uint8_t>>> host_blobs;
     bool done = false;
     bool quiet = false;  // rejected before anything worth reporting
+    std::vector<std::uint32_t> indirect_args;  // an indirect draw's arguments as read (captured as a direct draw)
+    std::vector<std::uint64_t> pages;          // a dispatch's guest pages, read again after it ran
 
     void blob(const std::string& name, const std::uint8_t* data, std::size_t bytes) {
         host_blobs.emplace_back(name, std::vector<std::uint8_t>(data, data + bytes));
@@ -295,6 +304,29 @@ public:
         return true;
     }
 
+    // The same for a range of a buffer (a tessellated draw's LDS ring).
+    bool buffer_readback(const std::string& name, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::string& why) {
+        Readback rb;
+        rb.blob = name;
+        rb.bytes = bytes;
+        if (!bytes || !create_dev_buffer(rb.staging, bytes, true)) {
+            why = "no host-visible staging buffer of " + std::to_string(bytes) + " bytes";
+            return false;
+        }
+        readbacks.push_back(rb);
+        begin_recording_locked();
+        transfer_flush_locked();
+        render_end_pass_locked();
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+        const VkBufferCopy region{offset, 0, bytes};
+        vkCmdCopyBuffer(g_cmd(), buffer, rb.staging.buffer, 1, &region);
+        return true;
+    }
+
     bool target_readbacks(const char* when, json::Value& targets, std::string& why) {
         const CaptureDraw& d = draw;
         json::Value& colors = const_cast<json::Value&>(json::member(targets, "color"));
@@ -346,12 +378,102 @@ void CaptureSessionDeleter::operator()(CaptureSession* s) const {
     delete s;
 }
 
-bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::uint64_t flip, bool lean_ready) {
+namespace {
+
+// Vulkan vertex input as the manifest holds it: the elements, the attributes,
+// and each binding's bytes from its first one up to the last vertex the draw
+// reads (`last` with the base vertex added), in blobs named <prefix><binding>.
+bool vertex_input_json(CaptureSession& s, const CaptureVertexInput& vi, std::uint64_t last, const char* prefix, json::Value& out,
+                       std::string& why) {
+    out = json::Value::make_object();
+    json::Value elements = json::Value::make_array();
+    for (const gcn::VertexElement& e : vi.elements) {
+        json::Value ej = json::Value::make_object();
+        ej.set("location", e.location);
+        ej.set("vdata", e.vdata);
+        ej.set("count", e.count);
+        ej.set("w3", json::hex(e.w3));
+        elements.push(ej);
+    }
+    out.set("elements", elements);
+    json::Value bindings = json::Value::make_array();
+    for (std::size_t b = 0; b < vi.bindings.size(); ++b) {
+        const VkVertexInputBindingDescription& bd = vi.bindings[b];
+        if (bd.binding != b) {
+            why = "vertex input bindings are not numbered in order";
+            return false;
+        }
+        std::uint64_t bytes = 0;
+        for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+            if (a.binding != bd.binding) continue;
+            const std::uint32_t w3 = a.location < vi.elements.size() ? vi.elements[a.location].w3 : 0;
+            bytes = std::max<std::uint64_t>(bytes, a.offset + last * bd.stride + vertex_element_bytes((w3 >> 15) & 0xf));
+        }
+        const std::uint64_t va = b < vi.binding_va.size() ? vi.binding_va[b] : 0;
+        const std::string where = "vertex input binding " + std::to_string(b);
+        if (!va || !bytes || bytes > kMaxVertexBytes) {
+            why = where + " has no guest address or is too large to capture";
+            return false;
+        }
+        if (!hle_kernel_va_mapped(va, bytes)) {
+            why = where + " is not mapped";
+            return false;
+        }
+        std::vector<std::uint8_t> data(bytes);
+        read_guest_locked(va, bytes, data.data());
+        const std::string name = prefix + std::to_string(b);
+        s.blob(name, data.data(), data.size());
+        json::Value bj = json::Value::make_object();
+        bj.set("binding", bd.binding);
+        bj.set("stride", bd.stride);
+        bj.set("guest_va", json::hex(va));
+        bj.set("bytes", bytes);
+        bj.set("blob", name);
+        bindings.push(bj);
+    }
+    out.set("bindings", bindings);
+    json::Value attributes = json::Value::make_array();
+    for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+        json::Value aj = json::Value::make_object();
+        aj.set("location", a.location);
+        aj.set("binding", a.binding);
+        aj.set("format", static_cast<unsigned>(a.format));
+        aj.set("offset", a.offset);
+        attributes.push(aj);
+    }
+    out.set("attributes", attributes);
+    return true;
+}
+
+}  // namespace
+
+bool capture_wanted() {
+    const Config& c = config();
+    if (!c.enabled) return false;
+    std::lock_guard<GpuMutex> lock(g.mu);  // the counts are the capturing draws'
+    return g_captured < c.count && g_rejected < kMaxRejections;
+}
+
+bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::uint64_t flip, bool lean_ready, std::uint64_t indirect_va) {
     const Config& c = config();
     if (!(c.enabled && g_captured < c.count && g_rejected < kMaxRejections && flip >= c.min_flip && count >= c.min_count)) {
         return false;
     }
-    if (c.each) return lean_ready && g_each_seen.insert(pipeline).second;
+    // An indirect draw whose arguments count nothing as guest memory holds
+    // them now (a particle emitter with nothing alive) is passed over before
+    // the settle a candidate costs; capture_begin_locked reads them again
+    // after it.
+    if (indirect_va) {
+        std::uint32_t a[2] = {};
+        if (hle_kernel_va_mapped(indirect_va, sizeof(a))) std::memcpy(a, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(indirect_va)), sizeof(a));
+        if (a[0] == 0 || a[1] == 0) return false;
+    }
+    if (c.armed && g_armed <= 0) return false;
+    if (c.each) {
+        // A pipeline is named <vertex shader>+<pixel shader>.
+        const std::size_t plus = pipeline.rfind('+');
+        return lean_ready && g_each_seen.insert(c.each_ps && plus != std::string::npos ? pipeline.substr(plus + 1) : pipeline).second;
+    }
     // A comma-separated list captures any of them: two passes of one surface
     // in the same frame, which is how their inputs can be compared.
     bool any = false;
@@ -385,8 +507,44 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
         return CapturePtr();
     };
 
-    // What the first supported draws must not do.
-    if (d.indirect_va) return reject("indirect draw: its arguments are GPU data");
+    // An indirect draw's arguments, read now - everything recorded before the
+    // draw has run (capture_settle_locked), so they hold the counts the GPU
+    // computed - and captured as the direct draw they make: Vulkan's layouts,
+    // which the renderer passes to vkCmdDraw(Indexed)Indirect as they are.
+    if (d.indirect_va) {
+        std::uint32_t a[5] = {};
+        const std::size_t words = d.index_va ? 5 : 4;
+        if (!hle_kernel_va_mapped(d.indirect_va, words * 4)) return reject("indirect draw: its arguments are not mapped");
+        if (copy_version_lookup_locked(d.indirect_va, words * 4, nullptr) != kCopyVersionNone) {
+            return reject("indirect draw: its arguments are still in a copy-back's copy");
+        }
+        std::memcpy(a, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(d.indirect_va)), words * 4);
+        if (a[words - 1] != 0) return reject("indirect draw with a first instance");
+        // Particle emitters with nothing alive draw zero vertices: such a
+        // draw runs no shader, and its replay would compare nothing. Not a
+        // candidate, so not one of the run's rejections either.
+        if (a[0] == 0 || a[1] == 0) {
+            s.quiet = true;
+            static bool said = false;
+            if (!said) {
+                said = true;
+                host_log("capture: %s draw %llu (flip %llu) skipped: an indirect draw that draws nothing (no vertices or instances); "
+                         "later ones are skipped silently", d.pipeline.c_str(), static_cast<unsigned long long>(d.draw_index),
+                         static_cast<unsigned long long>(d.flip));
+            }
+            return CapturePtr();
+        }
+        d.count = a[0];
+        d.instances = a[1];
+        if (d.index_va) {
+            d.index_va += static_cast<std::uint64_t>(a[2]) * (d.index_type == 1 ? 4 : 2);
+            d.base_vertex = static_cast<std::int32_t>(a[3]);
+        } else {
+            d.base_vertex = static_cast<std::int32_t>(a[2]);
+        }
+        s.indirect_args.assign(a, a + words);
+        d.indirect_va = 0;
+    }
     for (int t = 0; t < 8; ++t) {
         if (d.color[t] && !d.color[t]->initialised) return reject("colour target " + std::to_string(t) + " has undefined contents");
     }
@@ -400,7 +558,7 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     char leaf[160];
     std::snprintf(leaf, sizeof(leaf), "%s-f%llu-d%llu", d.pipeline.c_str(), static_cast<unsigned long long>(d.flip),
                   static_cast<unsigned long long>(d.draw_index));
-    s.dir = cfg.dir + "/" + leaf;
+    s.dir = (cfg.armed && !g_armed_dir.empty() ? g_armed_dir : cfg.dir) + "/" + leaf;
     std::error_code ec;
     if (fs::exists(s.dir, ec)) return reject("capture directory " + s.dir + " already exists");
     if (!fs::create_directories(fs::path(s.dir) / "blobs", ec)) return reject("cannot create " + s.dir + ": " + ec.message());
@@ -547,6 +705,9 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
             bj.set("path", b.path.str());
             bj.set("pointer", b.pointer);
             bj.set("max_dw", b.max_dw);
+            if (b.indexed) bj.set("indexed", true);
+            if (b.ranged) bj.set("ranged", true);
+            if (b.written) bj.set("written", true);  // the shaders store to it: drawreplay compares it after the draw
             bj.set("bias_dw", cs.params.cb_bias_dw[i]);
             bj.set("bytes", info.range);
             if (info.buffer == g.sink.buffer) {
@@ -557,7 +718,18 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
             } else {
                 std::uint64_t va = 0;
                 const std::uint8_t* bytes = imported_bytes_locked(info.buffer, info.offset, info.range, &va);
-                if (!bytes) return reject(where + " is not over imported guest memory");
+                std::vector<std::uint8_t> copied;
+                if (!bytes) {
+                    // A copy of guest memory taken as the draw recorded (a YEBIS
+                    // window's, the aligned scratch): the guest bytes it holds,
+                    // read now, as the copy was this recording.
+                    va = copy_binding_guest_locked(info.buffer, info.offset, info.range);
+                    if (!va || !hle_kernel_va_mapped(va, info.range)) return reject(where + " is not over imported guest memory or a copy of it");
+                    copied.resize(info.range);
+                    read_guest_locked(va, info.range, copied.data());
+                    bytes = copied.data();
+                    bj.set("bound_from", "a copy taken as the draw recorded");
+                }
                 bj.set("kind", "guest");
                 bj.set("guest_va", json::hex(va));
                 s.blob(name, bytes, info.range);
@@ -570,6 +742,14 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
         program_ranges(cs.gcn_words, user, ranges);
         if (st == 0) program_ranges(d.fetch_words, user, ranges);
         stages.push(sj);
+    }
+
+    // A tessellated draw's LS and hull programs reach memory through the page
+    // table with their own user data.
+    if (d.tess.present) {
+        program_ranges(d.tess.ls_words, d.tess.ls_user, ranges);
+        program_ranges(d.tess.ls_fetch_words, d.tess.ls_user, ranges);
+        program_ranges(d.tess.hs_words, d.tess.hs_user, ranges);
     }
 
     // Guest pages in the GPU page table that the shaders can reach.
@@ -601,6 +781,11 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     draw.set("instance_count", d.instances);
     draw.set("base_vertex", d.base_vertex);
     draw.set("indexed", d.index_va != 0);
+    if (!s.indirect_args.empty()) {
+        json::Value args = json::Value::make_array();
+        for (const std::uint32_t w : s.indirect_args) args.push(w);
+        draw.set("indirect_args", args);  // provenance: replayed as the direct draw above
+    }
     std::uint64_t last_vertex = d.count ? d.count - 1 : 0;  // the highest vertex read, before base_vertex
     if (d.index_va) {
         const std::size_t bytes = static_cast<std::size_t>(d.count) * (d.index_type ? 4 : 2);
@@ -630,55 +815,113 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     json::Value vertex_input;  // null for a draw that runs its fetch shader
     if (d.vertex_input) {
         if (d.base_vertex < 0) return reject("vertex input with a negative base vertex");
-        const std::uint64_t base = static_cast<std::uint64_t>(d.base_vertex);
-        vertex_input = json::Value::make_object();
-        json::Value elements = json::Value::make_array();
-        for (const gcn::VertexElement& e : d.vinput.elements) {
-            json::Value ej = json::Value::make_object();
-            ej.set("location", e.location);
-            ej.set("vdata", e.vdata);
-            ej.set("count", e.count);
-            ej.set("w3", json::hex(e.w3));
-            elements.push(ej);
+        std::string why;
+        if (!vertex_input_json(s, d.vinput, static_cast<std::uint64_t>(d.base_vertex) + last_vertex, "vertex-binding", vertex_input, why)) {
+            return reject(why);
         }
-        vertex_input.set("elements", elements);
-        json::Value bindings = json::Value::make_array();
-        for (std::size_t b = 0; b < d.vinput.bindings.size(); ++b) {
-            const VkVertexInputBindingDescription& bd = d.vinput.bindings[b];
-            if (bd.binding != b) return reject("vertex input bindings are not numbered in order");
-            std::uint64_t bytes = 0;
-            for (const VkVertexInputAttributeDescription& a : d.vinput.attributes) {
-                if (a.binding != bd.binding) continue;
-                const std::uint32_t w3 = a.location < d.vinput.elements.size() ? d.vinput.elements[a.location].w3 : 0;
-                bytes = std::max<std::uint64_t>(bytes, a.offset + (base + last_vertex) * bd.stride + vertex_element_bytes((w3 >> 15) & 0xf));
+    }
+
+    // A draw on the host's tessellator: the stages around the domain shader,
+    // the LS's and hull's programs, the LDS the LS pass left in the ring (the
+    // game's hull), and the draw as the game made it.
+    json::Value tess_json;  // null for other draws
+    if (d.tess.present) {
+        const CaptureTess& t = d.tess;
+        tess_json = json::Value::make_object();
+        tess_json.set("kind", t.hull ? "hull" : t.attrs ? "attributes" : "constant");
+        tess_json.set("control_points", t.control_points);
+        tess_json.set("attr_vec4s", t.attr_vec4s);
+        tess_json.set("window", t.window);
+        tess_json.set("quads", t.quads);
+        tess_json.set("cw", t.cw);
+        tess_json.set("spacing", t.spacing);
+        json::Value outer = json::Value::make_array(), inner = json::Value::make_array();
+        for (float f : t.outer) outer.push(json::f32(f));
+        for (float f : t.inner) inner.push(json::f32(f));
+        tess_json.set("outer", outer);
+        tess_json.set("inner", inner);
+        if (t.vertex_spirv.empty() || t.control_spirv.empty()) return reject("a tessellated draw without its vertex or control stage module");
+        s.blob("tess-vs-spirv", reinterpret_cast<const std::uint8_t*>(t.vertex_spirv.data()), t.vertex_spirv.size() * 4);
+        s.blob("tess-tcs-spirv", reinterpret_cast<const std::uint8_t*>(t.control_spirv.data()), t.control_spirv.size() * 4);
+        tess_json.set("vertex_spirv", "tess-vs-spirv");
+        tess_json.set("control_spirv", "tess-tcs-spirv");
+        const auto program = [&](const char* key, const std::vector<std::uint32_t>* words, const char* blob) {
+            if (words && !words->empty()) {
+                s.blob(blob, reinterpret_cast<const std::uint8_t*>(words->data()), words->size() * 4);
+                tess_json.set(key, blob);
+            } else {
+                tess_json.set(key, nullptr);
             }
-            const std::uint64_t va = b < d.vinput.binding_va.size() ? d.vinput.binding_va[b] : 0;
-            const std::string where = "vertex input binding " + std::to_string(b);
-            if (!va || !bytes || bytes > kMaxVertexBytes) return reject(where + " has no guest address or is too large to capture");
-            if (!hle_kernel_va_mapped(va, bytes)) return reject(where + " is not mapped");
-            std::vector<std::uint8_t> data(bytes);
-            read_guest_locked(va, bytes, data.data());
-            const std::string name = "vertex-binding" + std::to_string(b);
-            s.blob(name, data.data(), data.size());
-            json::Value bj = json::Value::make_object();
-            bj.set("binding", bd.binding);
-            bj.set("stride", bd.stride);
-            bj.set("guest_va", json::hex(va));
-            bj.set("bytes", bytes);
-            bj.set("blob", name);
-            bindings.push(bj);
+        };
+        program("ls_gcn", t.ls_words, "ls-gcn");
+        program("ls_fetch_gcn", t.ls_fetch_words, "ls-fetch-gcn");
+        program("hs_gcn", t.hs_words, "hs-gcn");
+        json::Value rs = json::Value::make_array();
+        rs.push(json::hex(t.ls_rsrc1));
+        rs.push(json::hex(t.ls_rsrc2));
+        tess_json.set("ls_rsrc", rs);
+        rs = json::Value::make_array();
+        rs.push(json::hex(t.hs_rsrc1));
+        rs.push(json::hex(t.hs_rsrc2));
+        tess_json.set("hs_rsrc", rs);
+        tess_json.set("ls_user", hex_words(t.ls_user, 16));
+        tess_json.set("hs_user", hex_words(t.hs_user, 16));
+        tess_json.set("tess_constants", hex_words(t.tess_constants, 12));
+        if (t.hull) {
+            std::string why;
+            if (!t.lds_buffer || !s.buffer_readback("tess-lds", t.lds_buffer, t.lds_offset, t.lds_bytes, why)) {
+                return reject("the LDS ring: " + why);
+            }
+            json::Value lj = json::Value::make_object();
+            lj.set("blob", "tess-lds");
+            lj.set("bytes", t.lds_bytes);
+            lj.set("note", "the ring from the draw's lds_address after the LS pass, before the draw; the evaluation stage's params "
+                           "point at it, and a replay puts its own copy there");
+            tess_json.set("lds", lj);
         }
-        vertex_input.set("bindings", bindings);
-        json::Value attributes = json::Value::make_array();
-        for (const VkVertexInputAttributeDescription& a : d.vinput.attributes) {
-            json::Value aj = json::Value::make_object();
-            aj.set("location", a.location);
-            aj.set("binding", a.binding);
-            aj.set("format", static_cast<unsigned>(a.format));
-            aj.set("offset", a.offset);
-            attributes.push(aj);
+        // The game's draw: an index range of control points, its instances.
+        json::Value nd = json::Value::make_object();
+        nd.set("count", t.count);
+        nd.set("instances", t.instances);
+        nd.set("first_instance", t.first_instance);
+        nd.set("first_point", t.first_point);
+        nd.set("base_vertex", t.base_vertex);
+        nd.set("indexed", t.index_va != 0);
+        std::uint64_t ls_last = t.count ? t.first_point + t.count - 1 : 0;
+        if (t.index_va) {
+            const std::size_t isz = t.index_type ? 4 : 2;
+            const std::uint64_t first_byte = static_cast<std::uint64_t>(t.first_point) * isz;
+            const std::size_t bytes = static_cast<std::size_t>(t.count) * isz;
+            if (!hle_kernel_va_mapped(t.index_va + first_byte, bytes)) return reject("the tessellated draw's index buffer is not mapped");
+            std::vector<std::uint8_t> indices(bytes);
+            read_guest_locked(t.index_va + first_byte, bytes, indices.data());
+            s.blob("tess-index", indices.data(), indices.size());
+            ls_last = 0;
+            for (std::size_t k = 0; k < t.count; ++k) {
+                std::uint32_t v = 0;
+                if (t.index_type) {
+                    std::memcpy(&v, indices.data() + k * 4, 4);
+                } else {
+                    std::uint16_t v16 = 0;
+                    std::memcpy(&v16, indices.data() + k * 2, 2);
+                    v = v16;
+                }
+                ls_last = std::max<std::uint64_t>(ls_last, v);
+            }
+            nd.set("index_type", t.index_type ? "uint32" : "uint16");
+            nd.set("index_blob", "tess-index");
+            nd.set("index_va", json::hex(t.index_va));
         }
-        vertex_input.set("attributes", attributes);
+        tess_json.set("draw", nd);
+        json::Value lvi;
+        if (t.ls_vertex_input && t.base_vertex >= 0) {
+            std::string why;
+            if (!vertex_input_json(s, t.ls_vinput, static_cast<std::uint64_t>(t.base_vertex) + ls_last, "ls-vertex-binding", lvi, why)) {
+                lvi = json::Value();  // the replay of an LS on vertex input is then not possible; the rest is
+                tess_json.set("ls_vertex_input_refused", why);
+            }
+        }
+        tess_json.set("ls_vertex_input", lvi);
     }
 
     json::Value shaders = json::Value::make_object();
@@ -744,6 +987,7 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     m.set("pipeline", fixed_json(d.fixed));
     m.set("draw", draw);
     m.set("vertex_input", vertex_input);
+    if (d.tess.present) m.set("tessellation", tess_json);
     m.set("stages", stages);
     m.set("images", images);
     m.set("samplers", samplers);
@@ -756,6 +1000,10 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     notes.push("Guest pages cover the tables and vertex buffers the programs reach through the page table; replay's sink-sentinel run checks that.");
     m.set("notes", notes);
     return session;
+}
+
+namespace {
+void write_session_locked(CaptureSession& s);
 }
 
 void capture_finish_locked(CapturePtr session, const CaptureDynamic& dyn) {
@@ -806,7 +1054,14 @@ void capture_finish_locked(CapturePtr session, const CaptureDynamic& dyn) {
     m.set("dynamic", dj);
 
     flush_locked();
+    write_session_locked(s);
+}
 
+namespace {
+
+// Writes a finished session's readbacks and blobs, then its manifest.
+void write_session_locked(CaptureSession& s) {
+    json::Value& m = s.manifest;
     json::Value blobs = json::Value::make_object();
     std::uint64_t total = 0;
     bool ok = true;
@@ -845,10 +1100,284 @@ void capture_finish_locked(CapturePtr session, const CaptureDynamic& dyn) {
         host_log("capture: %s: writing the manifest failed", s.dir.c_str());
         return;
     }
-    ++g_captured;
-    host_log("capture: wrote %s/manifest.json (%s, flip %llu, draw %llu, %zu blobs, %llu bytes)", s.dir.c_str(),
-             s.draw.pipeline.c_str(), static_cast<unsigned long long>(s.draw.flip), static_cast<unsigned long long>(s.draw.draw_index),
+    if (s.pages.empty() && json::str(m, "schema") == "bbhost-draw-capture") {
+        ++g_captured;
+        if (g_armed > 0) --g_armed;
+    }
+    host_log("capture: wrote %s/manifest.json (%s, flip %llu, %s %llu, %zu blobs, %llu bytes)", s.dir.c_str(), s.draw.pipeline.c_str(),
+             static_cast<unsigned long long>(s.draw.flip), s.pages.empty() ? "draw" : "dispatch", static_cast<unsigned long long>(s.draw.draw_index),
              blobs.object.size(), static_cast<unsigned long long>(total));
 }
 
+}  // namespace
+
+// ---- compute dispatches (BBHOST_CAPTURE_DISPATCH) ----
+
+namespace {
+
+struct DispatchConfig {
+    bool enabled = false;
+    std::string prefix;
+    int count = 1, every = 1;
+};
+
+const DispatchConfig& dispatch_config() {
+    static const DispatchConfig c = [] {
+        DispatchConfig c;
+        const char* e = std::getenv("BBHOST_CAPTURE_DISPATCH");
+        if (!e || !*e) return c;
+        c.prefix = e;
+        c.enabled = true;
+        if (const char* n = std::getenv("BBHOST_CAPTURE_DISPATCH_COUNT")) c.count = std::max(1, std::atoi(n));
+        if (const char* n = std::getenv("BBHOST_CAPTURE_DISPATCH_EVERY")) c.every = std::max(1, std::atoi(n));
+        return c;
+    }();
+    return c;
+}
+
+int g_dispatches_captured = 0, g_dispatches_rejected = 0;  // under g.mu
+std::uint64_t g_dispatch_matches = 0;
+
+}  // namespace
+
+bool capture_dispatch_candidate(const std::string& program, std::uint64_t flip) {
+    const DispatchConfig& c = dispatch_config();
+    if (!c.enabled || g_dispatches_captured >= c.count || g_dispatches_rejected >= kMaxRejections || flip < config().min_flip) return false;
+    bool any = false;
+    for (std::size_t at = 0; at <= c.prefix.size() && !any;) {
+        const std::size_t comma = std::min(c.prefix.find(',', at), c.prefix.size());
+        const std::size_t n = comma - at;
+        if (n && program.compare(0, n, c.prefix, at, n) == 0) any = true;
+        at = comma + 1;
+    }
+    return any && g_dispatch_matches++ % static_cast<std::uint64_t>(c.every) == 0;
+}
+
+CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
+    CapturePtr session(new CaptureSession);
+    CaptureSession& s = *session;
+    s.draw.pipeline = d.pipeline;
+    s.draw.flip = d.flip;
+    s.draw.draw_index = d.dispatch_index;
+    const auto reject = [&](const std::string& why) {
+        s.quiet = true;
+        ++g_dispatches_rejected;
+        static std::set<std::string> seen;
+        if (seen.size() < 32 && seen.insert(why).second) {
+            host_log("capture: dispatch %s %llu (flip %llu) not captured: %s", d.pipeline.c_str(), static_cast<unsigned long long>(d.dispatch_index),
+                     static_cast<unsigned long long>(d.flip), why.c_str());
+        }
+        return CapturePtr();
+    };
+    if (!d.meta || !d.spirv || !d.images || d.images->images.size() != d.meta->images.size() || d.images->samplers.size() != d.meta->samplers.size()) {
+        return reject("bindings and resolved resources disagree");
+    }
+    // An indirect dispatch's arguments, read now that everything recorded
+    // before it has run, captured as the direct dispatch they make.
+    std::uint32_t args[3] = {d.dim[0], d.dim[1], d.dim[2]};
+    if (d.indirect_va) {
+        if (!hle_kernel_va_mapped(d.indirect_va, sizeof(args))) return reject("its indirect arguments are not mapped");
+        read_guest_locked(d.indirect_va, sizeof(args), args);
+        if (!args[0] || !args[1] || !args[2]) {
+            s.quiet = true;  // no work: not a candidate, not a rejection
+            --g_dispatch_matches;
+            return CapturePtr();
+        }
+        if (args[0] > 65535 || args[1] > 65535 || args[2] > 65535) return reject("its indirect arguments ask past 65535 workgroups a dimension");
+    }
+
+    namespace fs = std::filesystem;
+    char leaf[160];
+    std::snprintf(leaf, sizeof(leaf), "dispatch-%s-f%llu-n%llu", d.pipeline.c_str(), static_cast<unsigned long long>(d.flip),
+                  static_cast<unsigned long long>(d.dispatch_index));
+    s.dir = config().dir + "/" + leaf;
+    std::error_code ec;
+    if (fs::exists(s.dir, ec)) return reject("capture directory " + s.dir + " already exists");
+    if (!fs::create_directories(fs::path(s.dir) / "blobs", ec)) return reject("cannot create " + s.dir + ": " + ec.message());
+
+    const gcn::TranslateResult& meta = *d.meta;
+    const std::uint32_t* user = d.params.user_sgpr;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    s.blob("cs-spirv", reinterpret_cast<const std::uint8_t*>(d.spirv->data()), d.spirv->size() * 4);
+    if (d.gcn_words && !d.gcn_words->empty()) s.blob("cs-gcn", reinterpret_cast<const std::uint8_t*>(d.gcn_words->data()), d.gcn_words->size() * 4);
+    s.blob("cs-params", reinterpret_cast<const std::uint8_t*>(&d.params), sizeof(d.params));
+    json::Value stage = json::Value::make_object();
+    stage.set("stage", "compute");
+    stage.set("spirv", "cs-spirv");
+    if (d.gcn_words && !d.gcn_words->empty()) stage.set("gcn", "cs-gcn");
+    json::Value pj = json::Value::make_object();
+    pj.set("blob", "cs-params");
+    pj.set("bytes", static_cast<unsigned>(sizeof(d.params)));
+    pj.set("user_sgpr", hex_words(user, 16));
+    pj.set("l1_table_replaced_on_replay", json::hex(d.params.l1_table));
+    stage.set("params", pj);
+
+    // Images: sampled ones only (a storage image would be an output too).
+    std::map<VkImageView, std::string> image_ids;
+    json::Value images = json::Value::make_object();
+    json::Value ij = json::Value::make_array();
+    for (std::size_t k = 0; k < meta.images.size(); ++k) {
+        const gcn::ImageBinding& b = meta.images[k];
+        const StageImages::Image& im = d.images->images[k];
+        const std::string where = "image binding " + std::to_string(b.binding) + " (" + b.path.str() + ")";
+        if (b.storage) return reject(where + " is a storage image");
+        if (!im.resolved || !im.view || im.dim != b.dim || im.arrayed != b.arrayed) return reject(where + " is bound to a dummy image");
+        ViewRecord rec;
+        if (!describe_view_locked(im.view, rec)) return reject(where + " has a view the texture cache did not record");
+        std::uint32_t words[8] = {};
+        resolve_resource(b.path, user, b.r128 ? 4 : 8, words, &ranges);
+        std::string id;
+        if (auto found = image_ids.find(im.view); found != image_ids.end()) {
+            id = found->second;
+        } else {
+            id = "image" + std::to_string(image_ids.size());
+            image_ids[im.view] = id;
+            json::Value rj = json::Value::make_object();
+            rj.set("kind", rec.render_target ? "render-target" : "surface");
+            rj.set("guest_base", json::hex(rec.guest_base));
+            rj.set("image", image_info_json(rec.image_info));
+            rj.set("view", view_info_json(rec.view_info));
+            rj.set("alias", nullptr);
+            json::Value subs = json::Value::make_array();
+            std::string why;
+            const VkImageSubresourceRange& r = rec.view_info.subresourceRange;
+            if (!s.readback(id, rec.image, r.aspectMask, rec.image_info.format, rec.image_info.imageType, rec.image_info.extent, r.baseMipLevel,
+                            r.levelCount, r.baseArrayLayer, r.layerCount, subs, why)) {
+                return reject(where + ": " + why);
+            }
+            rj.set("blob", id);
+            rj.set("subresources", subs);
+            images.set(id, rj);
+        }
+        json::Value bj = json::Value::make_object();
+        bj.set("binding", b.binding);
+        bj.set("path", b.path.str());
+        bj.set("dim", b.dim);
+        bj.set("arrayed", b.arrayed);
+        bj.set("r128", b.r128);
+        bj.set("tsharp", hex_words(im.w, 8));
+        bj.set("image", id);
+        ij.push(bj);
+    }
+    stage.set("images", ij);
+    if (!meta.samplers.empty()) return reject("the program samples (dispatch captures take image loads only)");
+
+    // What the program writes: the V#s it stores through and the counters it
+    // counts in, for the replay to compare.
+    json::Value written = json::Value::make_array();
+    for (const gcn::ResourcePath& path : meta.store_buffers) {
+        std::uint32_t v[4] = {};
+        if (!resolve_resource(path, user, 4, v, &ranges)) return reject("a buffer it stores through (" + path.str() + ") does not resolve");
+        const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+        const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+        const std::uint64_t bytes = stride ? std::uint64_t{v[2]} * stride : v[2];
+        json::Value wj = json::Value::make_object();
+        wj.set("path", path.str());
+        wj.set("guest_va", json::hex(base));
+        wj.set("stride", stride);
+        wj.set("records", v[2]);
+        wj.set("bytes", bytes);
+        written.push(wj);
+        if (base && bytes) ranges.push_back({base, bytes});
+    }
+    for (const gcn::BufferBinding& b : meta.buffers) {
+        std::uint32_t v[4] = {};
+        if (resolve_resource(b.path, user, b.pointer ? 2 : 4, v, &ranges) && !b.pointer) {
+            const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+            const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+            const std::uint64_t bytes = stride ? std::uint64_t{v[2]} * stride : v[2];
+            if (base && bytes && bytes <= kMaxVsharpBytes) ranges.push_back({base, bytes});
+        }
+    }
+    json::Value counters = json::Value::make_array();
+    for (std::uint64_t w : d.counters) {
+        counters.push(json::hex(w));
+        ranges.push_back({w, 4});
+    }
+    program_ranges(d.gcn_words, user, ranges);
+
+    std::set<std::uint64_t> pages;
+    for (const auto& [va, bytes] : ranges) {
+        if (!bytes || va + bytes < va) continue;
+        for (std::uint64_t p = va & ~(kPage - 1); p < va + bytes; p += kPage) {
+            if (!page_in_gpu_table_locked(p) || !hle_kernel_va_mapped(p, kPage)) continue;
+            pages.insert(p);
+            if (pages.size() > kMaxPages) return reject("program-reachable guest memory exceeds " + std::to_string(kMaxPages) + " pages");
+        }
+    }
+    json::Value memory = json::Value::make_object();
+    memory.set("page_bytes", kPage);
+    json::Value page_list = json::Value::make_array();
+    std::vector<std::uint8_t> page_bytes(pages.size() * kPage);
+    std::size_t at = 0;
+    for (std::uint64_t p : pages) {
+        page_list.push(json::hex(p));
+        read_guest_locked(p, kPage, page_bytes.data() + at);
+        at += kPage;
+        s.pages.push_back(p);
+    }
+    memory.set("pages", page_list);
+    memory.set("blob", "memory");
+    memory.set("after", "memory-after");
+    s.blob("memory", page_bytes.data(), page_bytes.size());
+
+    json::Value dj = json::Value::make_object();
+    json::Value groups = json::Value::make_array();
+    for (std::uint32_t a : args) groups.push(a);
+    dj.set("groups", groups);
+    json::Value threads = json::Value::make_array();
+    for (std::uint32_t t : d.threads) threads.push(t);
+    dj.set("threads", threads);
+    dj.set("indirect", d.indirect_va != 0);
+    if (d.indirect_va) dj.set("indirect_va", json::hex(d.indirect_va));
+    dj.set("gds_base", d.params.gds_base);
+    dj.set("gds_counters", counters);
+    dj.set("written", written);
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    json::Value identity = json::Value::make_object();
+    identity.set("pipeline", d.pipeline);
+    identity.set("flip", d.flip);
+    identity.set("dispatch_index", d.dispatch_index);
+    identity.set("device", props.deviceName);
+    identity.set("vendor_id", json::hex(props.vendorID));
+    identity.set("device_id", json::hex(props.deviceID));
+    identity.set("driver_version", json::hex(props.driverVersion));
+
+    json::Value& m = s.manifest;
+    m.set("schema", "bbhost-dispatch-capture");
+    m.set("version", 1);
+    m.set("identity", identity);
+    m.set("translate", d.translate);
+    m.set("dispatch", dj);
+    m.set("stage", stage);
+    m.set("images", images);
+    m.set("memory", memory);
+    json::Value notes = json::Value::make_array();
+    notes.push("The GPU was settled (every earlier submission completed, the GDS counters' starts included) before the inputs were read.");
+    notes.push("memory-after is the same pages read after the dispatch alone ran.");
+    m.set("notes", notes);
+    return session;
+}
+
+void capture_dispatch_finish_locked(CapturePtr session) {
+    if (!session) return;
+    CaptureSession& s = *session;
+    flush_locked();
+    std::vector<std::uint8_t> after(s.pages.size() * kPage);
+    for (std::size_t k = 0; k < s.pages.size(); ++k) read_guest_locked(s.pages[k], kPage, after.data() + k * kPage);
+    s.blob("memory-after", after.data(), after.size());
+    write_session_locked(s);
+    if (s.done) ++g_dispatches_captured;
+}
+
 }  // namespace gpu
+
+void host_gpu_capture_arm(int draws, const char* dir) {
+    using namespace gpu;
+    std::lock_guard<GpuMutex> lock(g.mu);
+    g_armed = draws > 0 ? draws : 0;
+    if (dir && *dir) g_armed_dir = dir;
+    g_rejected = 0;  // each arming gets the attempts a run has
+}

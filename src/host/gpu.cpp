@@ -1,11 +1,13 @@
 #include "core/config.h"
 #include "core/host_clock.h"
+#include "core/paced_file.h"
 #include "core/portable.h"
 #include "host/foreign_hooks.h"
+#include "host/draw_capture.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
+#include "host/shaders/gpu_stall.spv.h"
 #include "host/translation_cache.h"
-#include "bbhost_build_id.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -48,7 +50,7 @@ namespace gpu {
 Gpu g;
 std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
 
-void device_lost_locked(const char* where);  // below, with the reports it makes
+void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
 
 namespace {
@@ -946,6 +948,7 @@ bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool
             b.buffer = VK_NULL_HANDLE;
             return false;
         }
+        b.in_host = true;
         g.vram_short.store(true, std::memory_order_relaxed);
     }
     vkBindBufferMemory(g.device, b.buffer, b.memory, 0);
@@ -990,21 +993,25 @@ std::string translation_cache_path() {
     return path.substr(0, path.rfind('/') + 1) + "translation-cache.bin";
 }
 
-// The shader caches belong to the build that made them. A translation is keyed
-// by the translator's sources and the options hash_options names, a pipeline
-// by the driver - neither by the rest of the host, so a change there (a lift,
-// an option missing from the key) would leave the next build running the last
-// one's shaders. A build other than the one named in
-// <data root>/bbhost/shader-cache-build.txt starts both empty. The stage
-// manifest stays: it holds the guest's inputs, which the running build
-// translates again on the precompile workers, filling the caches before the
-// title. BBHOST_KEEP_SHADER_CACHE=1 keeps them across builds.
+// The shader caches belong to the translator that made them. A translation is
+// keyed by the program, every option and switch it was translated with and the
+// translator's fingerprint - its sources and the cache's own key and entry
+// code - and a pipeline by the driver, by its shaders and state; so an update
+// that leaves the translator alone keeps both and starts with every shader
+// built. Another translator - <data root>/bbhost/shader-cache-build.txt names
+// the one that made them - starts both empty: its translations would not be
+// taken anyway, and the pipelines its shaders replace would stay in the
+// pipeline cache, which the driver keeps whole (one translator's are 25 MiB on
+// the Steam Deck to 100 MiB on NVIDIA; the file grew past 400 MiB over a few
+// weeks of builds). The stage manifest stays: it holds the guest's inputs,
+// which the running build translates again on the precompile workers.
+// BBHOST_KEEP_SHADER_CACHE=1 keeps them across translators.
 static void shader_caches_check_build() {
     const std::string pipelines = pipeline_cache_path();
     if (pipelines.empty()) return;
     const std::string dir = pipelines.substr(0, pipelines.rfind('/') + 1);
     const std::string stamp = dir + "shader-cache-build.txt";
-    const std::string ours = BBHOST_BUILD_ID;
+    const std::string ours = translator_fingerprint();
     std::string theirs;
     {
         std::ifstream in(stamp);
@@ -1013,8 +1020,8 @@ static void shader_caches_check_build() {
     if (theirs == ours) return;
     std::error_code ec;
     if (const char* e = std::getenv("BBHOST_KEEP_SHADER_CACHE"); e && e[0] == '1') {
-        host_log("gpu: shader caches made by %s kept for %s (BBHOST_KEEP_SHADER_CACHE=1)", theirs.empty() ? "an earlier build" : theirs.c_str(),
-                 ours.c_str());
+        host_log("gpu: shader caches made by translator %s kept for translator %s (BBHOST_KEEP_SHADER_CACHE=1)",
+                 theirs.empty() ? "of an earlier build" : theirs.c_str(), ours.c_str());
     } else {
         std::uintmax_t freed = 0;
         int removed = 0;
@@ -1024,8 +1031,8 @@ static void shader_caches_check_build() {
             if (std::filesystem::remove(path, ec)) freed += bytes, ++removed;
         }
         if (removed)
-            host_log("gpu: shader caches made by %s, this is %s: cleared (%.1f MiB); the precompile builds them again", theirs.empty() ? "an earlier build" : theirs.c_str(),
-                     ours.c_str(), freed / 1048576.0);
+            host_log("gpu: shader caches made by translator %s, this is translator %s: cleared (%.1f MiB); the precompile builds them again",
+                     theirs.empty() ? "of an earlier build" : theirs.c_str(), ours.c_str(), freed / 1048576.0);
     }
     std::filesystem::create_directories(dir, ec);
     std::ofstream(stamp, std::ios::trunc) << ours << '\n';
@@ -1398,6 +1405,7 @@ void start_hang_watchdog() {
 }
 
 void start_memory_reserve();  // below, beside the image heap
+void vram_reserve_init();     // the same
 
 bool g_use_buffer_marker = false;  // VK_AMD_buffer_marker checkpoints (gpu_checkpoint)
 
@@ -1413,6 +1421,10 @@ struct Candidate {
     int type_rank = 0;
     VkDeviceSize local = 0;
     VkDeviceSize heaps = 0;  // every heap, device-local or not (memory_tight)
+    // What the heap of its first device-local type has free for this process
+    // now: the driver's budget less its usage (VK_EXT_memory_budget), else the
+    // heap's size (small_vram).
+    VkDeviceSize local_free = 0;
 };
 
 // The usable devices of `instance` and the index of the one to run on in
@@ -1433,9 +1445,10 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
         vkEnumerateDeviceExtensionProperties(d, nullptr, &next, exts.data());
         Candidate c;
         c.device = d;
-        bool host_import = false;
+        bool host_import = false, memory_budget = false;
         for (const VkExtensionProperties& e : exts) {
             if (std::strcmp(e.extensionName, "VK_EXT_external_memory_host") == 0) host_import = true;
+            if (std::strcmp(e.extensionName, "VK_EXT_memory_budget") == 0) memory_budget = true;
             if (std::strcmp(e.extensionName, "VK_KHR_maintenance8") == 0) c.maint8 = true;
             if (std::strcmp(e.extensionName, "VK_KHR_push_descriptor") == 0) c.push = true;
             if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) c.swapchain = true;
@@ -1452,6 +1465,19 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
         for (std::uint32_t h = 0; h < mp.memoryHeapCount; ++h) {
             if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) c.local += mp.memoryHeaps[h].size;
             c.heaps += mp.memoryHeaps[h].size;
+        }
+        for (std::uint32_t t = 0; t < mp.memoryTypeCount; ++t) {
+            if (!(mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+            const std::uint32_t h = mp.memoryTypes[t].heapIndex;
+            c.local_free = mp.memoryHeaps[h].size;
+            if (memory_budget) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+                mp2.pNext = &mb;
+                vkGetPhysicalDeviceMemoryProperties2(d, &mp2);
+                if (mb.heapBudget[h]) c.local_free = std::min(c.local_free, mb.heapBudget[h] - std::min(mb.heapBudget[h], mb.heapUsage[h]));
+            }
+            break;
         }
         c.type_rank = dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 4
                       : dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3
@@ -1517,6 +1543,28 @@ bool memory_tight(const Candidate& c) {
     return c.heaps < (12ull << 30);
 }
 std::atomic<int> g_tight{-1};  // memory_tight of the device run on, -1 until known
+
+// Whether the device is a discrete GPU with little video memory free for us:
+// under 7.5 GiB at the start (BBHOST_TEST_VRAM_MB's limit when a smaller card
+// is acted out). Then the settings that hold memory ahead are cut - spare
+// image heap blocks, kept untile scratch, a tessellation ring made whole,
+// display buffers for sizes the run may never use - on top of the reserve
+// and the live mirror share. Not on an integrated GPU or with tight memory,
+// which have settings of their own (a Steam Deck). BBHOST_SMALL_VRAM=0/1
+// says instead.
+std::uint64_t start_vram_free(const Candidate& c) {
+    std::uint64_t free = c.local_free;
+    if (const char* t = std::getenv("BBHOST_TEST_VRAM_MB"); t && std::strtoull(t, nullptr, 10))
+        free = std::min<std::uint64_t>(free, std::strtoull(t, nullptr, 10) << 20);
+    return free;
+}
+bool small_vram(const Candidate& c) {
+    const char* e = std::getenv("BBHOST_SMALL_VRAM");
+    if (e && *e) return e[0] != '0';
+    if (c.type_rank == 3 || memory_tight(c)) return false;
+    return start_vram_free(c) < (7680ull << 20);
+}
+std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
 
 // OBS's game capture for Vulkan is an implicit layer (in graphics-hook64.dll)
 // that the loader puts into every Vulkan program while OBS is installed,
@@ -1650,6 +1698,15 @@ bool init_locked() {
         g.has_device_fault = c.fault;
         g.integrated = c.type_rank == 3;
         g.tight = memory_tight(c);
+        {
+            int unknown = -1;
+            g_small.compare_exchange_strong(unknown, small_vram(c) ? 1 : 0);
+            g.small_vram = g_small.load() == 1;
+            if (g.small_vram)
+                host_log("gpu: %llu MiB of video memory free at the start: small video memory (BBHOST_SMALL_VRAM=0 says otherwise) - no "
+                         "spare image heap blocks in play, less untile scratch kept, a tessellation ring that grows as it is needed",
+                         static_cast<unsigned long long>(start_vram_free(c) >> 20));
+        }
         if (g_tight.exchange(g.tight ? 1 : 0) == (g.tight ? 0 : 1))
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
         if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
@@ -1711,11 +1768,12 @@ bool init_locked() {
         // budget is about 7171) - set before anything is allocated in them.
         const std::uint32_t t = find_memory_type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         g.local_heap = t == UINT32_MAX ? 0 : g.mem_props.memoryTypes[t].heapIndex;
+        std::uint32_t types = 0;
+        for (std::uint32_t i = 0; i < g.mem_props.memoryTypeCount; ++i) {
+            if (g.mem_props.memoryTypes[i].heapIndex == g.local_heap) types |= 1u << i;
+        }
+        if (t != UINT32_MAX) bb_memory_set_local_types(types);
         if (const char* e = std::getenv("BBHOST_TEST_VRAM_MB"); e && std::strtoull(e, nullptr, 10)) {
-            std::uint32_t types = 0;
-            for (std::uint32_t i = 0; i < g.mem_props.memoryTypeCount; ++i) {
-                if (g.mem_props.memoryTypes[i].heapIndex == g.local_heap) types |= 1u << i;
-            }
             bb_memory_test_limit(types, std::strtoull(e, nullptr, 10) << 20);
         }
     }
@@ -2178,6 +2236,7 @@ bool init_locked() {
                  static_cast<unsigned long long>(heap >> 20), static_cast<unsigned long long>(budget >> 20),
                  g.has_memory_budget ? " (the driver's budget)" : " (no budget from the driver: the heap's size)",
                  test_bytes ? " - BBHOST_TEST_VRAM_MB, acted out" : "");
+        vram_reserve_init();
         shadow_budget_locked();
     }
     if (g.device && g_use_buffer_marker) {
@@ -2258,7 +2317,7 @@ bool init_locked() {
     // The pipeline cache persists under the data root, so a later run creates
     // the pipelines this one compiled without the driver compiling them again.
     // The driver ignores data from another device or driver version; another
-    // build of bbhost throws it away itself (and its translations with it).
+    // translator throws it away itself (and its translations with it).
     shader_caches_check_build();
     std::vector<char> cache_data;
     if (const std::string path = pipeline_cache_path(); !path.empty()) {
@@ -2601,7 +2660,7 @@ void detect_fill(const gcn::Program& prog, ComputePipeline& pl) {
     int load_dst = -1, load_base = -1;
     std::uint32_t load_off = 0;
     int store_srsrc = -1;
-    bool other_memory = false;
+    bool other_memory = false, format_store = false;
     int stores = 0;
     for (const gcn::Inst& in : prog.insts) {
         switch (in.enc) {
@@ -2617,6 +2676,7 @@ void detect_fill(const gcn::Program& prog, ComputePipeline& pl) {
             case gcn::Enc::MUBUF:
                 if ((in.op == 7 || in.op == 30) && (store_srsrc < 0 || store_srsrc == in.srsrc)) {
                     store_srsrc = in.srsrc;
+                    format_store = format_store || in.op == 7;
                     ++stores;
                 } else {
                     other_memory = true;
@@ -2637,6 +2697,7 @@ void detect_fill(const gcn::Program& prog, ComputePipeline& pl) {
     pl.fill_dst_sgpr = store_srsrc;
     pl.fill_cb_sgpr = load_base;
     pl.fill_cb_dw = load_off;
+    pl.fill_format = format_store;
 }
 
 void detect_copy(const gcn::Program& prog, ComputePipeline& pl) {
@@ -2729,6 +2790,7 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
                                       const std::vector<std::pair<std::uint32_t, bool>>& dims, const std::vector<bool>& modes) {
     gcn::TranslateOptions o;
     o.stage = gcn::Stage::Compute;
+    o.gds_counters = host_gpu_gds_counters();
     o.rsrc1 = rsrc1;
     o.rsrc2 = rsrc2;
     o.image_dims = dims;
@@ -3723,7 +3785,9 @@ std::atomic<bool> g_device_lost{false};
 // the fault, how far the GPU's markers got, the last draws recorded, the other
 // programs hooked in; the note for the next starts; and the flag the window's
 // loop reads to tell the player and close (host_gpu_device_lost).
-void device_lost_locked(const char* where) {
+// `declared`: no driver said so - bbhost takes the device for lost because
+// a submission never finished (fence_wait_locked).
+void device_lost_locked(const char* where, bool declared) {
     g.ok = false;
     // Nothing recorded will run now: land the CP writes still queued.
     for (const auto& [va, span] : g.pending_writes) {
@@ -3732,7 +3796,13 @@ void device_lost_locked(const char* where) {
     g.pending_writes.clear();
     if (g_device_lost.exchange(true)) return;
     const unsigned long long flip = static_cast<unsigned long long>(hle_video_flip_count());
-    host_log("gpu: the device is lost (%s, flip %llu): the GPU stopped responding and the system reset it", where, flip);
+    if (declared) {
+        host_log("gpu: the device is taken for lost (%s, flip %llu): the driver reports no loss, but the GPU never finished "
+                 "that work, so nothing more is sent to it and bbhost ends",
+                 where, flip);
+    } else {
+        host_log("gpu: the device is lost (%s, flip %llu): the GPU stopped responding and the system reset it", where, flip);
+    }
     report_device_fault();
     report_checkpoints();
     if (!g.has_checkpoints) host_log("gpu: no progress markers this run; the next %d starts run with them", kMarkedRuns);
@@ -3816,6 +3886,284 @@ void staging_let_go_locked(const DevBuffer& b) {
 }
 }  // namespace
 
+namespace {
+
+// How long one wait for a submission's fence goes before the GPU is said to be
+// still busy with it, and how long in all before the GPU is taken for stuck.
+// BBHOST_GPU_WAIT_STEP_MS and BBHOST_GPU_WAIT_LIMIT_S shorten them for tests.
+std::uint64_t fence_step_ns() {
+    static const std::uint64_t ns = [] {
+        const char* e = std::getenv("BBHOST_GPU_WAIT_STEP_MS");
+        const std::uint64_t ms = e && *e ? std::strtoull(e, nullptr, 10) : 10000;
+        return std::max<std::uint64_t>(ms, 100) * 1000000ull;
+    }();
+    return ns;
+}
+double fence_limit_s() {
+    static const double s = [] {
+        const char* e = std::getenv("BBHOST_GPU_WAIT_LIMIT_S");
+        return e && *e ? std::max(1.0, std::atof(e)) : 60.0;
+    }();
+    return s;
+}
+
+// The first time a wait for slot k's submission runs past a step: what it
+// holds, what stays held until it finishes, and the hang report with the
+// GPU's progress markers where they can be read without a lost device.
+void say_stuck_locked(int k, double secs) {
+    const Gpu::Slot& sl = g.slots[k];
+    std::size_t writes = 0;
+    for (const auto& [va, span] : g.pending_writes) writes += span.serial >= sl.serial ? 1 : 0;
+    host_log("gpu: submission %llu (slot %d, recorded at flip %llu) is still running after %.1f s: %llu draws, %llu of them "
+             "tessellated, %llu dispatches. Until it finishes nothing it may still be reading is reset, freed or handed on - "
+             "its fence and descriptor pool, %zu buffers, %zu staging and %zu scratch chunks, %zu image-heap ranges, %zu images "
+             "and %zu views - and %zu CP writes it and the submissions after it carry wait; after %.0f s in all the GPU is taken "
+             "for stuck",
+             static_cast<unsigned long long>(sl.serial), k, static_cast<unsigned long long>(sl.held_flip), secs,
+             static_cast<unsigned long long>(sl.held_draws), static_cast<unsigned long long>(sl.held_tess),
+             static_cast<unsigned long long>(sl.held_dispatches), sl.garbage.size(), sl.staging_chunks.size(),
+             sl.scratch_chunks.size(), sl.dead_ranges.size(), sl.dead_images.size(), sl.dead_views.size(), writes,
+             fence_limit_s());
+    host_gpu_hang_report();
+    if (g.cmd_buffer_marker) report_checkpoints();  // AMD buffer markers: a buffer the GPU writes, readable at any time
+}
+
+// Waits for slot k's fence: true once it has signalled. A submission the GPU
+// has not finished after a step is said once (say_stuck_locked) and waited
+// for on - it may still be reading its descriptors, its memory and the
+// staging, scratch and image-heap ranges it holds, and the game takes the CP
+// writes it carries for the GPU being done, so none of that may be reset or
+// handed to other work before the fence signals. After ten seconds the wait
+// used to give up, reset the fence and the descriptor pool, free the rest
+// and count the submission done while the GPU still ran it, so the
+// recordings after it could write over what it read - a GPU that is slow
+// once can then stay slow (an integration run in the Forbidden Woods went on
+// at a frame every 90-110 s). One not finished within the limit is the GPU
+// stuck: device_lost_locked, so bbhost ends with the report instead of going
+// on; after that, or a real loss, nothing is waited for again. `waited_us`:
+// the time spent here.
+bool fence_wait_locked(int k, std::uint64_t& waited_us) {
+    Gpu::Slot& sl = g.slots[k];
+    waited_us = 0;
+    if (g_device_lost.load(std::memory_order_acquire)) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    g.wait_started_ns.store(static_cast<std::uint64_t>(t0.time_since_epoch().count()), std::memory_order_relaxed);
+    g.waiting_slot.store(k, std::memory_order_relaxed);
+    VkResult r = VK_TIMEOUT;
+    double secs = 0.0;
+    bool slow = false;
+    for (;;) {
+        r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, fence_step_ns());
+        secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (r != VK_TIMEOUT) break;
+        slow = true;
+        if (!sl.said_stuck) {
+            sl.said_stuck = true;
+            say_stuck_locked(k, secs);
+        } else if (secs < fence_limit_s()) {
+            host_log("gpu: submission %llu is still running after %.0f s", static_cast<unsigned long long>(sl.serial), secs);
+        }
+        if (secs >= fence_limit_s()) break;
+    }
+    g.waiting_slot.store(-1, std::memory_order_relaxed);
+    waited_us = static_cast<std::uint64_t>(secs * 1e6);
+    if (r == VK_SUCCESS) {
+        if (slow) {
+            host_log("gpu: submission %llu finished after %.1f s; what it held is let go now",
+                     static_cast<unsigned long long>(sl.serial), secs);
+        }
+        return true;
+    }
+    if (r == VK_TIMEOUT) {
+        host_log("gpu: submission %llu has not finished after %.0f s: the GPU is taken for stuck, and bbhost stops",
+                 static_cast<unsigned long long>(sl.serial), secs);
+        device_lost_locked("a submission the GPU had not finished within the limit", true);
+        return false;
+    }
+    host_log("gpu: waiting for submission %d failed (%d)%s", k, r, r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
+    device_lost_locked(r == VK_ERROR_DEVICE_LOST ? "a wait for a submission" : "a failed wait for a submission");
+    return false;
+}
+
+// BBHOST_TEST_GPU_STALL: the submission the job went into, waited for once it is in (stall_test_wait_locked).
+std::uint64_t g_stall_serial = 0;
+bool g_stall_pending = false;
+
+// BBHOST_TEST_GPU_STALL=<flip>:<ms>: the first submission from that flip on
+// carries a GPU job (shaders/gpu_stall.comp) that runs until the host lets it
+// go <ms> later - 0: never, the job then ends by itself once its pieces are
+// done - so a wait for its fence meets a GPU that is still busy:
+// fence_wait_locked's steps, what stays held, the resume and the stop, tested
+// without a real hang. The job is BBHOST_TEST_GPU_STALL_PIECES pieces (2000)
+// of at most BBHOST_TEST_GPU_STALL_TURNS turns (4096) each, about 8 ms a piece
+// on an RTX 4070, so the driver can switch the GPU to other work in between,
+// and the command buffer stays small: one of 200,000 commands held
+// vkQueueSubmit until the GPU had worked through most of it.
+void stall_test_record_locked() {
+    struct Cfg {
+        std::uint64_t flip = 0, ms = 0, pieces = 2000, turns = 4096;
+        bool on = false;
+    };
+    static const Cfg cfg = [] {
+        Cfg c;
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL"); e && *e) {
+            char* end = nullptr;
+            c.flip = std::strtoull(e, &end, 10);
+            c.ms = end && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 0;
+            c.on = true;
+        }
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_PIECES"); e && *e) c.pieces = std::max<std::uint64_t>(1, std::strtoull(e, nullptr, 10));
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_TURNS"); e && *e) c.turns = std::strtoull(e, nullptr, 10);
+        return c;
+    }();
+    static bool done = false;
+    if (!cfg.on || done || hle_video_flip_count() < cfg.flip) return;
+    done = true;
+    static VkPipelineLayout layout = VK_NULL_HANDLE;
+    static VkPipeline pipeline = VK_NULL_HANDLE;
+    static DevBuffer flag;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_gpu_stall_spv);
+    smi.pCode = k_gpu_stall_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    bool ok = vkCreateShaderModule(g.device, &smi, nullptr, &module) == VK_SUCCESS &&
+              vkCreatePipelineLayout(g.device, &pli, nullptr, &layout) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module;
+        ci.stage.pName = "main";
+        ci.layout = layout;
+        ok = vkCreateComputePipelines(g.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) == VK_SUCCESS;
+    }
+    if (module) vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok || !create_dev_buffer(flag, 64, true) || !flag.map) {
+        host_log("gpu: test: the GPU job of BBHOST_TEST_GPU_STALL could not be made");
+        return;
+    }
+    volatile std::uint32_t* w = static_cast<volatile std::uint32_t*>(flag.map);
+    for (int i = 0; i < 4; ++i) w[i] = 0;
+    struct Push {
+        std::uint64_t flag;
+        std::uint32_t max_turns, pad;
+    } push{flag.address, static_cast<std::uint32_t>(std::min<std::uint64_t>(cfg.turns, 0xffffffffu)), 0};
+    g_stall_serial = g.flushes;  // this recording's submission
+    g_stall_pending = true;
+    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    rec().push_constants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    for (std::uint64_t p = 0; p < cfg.pieces; ++p) {
+        rec().dispatch(1, 1, 1);
+        if (p + 1 < cfg.pieces) {
+            rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+    }
+    char when[48];
+    if (cfg.ms) std::snprintf(when, sizeof(when), "%llu ms later", static_cast<unsigned long long>(cfg.ms));
+    else std::snprintf(when, sizeof(when), "never");
+    host_log("gpu: test: submission %llu (flip %llu) carries a GPU job of %llu pieces of up to %llu turns that runs until the host "
+             "lets it go: %s (BBHOST_TEST_GPU_STALL)",
+             static_cast<unsigned long long>(g.flushes), static_cast<unsigned long long>(hle_video_flip_count()),
+             static_cast<unsigned long long>(cfg.pieces), static_cast<unsigned long long>(cfg.turns), when);
+    if (cfg.ms) {
+        std::thread([ms = cfg.ms, w] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            const std::uint32_t pieces = w[2], turns = w[1];
+            w[0] = 1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            host_log("gpu: test: the GPU job is let go %llu ms after it was recorded, %u pieces and %u turns in",
+                     static_cast<unsigned long long>(ms), pieces, turns);
+        }).detach();
+    }
+}
+
+// BBHOST_TEST_GPU_STALL: once the job's submission is in, the command processor
+// waits for it, as it does when it needs that slot again or flushes. The game
+// itself would first wait for its labels, and the job would never meet a wait.
+void stall_test_wait_locked() {
+    if (!g_stall_pending || g.flushes <= g_stall_serial) return;
+    g_stall_pending = false;
+    host_log("gpu: test: the command processor waits for submission %llu", static_cast<unsigned long long>(g_stall_serial));
+    retire_through_locked(g_stall_serial);
+}
+
+}  // namespace
+
+namespace {
+const bool g_indirect_stats = [] {
+    const char* e = std::getenv("BBHOST_INDIRECT_STATS");
+    return e && e[0] == '1';
+}();
+struct IndirectRec {
+    std::uint64_t serial, va;
+    std::uint8_t kind;
+    bool counting;
+};
+std::vector<IndirectRec> g_indirect_recs;  // under g.mu
+struct IndirectAgg {
+    std::uint64_t dispatches = 0, counting = 0, nonzero = 0, groups = 0, max_groups = 0, over_limit = 0;
+    std::uint64_t draws = 0, drawn = 0, elements = 0, max_elements = 0;
+    std::uint64_t first_flip = 0;
+};
+IndirectAgg g_indirect_agg;
+
+// The arguments of the indirect work submission `serial` held, read now that
+// it is done; once a second (60 flips) what they came to.
+void indirect_stats_retired_locked(std::uint64_t serial) {
+    if (!g_indirect_stats || g_indirect_recs.empty()) return;
+    IndirectAgg& a = g_indirect_agg;
+    std::size_t keep = 0;
+    for (const IndirectRec& r : g_indirect_recs) {
+        if (r.serial > serial) {
+            g_indirect_recs[keep++] = r;
+            continue;
+        }
+        std::uint32_t v[5] = {};
+        if (!hle_kernel_va_mapped(r.va, r.kind == 2 ? 20 : r.kind == 1 ? 16 : 12)) continue;
+        std::memcpy(v, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(r.va)), r.kind == 2 ? 20 : r.kind == 1 ? 16 : 12);
+        if (r.kind == 0) {
+            ++a.dispatches;
+            a.counting += r.counting ? 1 : 0;
+            const std::uint64_t groups = static_cast<std::uint64_t>(v[0]) * v[1] * v[2];
+            a.nonzero += groups ? 1 : 0;
+            a.groups += groups;
+            a.max_groups = std::max(a.max_groups, groups);
+            a.over_limit += v[0] > 65535 || v[1] > 65535 || v[2] > 65535 ? 1 : 0;
+        } else {
+            ++a.draws;
+            const std::uint64_t elements = static_cast<std::uint64_t>(v[0]) * v[1];
+            a.drawn += elements ? 1 : 0;
+            a.elements += elements;
+            a.max_elements = std::max(a.max_elements, elements);
+        }
+    }
+    g_indirect_recs.resize(keep);
+    const std::uint64_t flip = hle_video_flip_count();
+    if (!a.first_flip) a.first_flip = flip ? flip : 1;
+    if (flip < a.first_flip + 60) return;
+    host_log("gpu: indirect at flips %llu..%llu: %llu dispatches (%llu counting in GDS), %llu with work, %llu workgroups (most %llu, %llu over "
+             "65535 in a dimension); %llu draws, %llu drawing, %llu elements (most %llu)",
+             static_cast<unsigned long long>(a.first_flip), static_cast<unsigned long long>(flip), static_cast<unsigned long long>(a.dispatches),
+             static_cast<unsigned long long>(a.counting), static_cast<unsigned long long>(a.nonzero), static_cast<unsigned long long>(a.groups),
+             static_cast<unsigned long long>(a.max_groups), static_cast<unsigned long long>(a.over_limit), static_cast<unsigned long long>(a.draws),
+             static_cast<unsigned long long>(a.drawn), static_cast<unsigned long long>(a.elements), static_cast<unsigned long long>(a.max_elements));
+    a = IndirectAgg{};
+    a.first_flip = flip + 1;
+}
+}  // namespace
+
+void note_indirect_locked(std::uint64_t args_va, int kind, bool counting) {
+    if (!g_indirect_stats || !args_va || g_indirect_recs.size() >= (1u << 20)) return;
+    g_indirect_recs.push_back({g.flushes, args_va, static_cast<std::uint8_t>(kind), counting});
+}
+
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
@@ -3840,20 +4188,20 @@ void retire_slot_locked(int k) {
         busy_retired_locked(sl, false);
         return;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    g.wait_started_ns.store(static_cast<std::uint64_t>(t0.time_since_epoch().count()), std::memory_order_relaxed);
-    g.waiting_slot.store(k, std::memory_order_relaxed);
-    const VkResult r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, 10000000000ull);
-    g.waiting_slot.store(-1, std::memory_order_relaxed);
-    const auto fence_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::uint64_t fence_us = 0;
+    const bool done = fence_wait_locked(k, fence_us);
     g.gpu_us.fetch_add(fence_us);
-    bump(g_stream_stats.fence_ns, static_cast<std::uint64_t>(fence_us) * 1000);
-    if (r != VK_SUCCESS) {
-        host_log("gpu: waiting for submission %d failed (%d)%s", k, r,
-                 r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
-        if (r == VK_ERROR_DEVICE_LOST) device_lost_locked("a wait for a submission");
+    bump(g_stream_stats.fence_ns, fence_us * 1000);
+    if (!done) {
+        // The GPU is lost, or taken for stuck: what the submission holds stays
+        // as it is (the GPU may still read it), nothing more goes to the GPU
+        // (submit_locked), and bbhost ends.
+        sl.in_flight = false;
+        return;
     }
     vkResetFences(g.device, 1, &sl.fence);
+    indirect_stats_retired_locked(sl.serial);
+    indirect_clamp_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
@@ -3895,7 +4243,7 @@ void retire_slot_locked(int k) {
         it = it->second.serial < g.completed_submits ? g.pending_writes.erase(it) : std::next(it);
     }
     collect_profile_locked(sl);
-    busy_retired_locked(sl, r == VK_SUCCESS);
+    busy_retired_locked(sl, true);
     glitch_slot_done_locked(sl);
     textures_retired(k);
 }
@@ -3952,8 +4300,14 @@ namespace {
 constexpr std::uint64_t kScratchChunkBytes = 64ull << 20;
 constexpr std::uint64_t kScratchKeepBytes = 256ull << 20;
 std::atomic<std::uint64_t> g_scratch_created{0}, g_scratch_placed{0};
+std::atomic<std::uint64_t> g_scratch_refusals{0};  // chunks not made for want of room above the reserve
 void scratch_let_go_locked(const DevBuffer& b) {
-    if (g.scratch_free_bytes + b.size <= kScratchKeepBytes) {
+    // Not kept while video memory is down to the reserve, nor one in host
+    // memory (made while video memory was full): the next chunk is made in
+    // video memory if there is room by then (vram_return_on). With small
+    // video memory (small_vram) one chunk is kept, not four.
+    const std::uint64_t keep = g.small_vram ? kScratchChunkBytes : kScratchKeepBytes;
+    if (g.scratch_free_bytes + b.size <= keep && !vram_within_reserve() && !(b.in_host && vram_return_on())) {
         g.scratch_free.push_back(b);
         g.scratch_free_bytes += b.size;
     } else {
@@ -3976,6 +4330,13 @@ bool acquire_scratch_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offs
             g.scratch_free_bytes -= it->size;
             g.scratch_free.erase(it);
         } else {
+            // No new chunk out of the reserve: the upload takes the staging
+            // route (host memory) instead. A chunk made there was what
+            // overflowed a 6 GB card at a load and took every mirror with it.
+            if (vram_within_reserve(want)) {
+                g_scratch_refusals.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             if (!create_dev_buffer(chunk, want, false)) return false;
             g_scratch_created.fetch_add(1, std::memory_order_relaxed);
         }
@@ -4086,13 +4447,31 @@ std::uint64_t g_heap_host = 0;  // images placed in host memory for want of vide
 // The image heap's placement in memory type `type`: a free range in one of
 // its blocks; else, when `grow`, a new block, or memory of its own for an
 // image too large for one.
+// Blocks are tried fullest first: new images go where the heap is already
+// dense, so the emptier blocks drain as the game frees what they hold and the
+// keeper can give them back. First fit in block order kept every block a
+// little used - after ten places 9 blocks (2.3 GiB) for 1.2-1.9 GiB of
+// images. BBHOST_HEAP_FULLEST=0: block order, as before.
+const bool g_heap_fullest = [] {
+    const char* e = std::getenv("BBHOST_HEAP_FULLEST");
+    return !(e && e[0] == '0');
+}();
+
 bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool grow, ImageMemory& out) {
     const VkDeviceSize align = std::max<VkDeviceSize>(req.alignment, 256);
     if (req.size <= kHeapLargest) {
         for (int pass = 0; pass < 2; ++pass) {
+            thread_local std::vector<std::size_t> order;
+            order.clear();
             for (std::size_t k = 0; k < g_heap.size(); ++k) {
+                const HeapBlock& b = g_heap[k];
+                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size) order.push_back(k);
+            }
+            if (g_heap_fullest) {
+                std::stable_sort(order.begin(), order.end(), [](std::size_t a, std::size_t c) { return g_heap[a].used > g_heap[c].used; });
+            }
+            for (const std::size_t k : order) {
                 HeapBlock& b = g_heap[k];
-                if (b.memory == VK_NULL_HANDLE || b.type != type) continue;
                 for (auto it = b.free.begin(); it != b.free.end(); ++it) {
                     const VkDeviceSize at = (it->first + align - 1) & ~(align - 1);
                     if (at + req.size > it->first + it->second) continue;
@@ -4101,7 +4480,7 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
                     if (at > lo) b.free[lo] = at - lo;
                     if (at + req.size < hi) b.free[at + req.size] = hi - (at + req.size);
                     b.used += req.size;
-                    out = {b.memory, at, req.size, static_cast<std::int32_t>(k)};
+                    out = {b.memory, at, req.size, static_cast<std::int32_t>(k), type};
                     ++g_heap_allocs;
                     return true;
                 }
@@ -4127,17 +4506,128 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
     mai.memoryTypeIndex = type;
     if (vkAllocateMemory(g.device, &mai, nullptr, &out.memory) != VK_SUCCESS) return false;
     out.size = req.size;
+    out.type = type;
     ++g_heap_own;
     return true;
 }
+
+// The video memory budget, followed as it changes (vram_headroom): the
+// driver's figures read at most every 100 ms, and what our own allocations
+// took or gave back since - which the driver's next reading includes - from
+// our own count, so a load's burst of blocks is seen at once.
+std::mutex g_budget_mu;
+std::int64_t g_budget_read_ms = -(1ll << 40);
+std::int64_t g_budget_room = 0;            // heapBudget - heapUsage when read
+std::uint64_t g_budget_local_at_read = 0;  // bb_memory_local_bytes() then
+std::uint64_t g_vram_reserve = 0;          // vram_reserve_init
+std::atomic<std::uint64_t> g_reserve_refusals{0};
 }  // namespace
 
-bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out) {
+std::uint64_t image_heap_vram_free_locked() {
+    std::uint64_t free = 0;
+    for (const HeapBlock& b : g_heap) {
+        if (b.memory != VK_NULL_HANDLE && g.mem_props.memoryTypes[b.type].heapIndex == g.local_heap) free += kHeapBlock - b.used;
+    }
+    return free;
+}
+
+bool image_memory_in_vram(const ImageMemory& m) {
+    return m.type >= g.mem_props.memoryTypeCount || g.mem_props.memoryTypes[m.type].heapIndex == g.local_heap;
+}
+
+std::int64_t vram_headroom() {
+    std::uint64_t limit = 0, used = 0;
+    if (bb_memory_test_limited(&limit, &used)) return static_cast<std::int64_t>(limit) - static_cast<std::int64_t>(used);
+    const std::uint64_t local = bb_memory_local_bytes();
+    if (!g.has_memory_budget || !g.phys) return static_cast<std::int64_t>(g.local_budget) - static_cast<std::int64_t>(local);
+    std::lock_guard<std::mutex> lk(g_budget_mu);
+    const std::int64_t now = steady_ms();
+    if (now - g_budget_read_ms >= 100) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        mp.pNext = &mb;
+        vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp);
+        g_budget_room = static_cast<std::int64_t>(mb.heapBudget[g.local_heap]) - static_cast<std::int64_t>(mb.heapUsage[g.local_heap]);
+        g_budget_local_at_read = bb_memory_local_bytes();
+        g_budget_read_ms = now;
+        return g_budget_room;
+    }
+    return g_budget_room - (static_cast<std::int64_t>(local) - static_cast<std::int64_t>(g_budget_local_at_read));
+}
+
+// The reserve: 512 MiB on a discrete GPU, none on an integrated one (its
+// video memory is the same RAM, and a Steam Deck's 1 GiB carve-out would be
+// half reserve) or with tight memory, whose own settings apply.
+// BBHOST_VRAM_RESERVE_MB sets it; 0 places everything until an allocation
+// fails, as before.
+void vram_reserve_init() {
+    const char* e = std::getenv("BBHOST_VRAM_RESERVE_MB");
+    const bool given = e && *e;
+    const std::uint64_t mib = given ? std::strtoull(e, nullptr, 10) : (g.integrated || g.tight ? 0 : 512);
+    g_vram_reserve = mib << 20;
+    if (g_vram_reserve)
+        host_log("gpu: video memory followed against the driver's budget, the last %llu MiB kept for render targets and device buffers%s",
+                 static_cast<unsigned long long>(mib), given ? " (BBHOST_VRAM_RESERVE_MB)" : "");
+    else
+        host_log("gpu: video memory placed until an allocation fails (%s)",
+                 given ? "BBHOST_VRAM_RESERVE_MB=0" : g.integrated ? "an integrated GPU" : "tight memory");
+}
+
+std::uint64_t vram_reserve_bytes() { return g_vram_reserve; }
+
+bool vram_within_reserve(std::uint64_t more) {
+    return g_vram_reserve && vram_headroom() < static_cast<std::int64_t>(g_vram_reserve + more);
+}
+
+std::uint64_t vram_reserve_refusals() { return g_reserve_refusals.load(std::memory_order_relaxed); }
+
+// BBHOST_VRAM_RETURN=0: what a shortage put in host memory stays there for
+// the session, as before. On with the reserve.
+bool vram_return_on() {
+    static const bool env_off = [] {
+        const char* e = std::getenv("BBHOST_VRAM_RETURN");
+        return e && e[0] == '0';
+    }();
+    return g_vram_reserve && !env_off;
+}
+
+bool vram_room_for(std::uint64_t bytes, std::uint64_t margin) {
+    return vram_headroom() >= static_cast<std::int64_t>(g_vram_reserve + margin + bytes);
+}
+
+std::string textures_return_report();  // textures.cpp
+std::string render_return_report();    // render.cpp
+std::string vram_return_report() {
+    if (!vram_return_on()) return {};
+    return textures_return_report() + render_return_report();
+}
+
+bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture) {
     out = ImageMemory{};
     const std::uint32_t local = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     const std::int64_t now = steady_ms();
-    const bool may_grow = now - g_vram_refused_ms.load(std::memory_order_relaxed) >= 1000;
+    bool may_grow = now - g_vram_refused_ms.load(std::memory_order_relaxed) >= 1000;
+    // The reserve: a texture takes no new video memory out of it - room
+    // already in the heap's blocks, else host memory, which it is only read
+    // from - so the render targets made after it still find video memory. A
+    // target in host memory is written and read across the bus every frame:
+    // two at 4K held a 12 GB card's session at 3 fps.
+    bool held_back = false;
+    if (texture && may_grow && local != UINT32_MAX && vram_within_reserve(req.size <= kHeapLargest ? kHeapBlock : req.size)) {
+        may_grow = false;
+        held_back = true;
+    }
     if (local != UINT32_MAX && heap_place_locked(req, local, may_grow, out)) return true;
+    if (held_back) {
+        const std::uint32_t host = host_memory_type(req.memoryTypeBits);
+        if (host != UINT32_MAX && heap_place_locked(req, host, true, out)) {
+            if (g_reserve_refusals.fetch_add(1, std::memory_order_relaxed) == 0)
+                host_log("gpu: video memory is down to the reserve (%lld MiB left): textures go to host memory until there is room",
+                         static_cast<long long>(vram_headroom() >> 20));
+            ++g_heap_host;
+            return true;
+        }
+    }
     // Video memory has no room for it: host memory, which the GPU reads across
     // the bus - slower, but drawn. A target that found no memory was never
     // made, and every pass reading it read nothing: on an 8 GB card whose
@@ -4186,6 +4676,20 @@ std::string image_heap_report() {
                   static_cast<unsigned long long>(g_heap_cp_blocks), static_cast<unsigned long long>(g_heap_released),
                   static_cast<unsigned long long>(g.staging_free_bytes >> 20), static_cast<unsigned long long>(view_epoch()));
     if (const std::string sites = view_epoch_sites_report(); !sites.empty()) host_log("  %s", sites.c_str());
+    host_log("  %s", image_reuse_report_locked().c_str());
+    {
+        VkDeviceSize free_vram = 0, free_host = 0;
+        for (const HeapBlock& b : g_heap) {
+            if (b.memory == VK_NULL_HANDLE) continue;
+            (g.mem_props.memoryTypes[b.type].heapIndex == g.local_heap ? free_vram : free_host) += kHeapBlock - b.used;
+        }
+        host_log("  video memory: headroom %lld MiB, reserve %llu MiB; image heap free %llu MiB in video memory, %llu MiB in host "
+                 "blocks; textures kept out of the reserve %llu, untile scratch chunks %llu%s",
+                 static_cast<long long>(vram_headroom() >> 20), static_cast<unsigned long long>(g_vram_reserve >> 20),
+                 static_cast<unsigned long long>(free_vram >> 20), static_cast<unsigned long long>(free_host >> 20),
+                 static_cast<unsigned long long>(g_reserve_refusals.load()), static_cast<unsigned long long>(g_scratch_refusals.load()),
+                 vram_return_report().c_str());
+    }
     return buf;
 }
 
@@ -4210,6 +4714,7 @@ std::string image_heap_report() {
 // BBHOST_MEMORY_KEEPER=0 restores the old fixed reserve (six blocks and
 // 768 MiB at boot, never given back) for comparison.
 std::atomic<bool> g_loading_screen{false};
+bool loading_screen_now() { return g_loading_screen.load(std::memory_order_relaxed); }
 std::mutex g_keeper_mu;
 std::condition_variable g_keeper_cv;
 
@@ -4222,8 +4727,11 @@ void start_memory_reserve() {
     // what a Steam Deck's world ran out of.
     const std::uint64_t reserve = env("BBHOST_STAGING_RESERVE_MB", g.tight ? 256 : 768) << 20;
     const std::uint64_t floor = std::min(env("BBHOST_STAGING_FLOOR_MB", 256) << 20, reserve);
-    const std::uint64_t spare_play = env("BBHOST_IMAGE_HEAP_SPARE", g.tight ? 0 : 1);
-    const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", g.tight ? 1 : 4), spare_play);
+    // Small video memory (small_vram) too: a spare block is 256 MiB of it
+    // the targets cannot have.
+    const bool few = g.tight || g.small_vram;
+    const std::uint64_t spare_play = env("BBHOST_IMAGE_HEAP_SPARE", few ? 0 : 1);
+    const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
     std::thread([=] {
         host_thread_set_name("bb-reserve");
@@ -4254,6 +4762,9 @@ void start_memory_reserve() {
                     if (type == UINT32_MAX || heap_free_locked(type, nullptr) >= spare_blocks * kHeapBlock) break;
                 }
                 if (steady_ms() - g_vram_refused_ms.load(std::memory_order_relaxed) < 10000) break;  // video memory is full
+                // No spare out of the reserve, during a load either: the
+                // coming area's targets want that room more.
+                if (vram_within_reserve(kHeapBlock)) break;
                 VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                 mai.allocationSize = kHeapBlock;
                 mai.memoryTypeIndex = type;
@@ -4337,18 +4848,21 @@ void start_memory_reserve() {
             // turn, two seconds apart.
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
-            const bool may_give = now - last_given >= std::chrono::seconds(2);
+            // Down to the reserve, an empty block goes back at once, spare or
+            // not: the targets want the room more.
+            const bool short_now = vram_within_reserve();
+            const bool may_give = short_now || now - last_given >= std::chrono::seconds(2);
             {
                 std::lock_guard<GpuMutex> lk(g.mu);
                 if (type != UINT32_MAX && may_give) {
                     const VkDeviceSize free = heap_free_locked(type, nullptr);
                     for (HeapBlock& b : g_heap) {
                         if (b.memory == VK_NULL_HANDLE || b.used != 0) continue;
-                        if (now - b.empty_since < std::chrono::seconds(10)) continue;
+                        if (!short_now && now - b.empty_since < std::chrono::seconds(10)) continue;
                         // A block of host memory, made while video memory was
                         // full, goes back once empty; one of video memory only
                         // above the spare.
-                        if (b.type == type && free < (spare_play + 1) * kHeapBlock) continue;
+                        if (b.type == type && !short_now && free < (spare_play + 1) * kHeapBlock) continue;
                         gone.push_back(b.memory);
                         b.memory = VK_NULL_HANDLE;
                         b.free.clear();
@@ -4411,6 +4925,27 @@ void defer_destroy_view(VkImageView view) {
 // command processor, the words memo hit 47%.
 void defer_destroy_private_view(VkImageView view) {
     if (view) g.slots[g.slot].dead_views.push_back(view);
+}
+
+namespace {
+struct CopyBinding {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0, range = 0;
+    std::uint64_t guest = 0;
+};
+CopyBinding g_copy_bindings[64];  // under g.mu
+std::size_t g_copy_binding_next = 0;
+}  // namespace
+
+void note_copy_binding_locked(const VkDescriptorBufferInfo& info, std::uint64_t guest) {
+    g_copy_bindings[g_copy_binding_next++ % 64] = {info.buffer, info.offset, info.range, guest};
+}
+std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
+    for (std::size_t k = 1; k <= 64 && k <= g_copy_binding_next; ++k) {  // the latest first: the scratch ring reuses offsets
+        const CopyBinding& c = g_copy_bindings[(g_copy_binding_next - k) % 64];
+        if (c.buffer == buffer && c.offset == offset && c.range == range) return c.guest;
+    }
+    return 0;
 }
 
 const std::uint8_t* imported_bytes_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::uint64_t* guest_va) {
@@ -4602,7 +5137,13 @@ void submit_locked() {
     flush_deferred_writes_locked();  // (its transfer batch puts deferred copy-backs in place first)
     transfer_flush_locked();
     render_end_pass_locked();
+    stall_test_record_locked();  // BBHOST_TEST_GPU_STALL
     copy_versions_flush_locked();
+    // A render target a shortage put in host memory goes back into video
+    // memory once there is room: its copy recorded here, after everything
+    // this recording wrote it with (vram_return_on; one at most, once a
+    // second).
+    render_return_targets_locked();
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -4641,6 +5182,20 @@ void submit_locked() {
     }
     Gpu::Slot& cur = g.slots[g.slot];
     cur.serial = g.flushes;
+    {
+        // What it holds, for the line a wait for it that runs long writes.
+        static std::uint64_t last_draws = 0, last_dispatches = 0, last_tess = 0;
+        const std::uint64_t draws = g.draws.load(std::memory_order_relaxed), dispatches = g.dispatches.load(std::memory_order_relaxed);
+        const std::uint64_t tess = render_tess_draws();
+        cur.held_draws = draws - last_draws;
+        cur.held_dispatches = dispatches - last_dispatches;
+        cur.held_tess = tess - last_tess;
+        cur.held_flip = hle_video_flip_count();
+        cur.said_stuck = false;
+        last_draws = draws;
+        last_dispatches = dispatches;
+        last_tess = tess;
+    }
     textures_before_submit();  // the staging spans its copies read are filled
     // BBHOST_TEST_DEVICE_LOST=<flip>: from that flip on, act as if the device
     // were lost (it is not; the GPU only gets no more work) - the reports, the
@@ -4651,6 +5206,14 @@ void submit_locked() {
     }();
     if (test_lost && g.ok && hle_video_flip_count() >= test_lost) device_lost_locked("BBHOST_TEST_DEVICE_LOST");
     take_submit_failure_locked();
+    if (g_device_lost.load(std::memory_order_acquire)) {
+        // Lost, or taken for stuck (fence_wait_locked): nothing more goes to
+        // the GPU. Work queued behind a submission it never finished would
+        // reuse what that one may still read. The recording is dropped; bbhost
+        // is ending.
+        g.queued = 0;
+        return;
+    }
     if (streamed) {
         stream::EndSubmit es{};
         es.ncmds = si.commandBufferCount;
@@ -4694,11 +5257,14 @@ void submit_locked() {
     // mirrors are a cache and the images are not, so they go - freed once
     // this submission, the last that reads them, retires.
     if (g.vram_short.exchange(false, std::memory_order_relaxed)) shadow_give_back_locked(cur);
+    else shadow_return_locked();
+    shadow_flush_at_load_locked(cur);
     textures_submitted(g.slot);
     g.queued = 0;
     ++g.flushes;
     g.slot = (g.slot + 1) % g.slot_count;
     retire_slot_locked(g.slot);
+    stall_test_wait_locked();  // BBHOST_TEST_GPU_STALL
     g.cmd_ = g.slots[g.slot].cmd;
     g.fence = g.slots[g.slot].fence;
     g.desc_pool = g.slots[g.slot].pool;
@@ -4713,12 +5279,17 @@ void flush_locked() {
 
 void wait_submission_locked(std::uint64_t serial) {
     if (g.completed_submits > serial || serial >= g.flushes) return;
-    Gpu::Slot& sl = g.slots[serial % static_cast<std::uint64_t>(g.slot_count)];
+    const int k = static_cast<int>(serial % static_cast<std::uint64_t>(g.slot_count));
+    Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight || sl.serial != serial) return;  // retired, and its slot taken again
     stream_wait_submitted(serial);                      // its fence has gone to the queue
-    const auto t0 = std::chrono::steady_clock::now();
-    vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, 10000000000ull);
-    g.gpu_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    // Until it has run (a step's wait used to give up after ten seconds, and
+    // the caller reuse what the GPU might still read - the tessellation
+    // ring's regions), or the GPU is taken for stuck, after which nothing
+    // recorded goes to it.
+    std::uint64_t us = 0;
+    fence_wait_locked(k, us);
+    g.gpu_us.fetch_add(us);
 }
 
 void retire_through_locked(std::uint64_t serial) {
@@ -4768,6 +5339,29 @@ bool host_gpu_memory_tight() {
     return g_tight.load() == 1;
 }
 
+bool host_gpu_small_vram() {
+    if (const int s = g_small.load(); s >= 0) return s == 1;
+    bool small = false;
+    if (g_enabled) {
+        obs_capture_policy();  // before the first instance
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.pApplicationName = "bbhost";
+        app.apiVersion = VK_API_VERSION_1_3;
+        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ici.pApplicationInfo = &app;
+        VkInstance instance = VK_NULL_HANDLE;
+        if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
+            std::vector<Candidate> usable;
+            const int chosen = choose_device(instance, false, usable);
+            if (chosen >= 0) small = small_vram(usable[static_cast<std::size_t>(chosen)]);
+            vkDestroyInstance(instance, nullptr);
+        }
+    }
+    int unknown = -1;
+    g_small.compare_exchange_strong(unknown, small ? 1 : 0);
+    return g_small.load() == 1;
+}
+
 bool host_gpu_available() {
     std::lock_guard<GpuMutex> lock(g.mu);
     return init_locked();
@@ -4780,7 +5374,29 @@ GpuStats host_gpu_stats() {
     st.draw_calls = g.draw_calls.load();
     st.draw_failures = g.draw_failures.load();
     st.draws_empty = g.draws_empty.load();
+    for (int i = 0; i < kDrawPsCount; ++i) st.draws_ps[i] = g.draws_ps[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kDrawVsCount; ++i) st.draws_vs[i] = g.draws_vs[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kVsWhyCount; ++i) st.draws_vs_why[i] = g.draws_vs_why[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kDrawTessCount; ++i) st.draws_tess[i] = g.draws_tess[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
     return st;
+}
+
+const char* host_gpu_draw_fail_name(int reason) {
+    static const char* const why[kFailCount] = {"tessellation off",  "tessellation plan",  "tessellation LS pass",
+                                                "primitive type",    "no vertex shader",   "vertex shader",
+                                                "pixel shader",      "fetch shader",       "pipeline build",
+                                                "descriptor set",    "set allocation",     "fallback bindings",
+                                                "pipeline creation", "index buffer",       "indirect arguments",
+                                                "no GPU (device lost)"};
+    return reason >= 0 && reason < kFailCount ? why[reason] : nullptr;
+}
+const char* host_gpu_vs_why_name(int why) {
+    static const char* const names[kVsWhyCount] = {"tessellation (host)", "tessellation (emulated domain)", "no fetch shader",
+                                                    "no GX geometry",      "vertex input off",               "the game's own vertex table",
+                                                    "another fetch shape", "a missing record",               "no vertex format",
+                                                    "a short stride",      "data outside one buffer"};
+    return why >= 0 && why < kVsWhyCount ? names[why] : nullptr;
 }
 void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
 
@@ -4935,6 +5551,25 @@ std::atomic<std::uint64_t> g_unresolved_stores{0};
 // BBHOST_STORE_LOG=1: the first 400 buffer ranges compute stores are taken to write.
 const bool g_store_log = std::getenv("BBHOST_STORE_LOG") != nullptr;
 std::atomic<std::uint64_t> g_store_logs{0};
+// GDS counters (GpuDispatch::gds): dispatches that counted in at least one
+// bound word, ones whose program counts in GDS with none bound, and the
+// starts written or copied into a word first.
+std::atomic<std::uint64_t> g_gds_dispatches{0}, g_gds_unbound{0}, g_gds_sets{0}, g_gds_copies{0}, g_gds_start_failed{0};
+// BBHOST_GDS_TRACE=1: the first 64 dispatches that count in GDS, with their words.
+const bool g_gds_trace = [] {
+    const char* e = std::getenv("BBHOST_GDS_TRACE");
+    return e && e[0] == '1';
+}();
+std::atomic<int> g_gds_traced{0};
+bool counter_start_locked(const GpuDispatch::GdsCounter& c);
+}
+
+bool host_gpu_gds_counters() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GDS_COUNTERS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
 }
 
 bool host_gpu_dispatch(const GpuDispatch& d) {
@@ -5015,6 +5650,19 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         const std::uint32_t* c = &d.user_data[pl.fill_cb_sgpr];
         const std::uint64_t cb = (static_cast<std::uint64_t>(c[0]) | (static_cast<std::uint64_t>(c[1] & 0xff) << 32)) + pl.fill_cb_dw * 4;
         float rgba[4] = {};
+        // The fill takes the value as given: what a buffer_store_format_xyzw
+        // through a V# of 32_32_32_32 with the select X Y Z W writes. Another
+        // format or select would convert it and put each component through the
+        // select's inverse on the console (GX's own fill, gx_fill_resource,
+        // builds its V# so: 0xfac40e); logged once if one is ever seen.
+        if (pl.fill_format && (((v[3] >> 15) & 0xf) != 14 || (v[3] & 0xfff) != 0xfac)) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                host_log("gpu: fill dispatch %s stores through a V# whose format or select is not 32_32_32_32 X Y Z W (word 3 %08x): the value "
+                         "is filled as given",
+                         pl.name.c_str(), v[3]);
+            }
+        }
         if (hle_kernel_va_mapped(cb, 16)) {
             std::memcpy(rgba, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cb)), 16);
             static std::set<std::uint64_t> seen_bases;
@@ -5069,7 +5717,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         }
         hle_gnm_warn_if_command_buffer("copy dispatch", dst, bytes);
         const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes);
-        if (render_copy_target_locked(src, dst, bytes)) {
+        if (render_copy_target_locked(src, dst, bytes, "copy dispatch")) {
             tex_event(dst, bytes, "copy dispatch %s 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image", pl.name.c_str(),
                       static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
             g.dispatches.fetch_add(1);
@@ -5097,17 +5745,111 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         };
         for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        if (pl.meta.gds_counters) {
+            for (const GpuDispatch::GdsCounter& c : d.gds) {
+                if (c.word) import_windows(c.word, 4);
+                if (c.start == GpuDispatch::kGdsCopy && c.from) import_windows(c.from, 4);
+            }
+        }
     }
     if (g.queued + 1 >= kMaxQueued * kStageSlots) {
         submit_locked();
     }
     begin_recording_locked();
+    // The counters' starts go first, on the GPU's timeline: a set count (an
+    // initial count of 0 for the buffer the dispatch appends to) written into
+    // the word, a count from another word copied in.
+    bool gds_bound = false;
+    if (pl.meta.gds_counters) {
+        for (const GpuDispatch::GdsCounter& c : d.gds) {
+            if (!c.word) continue;
+            gds_bound = true;
+            if (c.start == GpuDispatch::kGdsKeep) continue;
+            if (counter_start_locked(c)) {
+                (c.start == GpuDispatch::kGdsSet ? g_gds_sets : g_gds_copies).fetch_add(1, std::memory_order_relaxed);
+            } else if (g_gds_start_failed.fetch_add(1, std::memory_order_relaxed) < 4) {
+                host_log("gpu: dispatch %s: the start of the GDS counter at 0x%llx (%s) could not be recorded: it counts on from what it holds",
+                         pl.name.c_str(), static_cast<unsigned long long>(c.word), c.start == GpuDispatch::kGdsSet ? "a set count" : "a copy");
+            }
+        }
+        if (gds_bound) {
+            g_gds_dispatches.fetch_add(1, std::memory_order_relaxed);
+            // The dispatch counts in the word while it runs, where GCN counted
+            // in GDS and left the word as it was until the store after: a V#
+            // of the program's over a counter word would see the count move.
+            // GX reads the live count from the indirect arguments instead;
+            // said once per program if one ever does.
+            if (!pl.gds_overlap_checked) {
+                pl.gds_overlap_checked = true;
+                const auto covers = [&](const gcn::ResourcePath& path) -> std::uint64_t {
+                    std::uint32_t v[4]{};
+                    if (!resolve_resource(path, d.user_data, 4, v)) return 0;
+                    const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+                    const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+                    const std::uint64_t bytes = stride ? std::uint64_t{v[2]} * stride : v[2];
+                    for (const GpuDispatch::GdsCounter& c : d.gds) {
+                        if (c.word && c.word >= base && c.word < base + bytes) return c.word;
+                    }
+                    return 0;
+                };
+                for (const gcn::BufferBinding& b : pl.meta.buffers) {
+                    if (const std::uint64_t w = b.pointer ? 0 : covers(b.path)) {
+                        host_log("gpu: dispatch %s reads %s, which holds the GDS counter word 0x%llx it counts in: it sees the count move",
+                                 pl.name.c_str(), b.path.str().c_str(), static_cast<unsigned long long>(w));
+                    }
+                }
+                for (const gcn::ResourcePath& path : pl.meta.store_buffers) {
+                    if (const std::uint64_t w = covers(path)) {
+                        host_log("gpu: dispatch %s stores through %s, which holds the GDS counter word 0x%llx it counts in", pl.name.c_str(),
+                                 path.str().c_str(), static_cast<unsigned long long>(w));
+                    }
+                }
+            }
+        } else if (g_gds_unbound.fetch_add(1, std::memory_order_relaxed) < 8) {
+            host_log("gpu: dispatch %s counts in GDS (%u site(s)) and the command buffer bound no counter for it: its ds_append / ds_consume "
+                     "return 0 and count nothing",
+                     pl.name.c_str(), pl.meta.gds_counters);
+        }
+        if (g_gds_trace && g_gds_traced.fetch_add(1, std::memory_order_relaxed) < 64) {
+            std::string words;
+            for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) {
+                const GpuDispatch::GdsCounter& c = d.gds[k];
+                if (!c.word) continue;
+                char t[160];
+                std::uint32_t now = 0;
+                if (hle_kernel_va_mapped(c.word, 4)) std::memcpy(&now, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(c.word)), 4);
+                std::snprintf(t, sizeof(t), " [GDS 0x%x] 0x%llx (holds %u on the CPU) %s", (d.gds_base + k) * 4, static_cast<unsigned long long>(c.word), now,
+                              c.start == GpuDispatch::kGdsKeep ? "kept" : c.start == GpuDispatch::kGdsSet ? "set to" : "copied from");
+                words += t;
+                if (c.start == GpuDispatch::kGdsSet) words += " " + std::to_string(c.value);
+                if (c.start == GpuDispatch::kGdsCopy) {
+                    std::snprintf(t, sizeof(t), " 0x%llx", static_cast<unsigned long long>(c.from));
+                    words += t;
+                }
+            }
+            host_log("gpu: GDS dispatch %s %ux%ux%u%s%s at flip %llu:%s", pl.name.c_str(), d.dim[0], d.dim[1], d.dim[2], d.indirect_va ? " indirect at " : "",
+                     d.indirect_va ? std::to_string(d.indirect_va).c_str() : "", static_cast<unsigned long long>(hle_video_flip_count()),
+                     words.empty() ? " none bound" : words.c_str());
+        }
+    }
     transfer_flush_locked();
     render_end_pass_locked();
     copy_versions_flush_locked();  // a compute shader reads memory without looking at them
+    // BBHOST_CAPTURE_DISPATCH (draw_capture.h): run everything recorded so
+    // far - the counters' starts too - before this dispatch's set exists, so
+    // memory and images hold its inputs.
+    const bool capture = capture_dispatch_candidate(pl.name, hle_video_flip_count());
+    if (capture) {
+        capture_settle_locked();
+        begin_recording_locked();
+    }
     gcn::StageParams params{};
     params.l1_table = g.l1.address;
     std::memcpy(params.user_sgpr, d.user_data, sizeof(params.user_sgpr));
+    if (gds_bound) {
+        params.gds_base = d.gds_base;
+        for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) params.gds_counter[k] = d.gds[k].word;
+    }
     VkDescriptorBufferInfo ubi{};
     alloc_params_slot_locked(params, ubi);
     VkDescriptorSet set = alloc_set_locked();
@@ -5128,21 +5870,58 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     infos.reserve(pl.meta.images.size() + pl.meta.samplers.size() + 1);
     bind_stage_images(set, pl.meta, stage_images, writes, infos, pl.name.c_str());
     vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pl.pipeline);
-    const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
-    rec().bind_sets(VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_layout, 0, 1, &set, set_cache_on() ? 1 : 0, &params_offset);
-    profile_begin_locked(&pl.name);
-    note_dispatch_name(g.dispatches.load(), pl.name.c_str());
-    gpu_checkpoint(2, g.dispatches.load());
+    // An indirect dispatch's arguments, checked on the GPU just before it
+    // reads them (indirect_clamp.cpp): a group count past 65,535 runs nothing.
+    VkBuffer args_buffer = VK_NULL_HANDLE;
+    VkDeviceSize args_offset = 0;
     if (d.indirect_va) {
         if (g_import_audit) audit_range(d.indirect_va, 12, kUseIndex);
         const Located loc = locate(d.indirect_va, 12);
         if (!loc.buffer || loc.avail < 12) {
-            profile_end_locked();
             g.failures.fetch_add(1);
             return false;
         }
-        if (!g_render_min) rec().dispatch_indirect(loc.buffer, loc.offset);
+        args_buffer = loc.buffer;
+        args_offset = loc.offset;
+        if (!g_render_min) indirect_clamp_locked(loc.buffer, loc.offset, d.indirect_va, name, args_buffer, args_offset);
+    }
+    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pl.pipeline);
+    const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
+    rec().bind_sets(VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_layout, 0, 1, &set, set_cache_on() ? 1 : 0, &params_offset);
+    CapturePtr capture_session;
+    if (capture) {
+        CaptureDispatch cd;
+        cd.pipeline = pl.name;
+        cd.flip = hle_video_flip_count();
+        cd.dispatch_index = g.dispatches.load();
+        cd.meta = &pl.meta;
+        cd.spirv = &pl.meta.spirv;
+        cd.gcn_words = &words;
+        cd.params = params;
+        cd.images = &stage_images;
+        std::memcpy(cd.dim, d.dim, sizeof(cd.dim));
+        std::memcpy(cd.threads, d.threads, sizeof(cd.threads));
+        cd.indirect_va = d.indirect_va;
+        if (gds_bound) {
+            for (const GpuDispatch::GdsCounter& c : d.gds) {
+                if (c.word) cd.counters.push_back(c.word);
+            }
+        }
+        cd.translate = json::Value::make_object();
+        cd.translate.set("stage", "compute");
+        cd.translate.set("rsrc1", json::hex(d.rsrc1));
+        cd.translate.set("rsrc2", json::hex(d.rsrc2));
+        cd.translate.set("gds_counters", host_gpu_gds_counters());
+        cd.translate.set("exec_known", g.exec_known);
+        cd.translate.set("max_lds_bytes", g.max_lds_bytes);
+        capture_session = capture_dispatch_begin_locked(std::move(cd));
+    }
+    profile_begin_locked(&pl.name);
+    note_dispatch_name(g.dispatches.load(), pl.name.c_str());
+    gpu_checkpoint(2, g.dispatches.load());
+    if (d.indirect_va) {
+        if (!g_render_min) rec().dispatch_indirect(args_buffer, args_offset);
+        note_indirect_locked(d.indirect_va, 0, pl.meta.gds_counters != 0);
     } else {
         if (!g_render_min) rec().dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }
@@ -5187,13 +5966,68 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
                       find_render_target(tsharp_base(tw)) ? " (render target)" : "");
         }
         if (b.storage) surface_queue_writeback(tsharp_base(tw));
+        static const std::uint64_t probe = [] {
+            const char* e = std::getenv("BBHOST_TEX_PROBE");
+            return e ? std::strtoull(e, nullptr, 0) : 0ull;
+        }();
+        if (probe && tsharp_base(tw) == probe) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 24) {
+                std::string bufs;
+                for (const gcn::ResourcePath& path : pl.meta.store_buffers) bufs += " store " + path.str();
+                for (std::size_t j = 0; j < pl.meta.buffers.size(); ++j) {
+                    std::uint32_t v[4]{};
+                    if (!resolve_resource(pl.meta.buffers[j].path, d.user_data, 4, v)) continue;
+                    const std::uint64_t vb = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+                    std::uint64_t head[2] = {};
+                    if (vb && hle_kernel_va_mapped(vb, sizeof(head))) std::memcpy(head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vb)), sizeof(head));
+                    char t[160];
+                    std::snprintf(t, sizeof(t), "; buffer %s 0x%llx: %016llx %016llx", pl.meta.buffers[j].path.str().c_str(),
+                                  static_cast<unsigned long long>(vb), static_cast<unsigned long long>(head[0]), static_cast<unsigned long long>(head[1]));
+                    bufs += t;
+                }
+                {
+                    char t[512];
+                    const std::uint32_t* u = d.user_data;
+                    const std::uint64_t vb = u[4] | (static_cast<std::uint64_t>(u[5] & 0xff) << 32);
+                    std::uint8_t src[16] = {};
+                    if (vb && hle_kernel_va_mapped(vb, sizeof(src))) std::memcpy(src, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vb)), sizeof(src));
+                    const std::uint64_t table = u[2] | (static_cast<std::uint64_t>(u[3]) << 32);
+                    std::uint32_t cbv[4] = {}, cb[4] = {};
+                    if (table && hle_kernel_va_mapped(table, sizeof(cbv))) std::memcpy(cbv, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(table)), sizeof(cbv));
+                    const std::uint64_t cbb = cbv[0] | (static_cast<std::uint64_t>(cbv[1] & 0xff) << 32);
+                    if (cbb && hle_kernel_va_mapped(cbb, sizeof(cb))) std::memcpy(cb, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cbb)), sizeof(cb));
+                    std::snprintf(t, sizeof(t), "; user[4:7] %08x %08x %08x %08x, bytes at 0x%llx:", u[4], u[5], u[6], u[7], static_cast<unsigned long long>(vb));
+                    bufs += t;
+                    for (std::uint8_t b8 : src) {
+                        std::snprintf(t, sizeof(t), " %02x", b8);
+                        bufs += t;
+                    }
+                    std::snprintf(t, sizeof(t), "; cb 0x%llx: %u %u %u %u", static_cast<unsigned long long>(cbb), cb[0], cb[1], cb[2], cb[3]);
+                    bufs += t;
+                }
+                host_log("texture probe: 0x%llx dispatch %s %ux%ux%u %s it, T# %08x %08x %08x %08x (flip %llu)%s",
+                         static_cast<unsigned long long>(tsharp_base(tw)), pl.name.c_str(), d.dim[0], d.dim[1], d.dim[2], b.storage ? "WRITES" : "reads",
+                         tw[0], tw[1], tw[2], tw[3], static_cast<unsigned long long>(hle_video_flip_count()), bufs.c_str());
+            }
+        }
+    }
+    if (gds_bound) {
+        for (const GpuDispatch::GdsCounter& c : d.gds) {
+            if (c.word) shadow_written_locked(c.word, 4, true);
+        }
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT;
+    // What follows may also take indirect arguments a shader wrote (the
+    // particles' counter passes write the next dispatch's) or copy out of
+    // memory it wrote (a counter, into the arguments).
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
+    if (capture_session) capture_dispatch_finish_locked(std::move(capture_session));
     return true;
 }
 
@@ -5303,28 +6137,13 @@ std::size_t g_cache_size_hint = 0;  // the last serialized size; under g_cache_s
 bool g_cache_save_every = false;     // BBHOST_PIPELINE_CACHE_SAVE_S set
 
 // Writes the file through a temporary one, 8 MiB at a time, each chunk on the
-// device before the next is written. Written at once, the cache (313 MB) was
-// seconds of write-back that other threads' file reads and log writes queued
-// behind: a 2.9 s main-loop frame at boot and a 1 s stall in play, over NFS.
+// device before the next is written (HostPacedFile). Written at once, the
+// cache (313 MB) was seconds of write-back that other threads' file reads and
+// log writes queued behind: a 2.9 s main-loop frame at boot and a 1 s stall in
+// play, over NFS.
 bool write_file_paced(const std::string& path, const char* data, std::size_t size) {
-    const std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) return false;
-    constexpr std::size_t kChunk = 8u << 20;
-    bool ok = true;
-    for (std::size_t at = 0; ok && at < size; at += kChunk) {
-        const std::size_t n = std::min(kChunk, size - at);
-        ok = std::fwrite(data + at, 1, n, f) == n && std::fflush(f) == 0;
-#if defined(_WIN32)
-        ok = ok && _commit(_fileno(f)) == 0;
-#else
-        ok = ok && ::fdatasync(fileno(f)) == 0;
-#endif
-    }
-    ok = std::fclose(f) == 0 && ok;
-    std::error_code ec;
-    if (ok) std::filesystem::rename(tmp, path, ec);
-    return ok && !ec;
+    HostPacedFile f(path, path + ".tmp");
+    return f.write(data, size) && f.commit();
 }
 
 // Serializes the cache and writes it if it grew. The cache is ~230 MB, and
@@ -5699,6 +6518,7 @@ void host_gpu_set_loading(bool loading) {
 }
 
 void host_gpu_world_reached() { gpu::precompile_set_world_reached(); }
+std::size_t host_gpu_shader_backlog() { return gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0; }
 
 std::string host_gpu_image_heap_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);
@@ -5904,6 +6724,69 @@ bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) 
     return true;
 }
 
+namespace {
+
+// A GDS counter's start before the dispatch that counts in it
+// (GpuDispatch::gds): a set count filled into the word, or another word's
+// copied in, in the open transfer batch.
+bool counter_start_locked(const GpuDispatch::GdsCounter& c) {
+    Located dst;
+    if (!locate_range(c.word, 4, dst)) return false;
+    Located src;
+    if (c.start == GpuDispatch::kGdsCopy && !locate_range(c.from, 4, src)) return false;
+    transfer_begin_locked();
+    if (c.start == GpuDispatch::kGdsSet) {
+        transfer_order_locked(VK_NULL_HANDLE, 0, dst.buffer, dst.offset, 4, true);
+        rec().fill_buffer(dst.buffer, dst.offset, 4, c.value);
+    } else {
+        transfer_order_locked(src.buffer, src.offset, dst.buffer, dst.offset, 4, true);
+        VkBufferCopy region{src.offset, dst.offset, 4};
+        rec().copy_buffer(src.buffer, dst.buffer, 1, &region);
+    }
+    transfer_end_locked();
+    shadow_written_locked(c.word, 4, true);
+    return true;
+}
+
+}  // namespace
+
+std::atomic<std::uint64_t> g_counter_copies{0}, g_counter_fills{0};
+
+bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok || !bytes) return false;
+    if (dst < src + bytes && src < dst + bytes) return false;
+    import_windows(src, bytes);
+    import_windows(dst, bytes);
+    Located d, sr;
+    if (!locate_range(dst, bytes, d) || !locate_range(src, bytes, sr)) return false;
+    note_gpu_write_over_marker("counter copy", dst, src, bytes);
+    transfer_begin_locked();
+    transfer_order_locked(sr.buffer, sr.offset, d.buffer, d.offset, bytes, true);
+    VkBufferCopy region{sr.offset, d.offset, bytes};
+    rec().copy_buffer(sr.buffer, d.buffer, 1, &region);
+    transfer_end_locked();
+    shadow_written_locked(dst, bytes, true);
+    g_counter_copies.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t bytes) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok || !bytes) return false;
+    import_windows(dst, bytes);
+    Located d;
+    if (!locate_range(dst, bytes, d)) return false;
+    note_gpu_write_over_marker("counter fill", dst, value, bytes);
+    transfer_begin_locked();
+    transfer_order_locked(VK_NULL_HANDLE, 0, d.buffer, d.offset, bytes, true);
+    rec().fill_buffer(d.buffer, d.offset, bytes, value);
+    transfer_end_locked();
+    shadow_written_locked(dst, bytes, true);
+    g_counter_fills.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 // Copy tokens whose source was a render target, copied as images.
 std::atomic<std::uint64_t> g_guest_copy_targets{0};
 std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(std::memory_order_relaxed); }
@@ -5915,7 +6798,7 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     if (dst < src + bytes && src < dst + bytes) return false;
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
     const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes);
-    if (render_copy_target_locked(src, dst, bytes)) {
+    if (render_copy_target_locked(src, dst, bytes, "copy token")) {
         tex_event(dst, bytes, "copy token 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image",
                   static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
         g_guest_copy_targets.fetch_add(1, std::memory_order_relaxed);
@@ -6221,6 +7104,7 @@ void host_gpu_report() {
         host_log("gpu:   recognised as an image copy: %llu image-to-image, %llu buffer-to-image (they still run their shader)",
                  static_cast<unsigned long long>(g_dispatch_image_blits.load()),
                  static_cast<unsigned long long>(g_dispatch_buf_to_image.load()));
+        host_log("gpu: %s", indirect_clamp_report().c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "
                  "for those)",
                  static_cast<unsigned long long>(g_dispatch_shaders.load()), g_dispatch_census.size(),
@@ -6228,6 +7112,14 @@ void host_gpu_report() {
         for (std::size_t k = 0; k < by_count.size() && k < 16; ++k) {
             host_log("gpu:   %8llu %s", static_cast<unsigned long long>(by_count[k].first), by_count[k].second.c_str());
         }
+    }
+    if (host_gpu_gds_counters()) {
+        host_log("gpu: GDS counters: %llu dispatches counted in bound words, %llu counted in GDS with none bound; %llu counts set and %llu copied "
+                 "in first (%llu could not be); %llu counter copies and %llu fills from the command processor",
+                 static_cast<unsigned long long>(g_gds_dispatches.load()), static_cast<unsigned long long>(g_gds_unbound.load()),
+                 static_cast<unsigned long long>(g_gds_sets.load()), static_cast<unsigned long long>(g_gds_copies.load()),
+                 static_cast<unsigned long long>(g_gds_start_failed.load()), static_cast<unsigned long long>(g_counter_copies.load()),
+                 static_cast<unsigned long long>(g_counter_fills.load()));
     }
     if (g.cmd_buffer_marker && g.marker_buf.map) {
         std::uint32_t started = 0, finished = 0;
@@ -6245,16 +7137,10 @@ void host_gpu_report() {
              static_cast<unsigned long long>(g.gpu_us.load() / 1000));
     if (const std::string busy = busy_exit_report(); !busy.empty()) host_log("%s", busy.c_str());
     if (g.draw_failures.load()) {
-        static const char* const why[kFailCount] = {"tessellation off",  "tessellation plan",  "tessellation LS pass",
-                                                    "primitive type",    "no vertex shader",   "vertex shader",
-                                                    "pixel shader",      "fetch shader",       "pipeline build",
-                                                    "descriptor set",    "set allocation",     "fallback bindings",
-                                                    "pipeline creation", "index buffer",       "indirect arguments",
-                                                    "no GPU (device lost)"};
         std::string line;
         for (int k = 0; k < kFailCount; ++k) {
             if (const std::uint64_t n = g.draw_fail_why[k].load()) {
-                line += (line.empty() ? "" : ", ") + std::string(why[k]) + " " + std::to_string(n);
+                line += (line.empty() ? "" : ", ") + std::string(host_gpu_draw_fail_name(k)) + " " + std::to_string(n);
             }
         }
         host_log("gpu: draw failures by reason: %s", line.c_str());

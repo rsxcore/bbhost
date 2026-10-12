@@ -4,6 +4,11 @@
 #include <locale>
 #include "core/write_watch.h"
 #include "hle/common.h"
+#include "hle/libc_ctype.h"
+#include "hle/libc_abi.h"
+#include "hle/libc_stdio.h"
+#include "hle/libc_float.h"
+#include "hle/libc_random.h"
 #include "hle/fs.h"
 #include "core/tls_rewrite.h"
 #include "hle/hle.h"
@@ -65,58 +70,15 @@ int qsort_host_cmp(const void* a, const void* b) {
 short g_ctype[257];
 short g_tolower[257];
 short g_toupper[257];
-lconv g_lconv{};
+bb::libc::Lconv g_lconv{};
 std::once_flag g_ctype_once;
-
-// Dinkum _Ctype bits (what the eboot masks with: 0x01 for GUID hex scans,
-// 0x02 before _Getptolower, 0x20 for digits).
-constexpr short kXD = 0x001;  // hex digit
-constexpr short kUP = 0x002;  // upper
-constexpr short kSP = 0x004;  // space
-constexpr short kPU = 0x008;  // punct
-constexpr short kLO = 0x010;  // lower
-constexpr short kDI = 0x020;  // digit
-constexpr short kCN = 0x040;  // control
-constexpr short kBB = 0x080;  // blank (space, tab)
-constexpr short kXS = 0x100;  // extra space
-constexpr short kXA = 0x200;  // extra alpha
 
 void init_ctype() {
     for (int i = 0; i < 257; ++i) {
         const int c = i - 1;
-        short bits = 0;
-        if (c >= 0 && c < 128) {
-            if (c >= '0' && c <= '9') {
-                bits |= kDI | kXD;
-            }
-            if (c >= 'A' && c <= 'Z') {
-                bits |= kUP;
-            }
-            if (c >= 'a' && c <= 'z') {
-                bits |= kLO;
-            }
-            if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
-                bits |= kXD;
-            }
-            if (c == ' ' || c == '\t') {
-                bits |= kBB;
-            }
-            if (c == ' ' || (c >= '\t' && c <= '\r')) {
-                bits |= kSP;
-            }
-            if (c < 0x20 || c == 0x7f) {
-                bits |= kCN;
-            }
-            if (c > 0x20 && c < 0x7f && !(bits & (kDI | kUP | kLO))) {
-                bits |= kPU;
-            }
-        }
-        g_ctype[i] = bits;
+        g_ctype[i] = bb::libc::ctype_flags(c);
         g_tolower[i] = static_cast<short>(c >= 'A' && c <= 'Z' ? c + 32 : c);
         g_toupper[i] = static_cast<short>(c >= 'a' && c <= 'z' ? c - 32 : c);
-    }
-    if (struct lconv* lc = localeconv()) {
-        g_lconv = *lc;
     }
 }
 
@@ -218,33 +180,46 @@ GUEST_ABI int hle_strncasecmp(const char* a, const char* b, std::uint64_t n) {
 #endif
 }
 GUEST_ABI int hle_strcoll(const char* a, const char* b) { return sgn(std::strcmp(a, b)); }
-GUEST_ABI const char* hle_strerror(int e) { return std::strerror(e); }
-GUEST_ABI long hle_strtol(const char* s, char** end, int base) { return std::strtol(s, end, base); }
+GUEST_ABI const char* hle_strerror(int e) { return bb::libc::error_string(e); }
+template <typename Char, typename Integer>
+Integer guest_integer_result(bb::libc::IntegerParse<Char, Integer> r, Char** end) {
+    if (end) *end = const_cast<Char*>(r.end);
+    if (r.range_error) set_guest_errno_bsd(34);  // native ERANGE
+    return r.value;
+}
+GUEST_ABI std::int64_t hle_strtol(const char* s, char** end, int base) {
+    return guest_integer_result(bb::libc::parse_signed(s, base), end);
+}
 GUEST_ABI std::uint64_t hle_strtoumax(const char* s, char** end, int base) {
-    return static_cast<std::uint64_t>(std::strtoull(s, end, base));
+    return guest_integer_result(bb::libc::parse_unsigned(s, base), end);
 }
 
 // The printf family walks the guest's own va_list (hle/sysv_va.h): the
 // v-entries get the guest's pointer, the variadic ones are asm shims
 // (SYSV_VA_ENTRY, after this namespace) that build one from the registers.
-GUEST_ABI int hle_vprintf(const char* fmt, SysvVaList* ap) { return sysv_vfprintf(stdout, fmt, ap); }
+GUEST_ABI int hle_vprintf(const char* fmt, SysvVaList* ap) { return bb::libc::print_file(stdout, fmt, ap); }
 GUEST_ABI int hle_vsnprintf(char* b, std::uint64_t n, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, n, fmt, ap);
 }
 GUEST_ABI int hle_vsprintf(char* b, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, ~std::size_t(0), fmt, ap);
 }
-GUEST_ABI int hle_vfprintf(FILE* f, const char* fmt, SysvVaList* ap) { return sysv_vfprintf(f ? f : stdout, fmt, ap); }
-GUEST_ABI int hle_puts(const char* s) { return std::puts(s); }
-GUEST_ABI int hle_putchar(int c) { return std::putchar(c); }
-GUEST_ABI void hle_perror(const char* s) { std::perror(s); }
+GUEST_ABI int hle_vfprintf(FILE* f, const char* fmt, SysvVaList* ap) { return bb::libc::print_file(f ? f : stdout, fmt, ap); }
+GUEST_ABI int hle_puts(const char* s) {
+    return bb::libc::file_result(stdout, [&] { return std::puts(s); }, bb::libc::write_access);
+}
+GUEST_ABI int hle_putchar(int c) {
+    return bb::libc::file_result(stdout, [&] { return std::putchar(c); }, bb::libc::write_access);
+}
+GUEST_ABI void hle_perror(const char* s) { bb::libc::print_error(stderr, s); }
 
 GUEST_ABI FILE* hle_fopen(const char* path, const char* mode) {
     std::string host = hle_fs_map_path(path);
     if (host.empty()) {
+        set_guest_errno_host(ENOENT);
         return nullptr;
     }
-    FILE* f = std::fopen(host.c_str(), mode ? mode : "r");
+    FILE* f = bb::libc::open_file(host.c_str(), mode ? mode : "r");
     static int logs;
     if (logs < 8) {
         host_log("fopen %s -> %s %s %s", path ? path : "", host.c_str(), mode ? mode : "",
@@ -281,33 +256,44 @@ GUEST_ABI FILE* hle_fopen(const char* path, const char* mode) {
 GUEST_ABI FILE* hle_freopen(const char* path, const char* mode, FILE* f) {
     std::string host = hle_fs_map_path(path);
     if (host.empty()) {
+        set_guest_errno_host(ENOENT);
         return nullptr;
     }
-    return std::freopen(host.c_str(), mode ? mode : "r", f);
+    return bb::libc::reopen_file(host.c_str(), mode ? mode : "r", f);
 }
-GUEST_ABI int hle_fclose(FILE* f) { return f ? std::fclose(f) : 0; }
-GUEST_ABI int hle_fflush(FILE* f) { return std::fflush(f); }
+GUEST_ABI int hle_fclose(FILE* f) { return f ? bb::libc::close_file(f) : 0; }
+GUEST_ABI int hle_fflush(FILE* f) { return libc_result(std::fflush(f)); }
 GUEST_ABI std::uint64_t hle_fread(void* p, std::uint64_t sz, std::uint64_t n, FILE* f) {
-    return write_watch_fread(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    return bb::libc::file_result(f, [&] {
+        return write_watch_fread(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    }, bb::libc::read_access);
 }
 GUEST_ABI std::uint64_t hle_fwrite(const void* p, std::uint64_t sz, std::uint64_t n, FILE* f) {
-    return std::fwrite(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    return bb::libc::file_result(f, [&] {
+        return std::fwrite(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    }, bb::libc::write_access);
 }
-GUEST_ABI int hle_fseek(FILE* f, long off, int whence) { return std::fseek(f, off, whence); }
-GUEST_ABI long hle_ftell(FILE* f) { return std::ftell(f); }
+GUEST_ABI int hle_fseek(FILE* f, std::int64_t off, int whence) { return libc_result(bb::libc::seek(f, off, whence)); }
+GUEST_ABI std::int64_t hle_ftell(FILE* f) {
+    const auto offset = bb::libc::tell(f);
+    if (offset == -1) set_guest_errno_host(errno);
+    return offset;
+}
 GUEST_ABI void hle_rewind(FILE* f) { std::rewind(f); }
 GUEST_ABI int hle_feof(FILE* f) { return std::feof(f); }
 GUEST_ABI int hle_ferror(FILE* f) { return std::ferror(f); }
 GUEST_ABI void hle_clearerr(FILE* f) { std::clearerr(f); }
-GUEST_ABI int hle_fgetc(FILE* f) { return std::fgetc(f); }
-GUEST_ABI int hle_getc(FILE* f) { return std::getc(f); }
+GUEST_ABI int hle_fgetc(FILE* f) { return bb::libc::file_result(f, [&] { return std::fgetc(f); }, bb::libc::read_access); }
+GUEST_ABI int hle_getc(FILE* f) { return bb::libc::file_result(f, [&] { return std::getc(f); }, bb::libc::read_access); }
 GUEST_ABI int hle_ungetc(int c, FILE* f) { return std::ungetc(c, f); }
-GUEST_ABI char* hle_fgets(char* s, int n, FILE* f) { return std::fgets(s, n, f); }
-GUEST_ABI int hle_fputc(int c, FILE* f) { return std::fputc(c, f); }
-GUEST_ABI int hle_fputs(const char* s, FILE* f) { return std::fputs(s, f); }
-GUEST_ABI int hle_fgetpos(FILE* f, std::fpos_t* p) { return std::fgetpos(f, p); }
+GUEST_ABI char* hle_fgets(char* s, int n, FILE* f) { return bb::libc::file_result(f, [&] { return std::fgets(s, n, f); }, bb::libc::read_access); }
+GUEST_ABI int hle_fputc(int c, FILE* f) { return bb::libc::file_result(f, [&] { return std::fputc(c, f); }, bb::libc::write_access); }
+GUEST_ABI int hle_fputs(const char* s, FILE* f) { return bb::libc::file_result(f, [&] { return std::fputs(s, f); }, bb::libc::write_access); }
+GUEST_ABI int hle_fgetpos(FILE* f, bb::libc::Fpos* p) { return libc_result(bb::libc::get_position(f, p)); }
 GUEST_ABI int hle_setvbuf(FILE* f, char* b, int m, std::uint64_t n) {
-    return std::setvbuf(f, b, m, static_cast<std::size_t>(n));
+    const int host_mode = bb::libc::buffer_mode(m);
+    if (host_mode < 0) return -1;
+    return std::setvbuf(f, b, host_mode, static_cast<std::size_t>(n));
 }
 
 GUEST_ABI int hle_usleep(unsigned int usec) {
@@ -358,121 +344,55 @@ GUEST_ABI std::int64_t hle_time(std::int64_t* t) {
 }
 GUEST_ABI std::int64_t hle_clock() {
     g_hle_clock_reads.clock.add();
-    return static_cast<std::int64_t>(std::clock());
+    // Native clock is a tail call to sceKernelGetProcessTime (microseconds),
+    // not the host CRT's CLOCKS_PER_SEC (1000 on Windows).
+    return static_cast<std::int64_t>(host_clock_monotonic_ns() / 1000ull);
 }
 GUEST_ABI double hle_difftime(std::int64_t a, std::int64_t b) {
     return std::difftime(static_cast<std::time_t>(a), static_cast<std::time_t>(b));
 }
-// The guest's struct tm is FreeBSD's: the nine ints, then tm_gmtoff (long)
-// and tm_zone (char*), 56 bytes. glibc's is the same; mingw's stops after
-// the ints (36 bytes), so on Windows the guest layout is written by hand
-// from the CRT's fields, the offset and the zone name from the CRT's
-// timezone state, and never a CRT struct handed to the guest as-is (the
-// gettimeofday lesson).
-struct GuestTm {
-    int sec, min, hour, mday, mon, year, wday, yday, isdst;
-    int pad;
-    std::int64_t gmtoff;
-    const char* zone;
-};
-static_assert(sizeof(GuestTm) == 56);
-#if defined(_WIN32)
-void guest_tm_from(const std::tm& src, GuestTm* dst, bool utc) {
-    dst->sec = src.tm_sec;
-    dst->min = src.tm_min;
-    dst->hour = src.tm_hour;
-    dst->mday = src.tm_mday;
-    dst->mon = src.tm_mon;
-    dst->year = src.tm_year;
-    dst->wday = src.tm_wday;
-    dst->yday = src.tm_yday;
-    dst->isdst = src.tm_isdst;
-    dst->pad = 0;
-    if (utc) {
-        dst->gmtoff = 0;
-        dst->zone = "UTC";
-        return;
-    }
-    long tz = 0, dst_bias = 0;
-    _get_timezone(&tz);  // seconds west of UTC, standard time
-    _get_dstbias(&dst_bias);
-    dst->gmtoff = -(tz + (src.tm_isdst > 0 ? dst_bias : 0));
-    static thread_local char zone[64];
-    std::size_t n = 0;
-    if (_get_tzname(&n, zone, sizeof(zone), src.tm_isdst > 0 ? 1 : 0) != 0 || n == 0) std::strcpy(zone, "");
-    dst->zone = zone;
-}
+// Dinkumware tm is nine ints (36 bytes), NOT FreeBSD's 56-byte tm. The
+// guest's localtime_s callers put a stack cookie directly after this buffer.
+// Always translate, including on Linux; handing glibc a guest buffer writes
+// tm_gmtoff/tm_zone over the cookie and saved registers.
+using GuestTm = bb::libc::Tm;
 thread_local GuestTm t_guest_tm;
-#endif
 GUEST_ABI void* hle_gmtime(const std::int64_t* t) {
-    std::time_t tt = t ? static_cast<std::time_t>(*t) : 0;
-#if defined(_WIN32)
+    if (!t) return nullptr;
+    const std::time_t tt = static_cast<std::time_t>(*t);
     std::tm tmp{};
+#if defined(_WIN32)
     if (gmtime_s(&tmp, &tt) != 0) return nullptr;
-    guest_tm_from(tmp, &t_guest_tm, true);
-    return &t_guest_tm;
 #else
-    return std::gmtime(&tt);
+    if (!gmtime_r(&tt, &tmp)) return nullptr;
 #endif
-}
-GUEST_ABI void* hle_localtime(const std::int64_t* t) {
-    std::time_t tt = t ? static_cast<std::time_t>(*t) : 0;
-#if defined(_WIN32)
-    std::tm tmp{};
-    if (localtime_s(&tmp, &tt) != 0) return nullptr;
-    guest_tm_from(tmp, &t_guest_tm, false);
+    bb::libc::tm_from_host(tmp, &t_guest_tm);
     return &t_guest_tm;
-#else
-    return std::localtime(&tt);
-#endif
 }
 GUEST_ABI void* hle_localtime_s(const std::int64_t* t, GuestTm* buf) {
-    std::time_t tt = t ? static_cast<std::time_t>(*t) : 0;
-    if (!buf) {
-        return nullptr;
-    }
-#if defined(_WIN32)
+    if (!t || !buf) return nullptr;
+    const std::time_t tt = static_cast<std::time_t>(*t);
     std::tm tmp{};
+#if defined(_WIN32)
     if (localtime_s(&tmp, &tt) != 0) return nullptr;
-    guest_tm_from(tmp, buf, false);
-    return buf;
 #else
-    return localtime_r(&tt, reinterpret_cast<std::tm*>(buf));
+    if (!localtime_r(&tt, &tmp)) return nullptr;
 #endif
+    bb::libc::tm_from_host(tmp, buf);
+    return buf;  // native returns the destination, not Microsoft's errno_t
 }
-#if defined(_WIN32)
-// The CRT's tm from the guest's: the nine ints lead both layouts.
-std::tm crt_tm_from(const GuestTm* g) {
-    std::tm t{};
-    t.tm_sec = g->sec;
-    t.tm_min = g->min;
-    t.tm_hour = g->hour;
-    t.tm_mday = g->mday;
-    t.tm_mon = g->mon;
-    t.tm_year = g->year;
-    t.tm_wday = g->wday;
-    t.tm_yday = g->yday;
-    t.tm_isdst = g->isdst;
-    return t;
+GUEST_ABI void* hle_localtime(const std::int64_t* t) {
+    return hle_localtime_s(t, &t_guest_tm);
 }
-#endif
 GUEST_ABI std::int64_t hle_mktime(GuestTm* t) {
-#if defined(_WIN32)
-    std::tm c = crt_tm_from(t);
+    std::tm c = bb::libc::tm_to_host(t);
     const std::time_t r = std::mktime(&c);
-    guest_tm_from(c, t, false);  // mktime normalizes its argument
+    bb::libc::tm_from_host(c, t);  // mktime normalizes its argument
     return static_cast<std::int64_t>(r);
-#else
-    return static_cast<std::int64_t>(std::mktime(reinterpret_cast<std::tm*>(t)));
-#endif
 }
 GUEST_ABI std::uint64_t hle_strftime(char* s, std::uint64_t n, const char* fmt, const GuestTm* t) {
-#if defined(_WIN32)
-    const std::tm c = crt_tm_from(t);
+    const std::tm c = bb::libc::tm_to_host(t);
     return std::strftime(s, static_cast<std::size_t>(n), fmt, &c);
-#else
-    return std::strftime(s, static_cast<std::size_t>(n), fmt, reinterpret_cast<const std::tm*>(t));
-#endif
 }
 
 
@@ -618,8 +538,9 @@ GUEST_ABI void hle_qsort(void* base, std::uint64_t n, std::uint64_t sz, int (*cm
         t_qsort_cmp = saved;
     }
 }
-GUEST_ABI void hle_srand(unsigned s) { std::srand(s); }
-GUEST_ABI int hle_rand() { return std::rand(); }
+bb::libc::Random g_random;
+GUEST_ABI void hle_srand(unsigned s) { g_random.seed(s); }
+GUEST_ABI int hle_rand() { return g_random.next(); }
 
 GUEST_ABI int hle_mkdir(const char* p, int mode) {
     std::string host = hle_fs_map_path(p);
@@ -673,11 +594,8 @@ GUEST_ABI int hle_stat(const char* p, void* sb) {
     return -1;
 }
 
-GUEST_ABI char* hle_setlocale(int cat, const char* loc) { return std::setlocale(cat, loc); }
-GUEST_ABI lconv* hle_localeconv() {
-    std::call_once(g_ctype_once, init_ctype);
-    return &g_lconv;
-}
+GUEST_ABI char* hle_setlocale(int, const char* loc) { return bb::libc::set_c_locale(loc); }
+GUEST_ABI bb::libc::Lconv* hle_localeconv() { return &g_lconv; }
 // The tables are built when libc registers (hle_register_libc), so these
 // touch no thread-local state and run raw: the main loop calls them ~850
 // times a frame.
@@ -685,28 +603,22 @@ GUEST_ABI short* hle_getpctype() { return g_ctype + 1; }
 GUEST_ABI short* hle_getptolower() { return g_tolower + 1; }
 GUEST_ABI short* hle_getptoupper() { return g_toupper + 1; }
 
-GUEST_ABI double hle_stod(const char* s, char** end, long) { return std::strtod(s, end); }
-GUEST_ABI long long hle_stoll(const char* s, char** end, long) { return std::strtoll(s, end, 10); }
-GUEST_ABI unsigned long hle_stoul(const char* s, char** end, long) { return std::strtoul(s, end, 10); }
-GUEST_ABI unsigned long long hle_stoull(const char* s, char** end, long) {
-    return std::strtoull(s, end, 10);
+template <typename Float, typename Char>
+Float guest_float_result(bb::libc::FloatParse<Float, Char> r, Char** end) {
+    if (end) *end = const_cast<Char*>(r.end);
+    if (r.range_error) set_guest_errno_bsd(34);
+    return r.value;
 }
+// Inspected game callers pass adjustment zero. Native extended arithmetic
+// and nonzero decimal adjustments remain separate compatibility work.
+GUEST_ABI double hle_stod(const char* s, char** end, std::int64_t) {
+    return guest_float_result(bb::libc::parse_float<double>(s), end);
+}
+GUEST_ABI std::int64_t hle_stoll(const char* s, char** end, int base) { return hle_strtol(s, end, base); }
+GUEST_ABI std::uint64_t hle_stoul(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
+GUEST_ABI std::uint64_t hle_stoull(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
 
-GUEST_ABI int hle_dtest(double* p) {
-    if (!p) {
-        return 0;
-    }
-    if (std::isnan(*p)) {
-        return 2;
-    }
-    if (std::isinf(*p)) {
-        return 1;
-    }
-    if (*p == 0.0) {
-        return -1;
-    }
-    return 0;
-}
+GUEST_ABI std::int16_t hle_dtest(const double* p) { return bb::libc::dtest(p); }
 
 GUEST_ABI double hle_sin(double x) { return std::sin(x); }
 // Dinkumware _Sin/_FSin(x, qoff) compute sin(x + qoff*pi/2), i.e. the quarter
@@ -738,44 +650,45 @@ GUEST_ABI float hle_sinf_q(float x, unsigned q) {
     }
 }
 GUEST_ABI double hle_tan(double x) { return std::tan(x); }
-GUEST_ABI float hle_tanf(float x) { return std::tanf(x); }
-GUEST_ABI float hle_tanhf(float x) { return std::tanhf(x); }
+// Use the standard float overloads, not non-portable std::<name>f aliases.
+GUEST_ABI float hle_tanf(float x) { return std::tan(x); }
+GUEST_ABI float hle_tanhf(float x) { return std::tanh(x); }
 GUEST_ABI double hle_acos(double x) { return std::acos(x); }
-GUEST_ABI float hle_acosf(float x) { return std::acosf(x); }
+GUEST_ABI float hle_acosf(float x) { return std::acos(x); }
 GUEST_ABI double hle_asin(double x) { return std::asin(x); }
-GUEST_ABI float hle_asinf(float x) { return std::asinf(x); }
+GUEST_ABI float hle_asinf(float x) { return std::asin(x); }
 GUEST_ABI double hle_atan(double x) { return std::atan(x); }
-GUEST_ABI float hle_atanf(float x) { return std::atanf(x); }
+GUEST_ABI float hle_atanf(float x) { return std::atan(x); }
 GUEST_ABI double hle_atan2(double y, double x) { return std::atan2(y, x); }
-GUEST_ABI float hle_atan2f(float y, float x) { return std::atan2f(y, x); }
+GUEST_ABI float hle_atan2f(float y, float x) { return std::atan2(y, x); }
 GUEST_ABI double hle_exp(double x) { return std::exp(x); }
-GUEST_ABI float hle_expf(float x) { return std::expf(x); }
+GUEST_ABI float hle_expf(float x) { return std::exp(x); }
 GUEST_ABI double hle_exp2(double x) { return std::exp2(x); }
-GUEST_ABI float hle_exp2f(float x) { return std::exp2f(x); }
-GUEST_ABI double hle_log(double x) { return std::log(x); }
-GUEST_ABI float hle_logf(float x) { return std::logf(x); }
+GUEST_ABI float hle_exp2f(float x) { return std::exp2(x); }
+GUEST_ABI double hle_dinkum_log(double x, int selector) { return bb::libc::logarithm(x, selector); }
+GUEST_ABI float hle_dinkum_logf(float x, int selector) { return bb::libc::logarithm(x, selector); }
 GUEST_ABI double hle_pow(double x, double y) { return std::pow(x, y); }
-GUEST_ABI float hle_powf(float x, float y) { return std::powf(x, y); }
+GUEST_ABI float hle_powf(float x, float y) { return std::pow(x, y); }
 GUEST_ABI double hle_sqrt(double x) { return std::sqrt(x); }
-GUEST_ABI float hle_sqrtf(float x) { return std::sqrtf(x); }
+GUEST_ABI float hle_sqrtf(float x) { return std::sqrt(x); }
 GUEST_ABI double hle_ceil(double x) { return std::ceil(x); }
-GUEST_ABI float hle_ceilf(float x) { return std::ceilf(x); }
+GUEST_ABI float hle_ceilf(float x) { return std::ceil(x); }
 GUEST_ABI double hle_floor(double x) { return std::floor(x); }
-GUEST_ABI float hle_floorf(float x) { return std::floorf(x); }
+GUEST_ABI float hle_floorf(float x) { return std::floor(x); }
 GUEST_ABI double hle_fabs(double x) { return std::fabs(x); }
-GUEST_ABI float hle_fabsf(float x) { return std::fabsf(x); }
+GUEST_ABI float hle_fabsf(float x) { return std::fabs(x); }
 GUEST_ABI double hle_fmod(double x, double y) { return std::fmod(x, y); }
-GUEST_ABI float hle_fmodf(float x, float y) { return std::fmodf(x, y); }
+GUEST_ABI float hle_fmodf(float x, float y) { return std::fmod(x, y); }
 GUEST_ABI double hle_frexp(double x, int* e) { return std::frexp(x, e); }
-GUEST_ABI float hle_frexpf(float x, int* e) { return std::frexpf(x, e); }
+GUEST_ABI float hle_frexpf(float x, int* e) { return std::frexp(x, e); }
 GUEST_ABI double hle_ldexp(double x, int e) { return std::ldexp(x, e); }
-GUEST_ABI float hle_ldexpf(float x, int e) { return std::ldexpf(x, e); }
+GUEST_ABI float hle_ldexpf(float x, int e) { return std::ldexp(x, e); }
 GUEST_ABI double hle_modf(double x, double* i) { return std::modf(x, i); }
-GUEST_ABI float hle_modff(float x, float* i) { return std::modff(x, i); }
-GUEST_ABI float hle_coshf(float x) { return std::coshf(x); }
-GUEST_ABI float hle_sinhf(float x) { return std::sinhf(x); }
+GUEST_ABI float hle_modff(float x, float* i) { return std::modf(x, i); }
+GUEST_ABI float hle_coshf(float x) { return std::cosh(x); }
+GUEST_ABI float hle_sinhf(float x) { return std::sinh(x); }
 
-GUEST_ABI ldiv_t hle_ldiv(long n, long d) { return std::ldiv(n, d); }
+GUEST_ABI bb::libc::Div64 hle_ldiv(std::int64_t n, std::int64_t d) { return bb::libc::divide(n, d); }
 
 // Orbis wchar_t is UTF-16. Linux wchar_t is UTF-32 — never wrap host wcs*.
 using Gwchar = char16_t;
@@ -909,23 +822,10 @@ GUEST_ABI std::uint64_t hle_wcsspn(const Gwchar* s, const Gwchar* r) {
     }
     return n;
 }
-GUEST_ABI long hle_wcstol(const Gwchar* s, Gwchar** e, int b) {
-    std::string tmp;
-    if (s) {
-        for (const Gwchar* p = s; *p && tmp.size() < 64; ++p) {
-            tmp.push_back(static_cast<char>(*p));
-        }
-    }
-    char* end = nullptr;
-    long v = std::strtol(tmp.c_str(), &end, b);
-    if (e && s) {
-        *e = const_cast<Gwchar*>(s) + (end ? (end - tmp.c_str()) : tmp.size());
-    }
-    return v;
+GUEST_ABI std::int64_t hle_wcstol(const Gwchar* s, Gwchar** e, int b) {
+    return guest_integer_result(bb::libc::parse_signed(s, b), e);
 }
-GUEST_ABI long long hle_wcstoll(const Gwchar* s, Gwchar** e, int b) {
-    return hle_wcstol(s, e, b);
-}
+GUEST_ABI std::int64_t hle_wcstoll(const Gwchar* s, Gwchar** e, int b) { return hle_wcstol(s, e, b); }
 GUEST_ABI Gwchar* hle_wmemcpy(Gwchar* d, const Gwchar* s, std::uint64_t n) {
     if (d && s && n) {
         std::memcpy(d, s, static_cast<std::size_t>(n) * sizeof(Gwchar));
@@ -967,14 +867,6 @@ GUEST_ABI const Gwchar* hle_wmemchr(const Gwchar* s, Gwchar c, std::uint64_t n) 
     }
     return nullptr;
 }
-GUEST_ABI int hle_swprintf(Gwchar* b, std::uint64_t n, const Gwchar* fmt, ...) {
-    if (!b || n == 0) {
-        return 0;
-    }
-    b[0] = 0;
-    (void)fmt;
-    return 0;
-}
 GUEST_ABI int hle_wprintf(const Gwchar*, ...) { return 0; }
 // swscanf: narrow both strings (ASCII data in practice) and defer to vsscanf.
 // %s/%c conversions would need wide targets; they are rejected (return 0).
@@ -997,22 +889,11 @@ GUEST_ABI int hle_swscanf_body(const Gwchar* s, const Gwchar* fmt, SysvVaList* a
     }
     return sysv_vsscanf(ns.c_str(), nf.c_str(), ap);
 }
-GUEST_ABI double hle_wstod(const Gwchar* s, Gwchar** end, long) {
-    std::string tmp;
-    if (s) {
-        for (const Gwchar* p = s; *p && tmp.size() < 64; ++p) {
-            tmp.push_back(static_cast<char>(*p));
-        }
-    }
-    char* e = nullptr;
-    double v = std::strtod(tmp.c_str(), &e);
-    if (end && s) {
-        *end = const_cast<Gwchar*>(s) + (e ? (e - tmp.c_str()) : tmp.size());
-    }
-    return v;
+GUEST_ABI double hle_wstod(const Gwchar* s, Gwchar** end, std::int64_t) {
+    return guest_float_result(bb::libc::parse_wide_float<double>(s), end);
 }
-GUEST_ABI float hle_wstof(const Gwchar* s, Gwchar** end, long) {
-    return static_cast<float>(hle_wstod(s, end, 0));
+GUEST_ABI float hle_wstof(const Gwchar* s, Gwchar** end, std::int64_t) {
+    return guest_float_result(bb::libc::parse_wide_float<float>(s), end);
 }
 
 GUEST_ABI void hle_ios_init() {}
@@ -1025,7 +906,7 @@ GUEST_ABI void hle_locinfo_dtor(void*) {}
 }  // namespace
 
 // The variadic entries: asm shims over bodies that take the guest va_list.
-extern "C" GUEST_ABI int hle_va_printf_body(const char* fmt, SysvVaList* ap) { return sysv_vfprintf(stdout, fmt, ap); }
+extern "C" GUEST_ABI int hle_va_printf_body(const char* fmt, SysvVaList* ap) { return hle_vprintf(fmt, ap); }
 extern "C" GUEST_ABI int hle_va_snprintf_body(char* b, std::uint64_t n, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, n, fmt, ap);
 }
@@ -1033,11 +914,22 @@ extern "C" GUEST_ABI int hle_va_sprintf_body(char* b, const char* fmt, SysvVaLis
     return sysv_vsnprintf(b, ~std::size_t(0), fmt, ap);
 }
 extern "C" GUEST_ABI int hle_va_fprintf_body(FILE* f, const char* fmt, SysvVaList* ap) {
-    return sysv_vfprintf(f ? f : stdout, fmt, ap);
+    return hle_vfprintf(f, fmt, ap);
 }
-extern "C" GUEST_ABI int hle_va_fscanf_body(FILE* f, const char* fmt, SysvVaList* ap) { return sysv_vfscanf(f, fmt, ap); }
+extern "C" GUEST_ABI int hle_va_fscanf_body(FILE* f, const char* fmt, SysvVaList* ap) {
+    return bb::libc::scan_file(f, fmt, ap);
+}
 extern "C" GUEST_ABI int hle_va_sscanf_body(const char* s, const char* fmt, SysvVaList* ap) {
     return sysv_vsscanf(s, fmt, ap);
+}
+extern "C" GUEST_ABI int hle_va_swprintf_body(Gwchar* b, std::uint64_t n, const Gwchar* fmt, SysvVaList* ap) {
+    const int saved_errno = errno;
+    errno = 0;
+    const int r = sysv_vswprintf(b, n, fmt, ap);
+    const int error = errno;
+    errno = saved_errno;
+    if (error == EILSEQ) set_guest_errno_bsd(86);
+    return r;
 }
 extern "C" GUEST_ABI int hle_va_swscanf_body(const Gwchar* s, const Gwchar* fmt, SysvVaList* ap) {
     return hle_swscanf_body(s, fmt, ap);
@@ -1049,6 +941,7 @@ SYSV_VA_ENTRY(hle_sprintf_s, hle_va_snprintf_body, 3, rcx)
 SYSV_VA_ENTRY(hle_fprintf, hle_va_fprintf_body, 2, rdx)
 SYSV_VA_ENTRY(hle_fscanf, hle_va_fscanf_body, 2, rdx)
 SYSV_VA_ENTRY(hle_sscanf, hle_va_sscanf_body, 2, rdx)
+SYSV_VA_ENTRY(hle_swprintf, hle_va_swprintf_body, 3, rcx)
 SYSV_VA_ENTRY(hle_swscanf, hle_va_swscanf_body, 2, rdx)
 
 void hle_register_libc() {
@@ -1247,8 +1140,8 @@ void hle_register_libc() {
     REG_RAW_GS("ldexpf", hle_ldexpf);
     REG_RAW("modf", hle_modf);
     REG_RAW("modff", hle_modff);
-    REG_RAW_GS("_Log", hle_log);
-    REG_RAW_GS("_FLog", hle_logf);
+    REG_RAW_GS("_Log", hle_dinkum_log);
+    REG_RAW_GS("_FLog", hle_dinkum_logf);
     REG_RAW_GS("_FCosh", hle_coshf);
     REG_RAW_GS("_FSinh", hle_sinhf);
     REG_RAW("ldiv", hle_ldiv);

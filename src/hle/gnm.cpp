@@ -484,6 +484,36 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                  static_cast<unsigned long long>(now.pipelines - last.pipelines),
                  static_cast<unsigned long long>(now.transfers - last.transfers),
                  static_cast<unsigned long long>(now.transfer_batches - last.transfer_batches), hle_gnm_flush_reasons().c_str());
+        {
+            // The window's draws by how their pixel shader ran: the share the
+            // lifter (BBHOST_DECOMP) carries.
+            std::uint64_t ps[kDrawPsCount];
+            for (int i = 0; i < kDrawPsCount; ++i) ps[i] = now.draws_ps[i] - last.draws_ps[i];
+            const std::uint64_t shaded = ps[kDrawPsLifted] + ps[kDrawPsTranslated] + ps[kDrawPsFallback];
+            host_log("  pixel shaders: %llu draws lifted (%.1f%%), %llu translated, %llu on the fallback; %llu draws without one",
+                     static_cast<unsigned long long>(ps[kDrawPsLifted]),
+                     shaded ? 100.0 * static_cast<double>(ps[kDrawPsLifted]) / static_cast<double>(shaded) : 0.0,
+                     static_cast<unsigned long long>(ps[kDrawPsTranslated]), static_cast<unsigned long long>(ps[kDrawPsFallback]),
+                     static_cast<unsigned long long>(ps[kDrawPsNone]));
+            // ... and by how their vertex shader ran.
+            std::uint64_t vs[kDrawVsCount], all = 0;
+            for (int i = 0; i < kDrawVsCount; ++i) all += vs[i] = now.draws_vs[i] - last.draws_vs[i];
+            host_log("  vertex shaders: %llu draws lifted (%.1f%%), %llu translated on vertex input, %llu with the fetch shader or tessellation, "
+                     "%llu on the fallback",
+                     static_cast<unsigned long long>(vs[kDrawVsLifted]), all ? 100.0 * static_cast<double>(vs[kDrawVsLifted]) / static_cast<double>(all) : 0.0,
+                     static_cast<unsigned long long>(vs[kDrawVsTranslated]), static_cast<unsigned long long>(vs[kDrawVsOther]),
+                     static_cast<unsigned long long>(vs[kDrawVsFallback]));
+            // ... the last of those by why.
+            if (vs[kDrawVsOther]) {
+                std::string why;
+                for (int i = 0; i < kVsWhyCount; ++i) {
+                    if (const std::uint64_t k = now.draws_vs_why[i] - last.draws_vs_why[i]) {
+                        why += (why.empty() ? "" : ", ") + std::string(host_gpu_vs_why_name(i)) + " " + std::to_string(k);
+                    }
+                }
+                host_log("  vertex shaders the lifter does not take: %s", why.c_str());
+            }
+        }
         if (const std::string arena = hle_gnm_arena_report(); !arena.empty()) host_log("arena:%s", arena.c_str());
         std::string ph;
         for (int i = 0; i < kPhaseCount; ++i) {
@@ -515,6 +545,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         if (!prof.empty()) host_log("  gpu profile:%s", prof.c_str());
         if (const std::string busy = host_gpu_busy_report(); !busy.empty()) host_log("  %s", busy.c_str());
         host_log("  fill: %s", host_gpu_fill_stats().c_str());
+        if (const std::string r = host_gpu_target_copy_report(); !r.empty()) host_log("  %s", r.c_str());
         // The guest's clock reads and sync slow paths a second (hle/kernel.cpp),
         // and the pacing: the frame limiter's margin and spin
         // (engine/frame_rate.cpp), the vblank clock's lateness and the flips'

@@ -25,6 +25,7 @@ struct Block {
     std::uint64_t bytes = 0;
     std::uint32_t type = 0;
     bool limited = false;  // counted against BBHOST_TEST_VRAM_MB
+    bool local = false;    // counted in g_local_bytes
     std::string site;
 };
 std::mutex g_mu;
@@ -36,6 +37,12 @@ std::map<std::uint32_t, std::uint64_t> g_by_type;
 // them fails as a full card's does. 0: no limit.
 std::uint32_t g_limit_types = 0;
 std::uint64_t g_limit_bytes = 0, g_limited_bytes = 0;
+// The memory types of the device-local heap (bb_memory_set_local_types) and
+// what our allocations hold in them: the video memory this process has taken
+// itself, and the report's sites outside it marked "@host", so the report no
+// longer adds host and device memory together.
+std::uint32_t g_local_types = 0;
+std::uint64_t g_local_bytes = 0;
 
 std::string site_name(const char* file, int line) {
     const char* base = file;
@@ -52,6 +59,23 @@ void bb_memory_test_limit(std::uint32_t types, std::uint64_t bytes) {
     std::lock_guard<std::mutex> lk(g_mu);
     g_limit_types = types;
     g_limit_bytes = bytes;
+}
+
+void bb_memory_set_local_types(std::uint32_t types) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_local_types = types;
+}
+
+std::uint64_t bb_memory_local_bytes() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_local_bytes;
+}
+
+bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (limit) *limit = g_limit_bytes;
+    if (used) *used = g_limited_bytes;
+    return g_limit_bytes != 0;
 }
 
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
@@ -77,6 +101,11 @@ VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, cons
         b.type = info->memoryTypeIndex;
         b.limited = limited;
         b.site = site_name(file, line);
+        if (g_local_types) {
+            b.local = ((g_local_types >> b.type) & 1) != 0;
+            if (b.local) g_local_bytes += b.bytes;
+            else b.site += "@host";
+        }
         Site& s = g_sites[b.site];
         s.bytes += b.bytes;
         ++s.count;
@@ -107,6 +136,7 @@ void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCa
             --s.count;
             g_by_type[it->second.type] -= it->second.bytes;
             if (it->second.limited) g_limited_bytes -= it->second.bytes;
+            if (it->second.local) g_local_bytes -= it->second.bytes;
             g_blocks.erase(it);
         }
     }
@@ -123,9 +153,18 @@ std::string bb_memory_sites_report() {
     for (const auto& [t, bytes] : g_by_type) total += bytes;
     std::snprintf(buf, sizeof(buf), " total %llu;", static_cast<unsigned long long>(total >> 20));
     out += buf;
+    if (g_local_types) {
+        std::snprintf(buf, sizeof(buf), " video memory %llu;", static_cast<unsigned long long>(g_local_bytes >> 20));
+        out += buf;
+    }
+    if (g_limit_bytes) {
+        std::snprintf(buf, sizeof(buf), " BBHOST_TEST_VRAM_MB %llu/%llu;", static_cast<unsigned long long>(g_limited_bytes >> 20),
+                      static_cast<unsigned long long>(g_limit_bytes >> 20));
+        out += buf;
+    }
     int n = 0;
     for (const auto& [name, s] : v) {
-        if ((s.bytes < (1ull << 20) && s.us < 1000) || n++ >= 12) continue;
+        if ((s.bytes < (1ull << 20) && s.us < 1000) || n++ >= 16) continue;
         std::snprintf(buf, sizeof(buf), " %s %llu/%llu (%llu, %.1f);", name.c_str(), static_cast<unsigned long long>(s.bytes >> 20),
                       static_cast<unsigned long long>(s.count), static_cast<unsigned long long>(s.calls), s.us / 1000.0);
         out += buf;

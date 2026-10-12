@@ -320,8 +320,10 @@ typedef struct BbHostApi {
     int (*show_message)(const char* text, float seconds);
     /* Game time against real time: 0.5 is slow motion at half speed, 2.0
      * double speed as far as the machine keeps up (clamped to 0.1-4; 1 is
-     * normal). The game advances a fixed step each frame, so this paces the
-     * frames. Any thread. 0 on success. */
+     * normal). At 30 fps the game advances a fixed step each frame, so this
+     * paces the frames; at the other frame rates it scales the step (at most
+     * 1/30 s a frame) and the frames keep their pace. Any thread. 0 on
+     * success. */
     int (*set_time_scale)(float scale);
 
     /* Version 9: settings and actions from the plugin menus, and files. */

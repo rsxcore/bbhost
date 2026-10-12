@@ -18,10 +18,12 @@ patch loader does), then every byte the list changes is kept except:
 Contiguous kept bytes become one site: its address, the bytes the eboot holds there, the bytes the list
 leaves. frame_rate.cpp checks every site's old bytes before writing any.
 
-The 90 file holds only what "90 FPS++" does beyond "60 FPS++": a run of the bytes either list changes is
-kept when any byte in it differs from what the 60 sites leave. At 90 frame_rate.cpp writes the 60 sites,
-then these over them, so the old bytes recorded are the eboot's. The tool checks that each cloth cave reads
-the scalars the 90 list stores at 0x4d3bd00 and that the damping exponent's new load reads 2/3.
+The 90 file holds the cloth's six stiffness caves from "90 FPS++" (1.0): what it does beyond "60 FPS++",
+a run of the bytes either list changes kept when any byte in it differs from what the 60 sites leave,
+less EXCLUDE_90. Above 60 frame_rate.cpp writes the 60 sites, then these over them, so the old bytes
+recorded are the eboot's; it writes the scalars the caves read (0x4d3bd00) itself, every frame. The tool
+checks that each cave reads those scalars. Kyo's 1.3 lists put the caves at 0x5490000 and compute the
+scale there; frame_rate.cpp keeps the 1.0 caves and does the 1.3 arithmetic.
 """
 import os
 import re
@@ -46,6 +48,29 @@ EXCLUDE = [
     (0x2c012cc, 0x2c012de, 'sleep cave'),
     # The same loop's three profiling clock reads skipped: not needed with a host gettimeofday.
     (0x2c0118a, 0x2c0118c, 'profiling'), (0x2c011eb, 0x2c011ed, 'profiling'), (0x2c012ca, 0x2c012cc, 'profiling'),
+    # The ragdoll/clip drive's path B load moved to a converted constant: frame_rate.cpp's kFrameTimeSites
+    # point it at the frame's time instead.
+    (0x1915fab, 0x1915fb3, 'clip step'),
+    # Durations, not steps (a frame count's seconds, two shortest-duration floors): they stay 1/30, as in
+    # Kyo's 1.3 list.
+    (0x4c88688, 0x4c8868c, 'duration'), (0x4cadc08, 0x4cadc0c, 'duration'), (0x4cadd28, 0x4cadd2c, 'duration'),
+    # Seconds the list converted as if they were frames (frame_rate.cpp says what each is): an attack hit's
+    # lifetime from a param frame count, the menu's auto-repeat interval, network timers drained by the
+    # real dt (a sign's refresh, a position record's period, remote objects' lifetimes, a peer's session
+    # protection), and the Havok AI's braking limit in m/s^2.
+    (0x4d28418, 0x4d2841c, 'duration'), (0x4d27720, 0x4d27724, 'duration'),
+    (0x1ca975a, 0x1ca975e, 'duration'), (0x1ca9892, 0x1ca9896, 'duration'), (0x1c9f889, 0x1c9f88d, 'duration'),
+    (0x187305d, 0x1873061, 'duration'), (0x187458d, 0x1874591, 'duration'), (0x18b254d, 0x18b2551, 'duration'),
+    (0x18b382d, 0x18b3831, 'duration'), (0x187afec, 0x187aff0, 'duration'), (0x187b0ad, 0x187b0b1, 'duration'),
+    (0x1880cfd, 0x1880d01, 'duration'), (0x1880e1a, 0x1880e1e, 'duration'), (0x21bb004, 0x21bb008, 'physical'),
+]
+# Left out of the 90 file (Kyo's 1.3 package drops them): the damping exponent's load, the integrator's
+# dt * dt scale (its hook and cave), the fixed 0.0125 turn step, and the scalars (frame_rate.cpp writes them).
+EXCLUDE_90 = [
+    (0xb6fbd4, 0xb6fbd8, 'damping exponent'),
+    (0xb73f84, 0xb73f8d, 'integrator hook'), (0xb73fa8, 0xb73fc1, 'integrator cave'),
+    (0x1cbdb42, 0x1cbdb52, 'turn step'),
+    (0x4d3bd00, 0x4d3bd20, 'cloth scalars'),
 ]
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 CLOTH_SCALARS = 0x4d3bd00  # 4 x constraint stiffness, then 4 x the integrator's acceleration scale
@@ -160,33 +185,22 @@ def main():
     sites90 = [s for s in changed_runs(ninety, orig, ours, also=[a for a, b in after60.items() if b != orig(a)])
                if any(ninety.get(s[0] + k, orig(s[0] + k)) != after60.get(s[0] + k, orig(s[0] + k)) for k in range(s[1]))]
 
-    # The cloth package: every cave's vmulps reads the stiffness scalars, the integrator's reads the
-    # acceleration scale beside them, and the damping exponent's load reads 2/3.
-    def f32_at(a):
-        return struct.unpack('<f', bytes(ninety.get(a + k, orig(a + k)) for k in range(4)))[0]
+    sites90 = [x for x in sites90 if not any(lo <= x[0] < hi for lo, hi, _ in EXCLUDE_90)]
+
+    # The cloth caves: each vmulps reads the stiffness scalars.
     caves = [a for a, n in sites90 if n == 25 and ninety.get(a) == 0xeb and ninety.get(a + 2) == 0xc5]
     for a in caves:
-        if ninety.get(a + 3) == 0xf8:  # vmulps xmm0, xmm0, [rip+d]: c5 f8 59 05 d32
-            t = rip_target(ninety, orig, a + 2, 8, a + 6)
-            if t != CLOTH_SCALARS:
-                raise SystemExit('cave 0x%x reads 0x%x, not the stiffness scalars' % (a, t))
-        else:  # vmulss xmm0, xmm0, xmm0; vmulss xmm0, xmm0, [rip+d]
-            t = rip_target(ninety, orig, a + 6, 8, a + 10)
-            if t != CLOTH_SCALARS + 0x10:
-                raise SystemExit('cave 0x%x reads 0x%x, not the acceleration scale' % (a, t))
-    if len(caves) != 7:
-        raise SystemExit('%d cloth caves in the 90 list, not 7' % len(caves))
-    damping = 0xb6fbd0
-    t = rip_target(ninety, orig, damping, 8, damping + 4)
-    if abs(f32_at(t) - 2.0 / 3.0) > 1e-6:
-        raise SystemExit('the damping exponent at 90 reads %g at 0x%x' % (f32_at(t), t))
-    for k in range(4):
-        if abs(f32_at(CLOTH_SCALARS + 4 * k) - 2.0 / 3.0) > 1e-6 or abs(f32_at(CLOTH_SCALARS + 0x10 + 4 * k) - 1.5) > 1e-6:
-            raise SystemExit('the cloth scalars at 90 are not 2/3 and 1.5')
+        if ninety.get(a + 3) != 0xf8:
+            raise SystemExit('cave 0x%x is not a vmulps' % a)
+        t = rip_target(ninety, orig, a + 2, 8, a + 6)
+        if t != CLOTH_SCALARS:
+            raise SystemExit('cave 0x%x reads 0x%x, not the stiffness scalars' % (a, t))
+    if len(caves) != 6 or len(sites90) != 12:
+        raise SystemExit('%d cloth caves (%d sites) in the 90 list, not 6 (12)' % (len(caves), len(sites90)))
     write_inc(os.path.join(ROOT, 'src/engine/ninety_fps_sites.inc'),
               ['Generated by tools/fps_sites.py from Kyo\'s "90 FPS++" list for 1.09 (shadPS4\'s patch list,',
-               'user/patches/shadPS4/Bloodborne.xml) and the 1.09 eboot: what it does beyond "60 FPS++", written over',
-               'the 60 sites at 90 and uncapped. Address (Binary Ninja), old bytes (the eboot\'s), new bytes.'],
+               'user/patches/shadPS4/Bloodborne.xml, PatchVer 1.0) and the 1.09 eboot: the cloth\'s six stiffness',
+               'caves, written over the 60 sites above 60. Address (Binary Ninja), old bytes (the eboot\'s), new bytes.'],
               sites90, ninety, orig)
 
 

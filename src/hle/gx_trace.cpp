@@ -2596,6 +2596,23 @@ std::uint64_t native_upload(const std::uint64_t* f) {
         !safe_read(res + 0x2c, &width, 2) || !safe_read(res + 0x2e, &height, 2) || !safe_read(res + 8, &memory, 8)) {
         return 0;
     }
+    static const std::uint64_t probe = [] {
+        const char* e = std::getenv("BBHOST_TEX_PROBE");
+        return e ? std::strtoull(e, nullptr, 0) : 0ull;
+    }();
+    if (probe && memory == probe) {
+        std::uint64_t data = 0;
+        std::uint32_t pitch = 0;
+        safe_read(desc, &data, 8);
+        safe_read(desc + 8, &pitch, 4);
+        std::uint64_t head[2] = {};
+        if (data) safe_read(data, head, sizeof(head));
+        host_log("texture probe: 0x%llx GX upload call: type %u %ux%u mips %u format %u subresource %u box %s, rows at 0x%llx pitch %u: "
+                 "%016llx %016llx (flip %llu)",
+                 static_cast<unsigned long long>(memory), type, width, height, mips, fmt, subresource, box ? "given" : "none",
+                 static_cast<unsigned long long>(data), pitch, static_cast<unsigned long long>(head[0]), static_cast<unsigned long long>(head[1]),
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
     if ((type != 2 && type != 3) || !mips || !memory) {
         g_upload_not_2d.fetch_add(1, std::memory_order_relaxed);
         if (type < 8) g_upload_by_type[type].fetch_add(1, std::memory_order_relaxed);

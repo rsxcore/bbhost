@@ -16,6 +16,7 @@
 // Every vkAllocateMemory/vkFreeMemory in the files that include this header
 // is tagged with its site (gpu_memtrack.cpp), so a VRAM report can say which
 // allocation holds what - the question when several instances share a GPU.
+#include <chrono>
 #include <string>
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
                          VkDeviceMemory* out, const char* file, int line);
@@ -25,6 +26,14 @@ std::string bb_memory_sites_report();
 // fail with VK_ERROR_OUT_OF_DEVICE_MEMORY once they would hold more than
 // `bytes` together - a smaller card's video memory acted out on a bigger one.
 void bb_memory_test_limit(std::uint32_t types, std::uint64_t bytes);
+// The memory types of the device-local heap: what our allocations hold in
+// them is counted (bb_memory_local_bytes), and the report's sites outside it
+// are marked "@host".
+void bb_memory_set_local_types(std::uint32_t types);
+std::uint64_t bb_memory_local_bytes();
+// Whether BBHOST_TEST_VRAM_MB acts out a smaller card: its limit, and what
+// our allocations hold against it.
+bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
 #define vkAllocateMemory(d, i, a, m) bb_alloc_memory((d), (i), (a), (m), __FILE__, __LINE__)
 #define vkFreeMemory(d, m, a) bb_free_memory((d), (m), (a))
 
@@ -55,7 +64,11 @@ struct ImageMemory {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize offset = 0, size = 0;
     std::int32_t block = -1;
+    std::uint32_t type = UINT32_MAX;  // the memory type it is in (image_memory_in_vram); UINT32_MAX: not known
 };
+// Whether an image's memory is in video memory (the device-local heap; true
+// when that is not known), and not in host memory for want of it.
+bool image_memory_in_vram(const ImageMemory& m);
 
 constexpr std::uint64_t kChunkBytes = 1ull << gcn::kDmemChunkShift;
 // How far a whole-span import runs on into the next chunk (gpu.cpp map setup).
@@ -120,6 +133,9 @@ struct DevBuffer {
     VkDeviceAddress address = 0;
     void* map = nullptr;
     std::uint64_t size = 0;
+    // A device-local buffer that found video memory full and went to host
+    // memory (create_dev_buffer): read across the bus until it is made again.
+    bool in_host = false;
 };
 
 struct ComputePipeline {
@@ -144,6 +160,7 @@ struct ComputePipeline {
     int fill_dst_sgpr = -1;   // user SGPR of the destination V#
     int fill_cb_sgpr = -1;    // user SGPR of the constant buffer V#
     std::uint32_t fill_cb_dw = 0;  // dword offset of the value in it
+    bool fill_format = false;      // it stores with buffer_store_format_xyzw (through the V#'s format and select)
     // A "copy" shader: buffer_load_format_x from one user-data V# and
     // buffer_store_format_x to another, nothing else. A copy out of a
     // render target becomes an image copy into a snapshot image.
@@ -159,6 +176,7 @@ struct ComputePipeline {
     bool buffer_to_image = false;  // MUBUF load + MIMG store
     int img_src_sgpr = -1;       // the source V#'s user SGPR, for buffer_to_image
     bool untraced_stores_logged = false;
+    bool gds_overlap_checked = false;     // GDS counters: whether a V# of the program covers a counter word, looked at once
 };
 
 // Guest VA -> (VkBuffer, offset) for index buffers.
@@ -276,6 +294,11 @@ struct Gpu {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         bool in_flight = false;
         std::uint64_t serial = 0;  // Gpu::flushes when this slot was submitted
+        // What the submission holds, for the line a wait for it that runs long
+        // writes (fence_wait_locked): the draws, dispatches and tessellated
+        // draws recorded since the submission before, and the flip.
+        std::uint64_t held_draws = 0, held_dispatches = 0, held_tess = 0, held_flip = 0;
+        bool said_stuck = false;  // that line was written for this submission
         std::vector<DevBuffer> garbage;
         std::vector<DevBuffer> staging_chunks;  // the upload staging chunks this slot's uploads are in, each once (Gpu::staging_users)
         std::vector<DevBuffer> scratch_chunks;  // the same for the device-local untile scratch (Gpu::scratch_users)
@@ -353,6 +376,10 @@ struct Gpu {
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
+    // A discrete GPU with under 7.5 GiB of video memory free at the start
+    // (gpu.cpp, small_vram): fewer spares, less scratch, a tessellation ring
+    // that grows as it is needed, display buffers no larger than the start.
+    bool small_vram = false;
     bool has_push_descriptor = false;       // VK_KHR_push_descriptor enabled
     PFN_vkCmdPushDescriptorSetKHR cmd_push_descriptor_set = nullptr;
     // VK_EXT_extended_dynamic_state3's depth clamp (BBHOST_DYNAMIC_DEPTH_CLAMP=0
@@ -429,6 +456,11 @@ struct Gpu {
     std::atomic<std::uint64_t> transfer_batches{0};  // barrier pairs the transfers above needed
     std::atomic<std::uint64_t> rt_replacements{0};   // render targets re-created (each idles the device)
     std::atomic<std::uint64_t> draws{0}, draw_failures{0}, gfx_pipelines{0};
+    // The draws by how their pixel shader ran (DrawPs, gpu.h), beside `draws`.
+    std::atomic<std::uint64_t> draws_ps[4] = {};
+    std::atomic<std::uint64_t> draws_vs[4] = {};  // ... and by how their vertex shader ran (DrawVs)
+    std::atomic<std::uint64_t> draws_vs_why[16] = {};  // kDrawVsOther by why (DrawVsWhy)
+    std::atomic<std::uint64_t> draws_tess[6] = {};     // the host tessellator's draws by lifted stages (DrawTess)
     // Why each failed draw failed (DrawFail), reported at exit beside the total.
     std::atomic<std::uint64_t> draw_fail_why[16] = {};
     // host_gpu_draw calls, and those that returned without drawing (no target, or no colour and no depth write).
@@ -534,6 +566,8 @@ std::string stage_manifest_path();
 // otherwise.
 void precompile_set_loading(bool loading);
 void precompile_set_world_reached();
+// The jobs queued and compiling on the precompile workers.
+std::size_t precompile_backlog();
 
 // gpu.cpp
 bool init_locked();
@@ -549,8 +583,11 @@ void submit_locked();      // submits the current command buffer; waits only for
 // flight retire, oldest first); nothing for one not submitted yet.
 void retire_through_locked(std::uint64_t serial);
 // Waits until submission `serial` has run, retiring nothing: for a recording
-// in progress, which slot cleanup in its middle could disturb.
+// in progress, which slot cleanup in its middle could disturb. A GPU taken
+// for stuck meanwhile (fence_wait_locked) ends the wait; nothing recorded
+// after that goes to the GPU (submit_locked).
 void wait_submission_locked(std::uint64_t serial);
+std::uint64_t render_tess_draws();  // the tessellated draws so far (render.cpp)
 // Copies guest memory as the work being recorded now will see it: the CP writes
 // still queued in unfinished submissions applied on top (Gpu::pending_writes).
 void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out);
@@ -571,7 +608,45 @@ void defer_destroy_image(VkImage image, VkDeviceMemory memory);
 // of 256 MiB blocks instead of one vkAllocateMemory - a kernel call - per
 // texture, which was ~10% of the command processor in frames where new
 // areas streamed in. Larger images get memory of their own.
-bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out);
+// texture: a sampled image or a copy made for one, which the video memory
+// reserve keeps out of the last of video memory (vram_reserve_bytes);
+// otherwise a render target or snapshot, which may take the reserve.
+bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture = false);
+// The video memory this process may still take, in bytes (negative: over
+// budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
+// it, else the driver's budget for the heap less its usage
+// (VK_EXT_memory_budget, read at most every 100 ms), else the budget at the
+// start less what our allocations hold there. Any thread.
+std::int64_t vram_headroom();
+// The video memory kept for render targets, snapshots and device buffers
+// (BBHOST_VRAM_RESERVE_MB; 0: the budget is not followed, as before):
+// textures take no new video memory out of it, the memory keeper makes no
+// spare in it, and the untile scratch takes no new chunk there.
+std::uint64_t vram_reserve_bytes();
+// Whether video memory is down to the reserve (headroom under reserve +
+// `more` bytes); false when the reserve is off.
+bool vram_within_reserve(std::uint64_t more = 0);
+// Textures kept out of the reserve so far (placed in host memory instead).
+std::uint64_t vram_reserve_refusals();
+// Whether what a shortage put in host memory comes back once video memory has
+// room (BBHOST_VRAM_RETURN, on with the reserve): the mirrors, textures,
+// render targets and snapshots, device buffers.
+bool vram_return_on();
+// Whether video memory has `bytes` free above the reserve and `margin`.
+bool vram_room_for(std::uint64_t bytes, std::uint64_t margin = 256ull << 20);
+// The render targets and snapshots in host memory, one a call at most, moved
+// back into video memory (render.cpp; while recording - it records the copy).
+void render_return_targets_locked();
+// Textures in host memory dropped, at most 64 MiB a call, to be made again in
+// video memory at their next bind (textures.cpp).
+void textures_return_from_host_locked();
+// Textures not bound for a while evicted while video memory is down to the
+// reserve and the image heap's blocks are short of room (textures.cpp,
+// BBHOST_VRAM_EVICT_S).
+void evict_cold_surfaces_locked();
+// Free room in the image heap's blocks of video memory (gpu.cpp).
+std::uint64_t image_heap_vram_free_locked();
+std::string vram_return_report();  // the 5-second report's counts
 // Frees `m` with `image` once the recording in progress has retired.
 void defer_destroy_image(VkImage image, const ImageMemory& m);
 std::string image_heap_report();
@@ -672,7 +747,28 @@ std::string untile_gpu_report();
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// A copy of [va, va+bytes) - `loc`, its import, which the mirrors keep in host
+// memory - made for one draw in device memory, in the same uploads; `loc`
+// becomes the copy. False, `loc` unchanged, for a range past 1 MiB, one the
+// GPU writes earlier in this recording, or no room left in the staging chunks.
+bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
+// BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
+// indexed) recorded now, whose arguments are read once its submission is
+// done - the counts GPU work wrote there (the particles' counter copies). Once
+// a second the log says what they held. `counting`: a dispatch whose program
+// counts in GDS.
+void note_indirect_locked(std::uint64_t args_va, int kind, bool counting);
+// indirect_clamp.cpp: an indirect dispatch's arguments (src at src_offset,
+// guest `va`) copied into a ring slot and checked on the GPU in stream order,
+// a count past 65,535 groups a dimension zeroed; the dispatch then reads
+// buffer/offset. False when the check is off (BBHOST_INDIRECT_GUARD=0) or
+// unavailable: read the arguments in place. `name`: the program, logged once
+// if it is ever clamped (when its submission is done).
+bool indirect_clamp_locked(VkBuffer src, VkDeviceSize src_offset, std::uint64_t va, const std::string& name, VkBuffer& buffer,
+                           VkDeviceSize& offset);
+void indirect_clamp_retired_locked(std::uint64_t serial);
+std::string indirect_clamp_report();
 // Diagnostic: describes what the mirror holds for a range and whether a page it
 // is still serving has been written since this recording's check of it.
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n);
@@ -689,6 +785,14 @@ void shadow_budget_locked();
 // it retires, and draws read vertex and index data from host memory from
 // then on.
 void shadow_give_back_locked(Gpu::Slot& slot);
+// Mirrors given back come back once video memory has had room for them a
+// while (vram_return_on). Called at each submission that gave nothing back.
+void shadow_return_locked();
+// The mirrors start over (into `slot`) when a load comes after a shortage of
+// room (the live share). Called at each submission.
+void shadow_flush_at_load_locked(Gpu::Slot& slot);
+// Whether a loading screen is up (host_gpu_set_loading).
+bool loading_screen_now();
 std::string shadow_report();
 std::uint64_t fnv1a(const void* data, std::size_t n, std::uint64_t h = 1469598103934665603ull);
 void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, std::vector<VkWriteDescriptorSet>& writes,
@@ -781,9 +885,47 @@ struct RtImage {
     std::uint64_t fill_va = 0;
     std::uint64_t pending_seen = 0;  // g_pending_gen when apply_pending_clear last scanned for it (render.cpp)
     std::size_t fill_bytes = 0;
+    // The flip it was made at, and the flip and the time (steady clock, ms) a
+    // draw, a fill or a copy last wrote it: its age and order for the reuse
+    // retire (image_reuse_sweep_locked).
+    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0;
+    // How its image was made, to make it again elsewhere (a target that went
+    // to host memory for want of video memory comes back: render_return_targets_locked).
+    VkImageCreateFlags create_flags = 0;
+    VkImageUsageFlags usage = 0;
 };
 // The bytes a target covers in guest memory (render.cpp).
 std::size_t rt_size_bytes(const RtImage& r);
+// Images over memory the game has given to something newer. On the console a
+// render target, a copy's snapshot or a shader-written texture is only memory:
+// when the game frees it and makes a newer object there, the old contents are
+// gone. Here each is an image kept by its guest address, which nothing removed
+// but an image of another shape at the same base - so an area's targets and
+// compute textures stayed after the game had moved on, and device memory
+// climbed with every new place (1080p: +1.5 GiB of image heap over ten
+// places, 4K: a 12 GB card full by the fifth). Once a second
+// (image_reuse_sweep_locked, from the submit) an image no draw, fill or copy
+// has written for BBHOST_IMG_REUSE_IDLE seconds (10), on memory no live GX
+// resource holds whole, goes once a GX resource, target or snapshot made after
+// its last write holds part of its memory. BBHOST_IMG_RETIRE_REUSED=0 keeps
+// them. All under g.mu.
+void image_reuse_sweep_locked();
+struct ReuseRetired {
+    std::uint64_t n = 0, bytes = 0;
+};
+// Each scan goes on from where the last one stopped and stops at `deadline`,
+// so a sweep holds g.mu for a bounded time however many images there are.
+ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
+                                         std::chrono::steady_clock::time_point deadline);  // render.cpp: targets and snapshots
+ReuseRetired textures_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
+                                           std::chrono::steady_clock::time_point deadline);  // textures.cpp: shader-written surfaces
+// Whether a target or snapshot made after `after_flip` (other than `self`)
+// covers part of [va, va + bytes).
+bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip, const RtImage* self);
+// The copies made of the target at `base` for regions a texture read (textures.cpp).
+void textures_drop_rt_regions_locked(std::uint64_t base);
+// The reuse retire's line for the 5-second report.
+std::string image_reuse_report_locked();
 RtImage* find_render_target(std::uint64_t base);
 // The view formats a colour target of `format` is created for (at most 5, the
 // format first): its channel layout's other numeric kinds, which keep RADV's
@@ -1037,6 +1179,12 @@ void copy_versions_put_in_place_locked(int why);
 // covers part of one: put them in place first), or kCopyVersionNone.
 enum { kCopyVersionNone, kCopyVersionInside, kCopyVersionStraddles };
 int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out);
+// Draw captures take a binding's bytes from the guest memory it imports. A
+// binding resolved to a copy of guest memory taken as the draw records (a
+// YEBIS window's, the aligned scratch) is noted with the guest address its
+// first byte stands for (gpu.cpp keeps the last few); 0 when none is noted.
+void note_copy_binding_locked(const VkDescriptorBufferInfo& info, std::uint64_t guest);
+std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range);
 // The bytes of [base, base + bytes) as this point in the stream has them, over
 // `to` (which holds guest memory's): for a snapshot taken as a draw records.
 void copy_versions_overlay_locked(std::uint64_t base, std::uint64_t bytes, std::uint8_t* to);
@@ -1220,8 +1368,14 @@ std::string render_fill_stats();  // " fill-pending=N fill-applied=M"
 // Command-processor pipeline builds so far: [0] translate us, [1] modules us, [2] vkCreateGraphicsPipelines us,
 // [3] stage translations, [4] stages the cache served (with BBHOST_STAGE_CACHE=0: translations whose key was seen before).
 void render_pipeline_time_us(std::uint64_t out[5]);
-// A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst.
-bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes);
+// A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst
+// (or into the target there of its shape); a copy one smaller destination long gets the
+// source's top-left overlap (copy_overlap_locked). `via` names the copy in the log ("copy
+// token", "copy dispatch"); a copy from a target it refuses is counted and logged once per
+// pair (render_target_copy_report).
+bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, const char* via);
+// The 5-second report's line: copies into images, and the ones refused by reason.
+std::string render_target_copy_report();
 
 // ---- recorder.cpp: the command stream (BBHOST_RECORDER, BBHOST_STREAM_SUBMIT) ----
 // The command buffer being recorded, once the recorder has replayed every
@@ -1393,6 +1547,10 @@ public:
     void bind_sets(VkPipelineLayout layout, const VkDescriptorSet sets[2], const std::uint32_t* dynamic = nullptr, bool bindless = false);
     // Constant buffers into set 2 (cb_push_on()): `n` bindings and their ranges.
     void push_buffers(VkPipelineLayout layout, const std::uint32_t* bindings, const VkDescriptorBufferInfo* infos, std::uint32_t n);
+    // One more set at `index`, after bind_sets' (a pipeline's own, past the
+    // shared layout's sets), with up to two dynamic offsets.
+    void bind_stage_set(VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set, std::uint32_t dynamic_count = 0,
+                        const std::uint32_t* dynamic = nullptr);
     void viewport(const VkViewport& vp);
     void scissor(const VkRect2D& sc);
     void depth_bounds(float lo, float hi);

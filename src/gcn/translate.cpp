@@ -20,6 +20,14 @@ std::atomic<bool> g_runtime_sample_offsets{false};
 void set_runtime_sample_offsets(bool on) { g_runtime_sample_offsets.store(on, std::memory_order_relaxed); }
 bool runtime_sample_offsets() { return g_runtime_sample_offsets.load(std::memory_order_relaxed); }
 
+bool tbuffer_dst_sel() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_TBUFFER_DST_SEL");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 std::string translation_switches() {
     // The variables as given rather than what each decides: two spellings of
     // one setting only cost a second entry.
@@ -29,7 +37,10 @@ std::string translation_switches() {
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
                     ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
-    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH"}) s += env(name);
+    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED", "BBHOST_BOUND_STORES",
+                             "BBHOST_TBUFFER_DST_SEL"}) {
+        s += env(name);
+    }
     return s;
 }
 
@@ -49,6 +60,28 @@ namespace {
 using spv::Id;
 
 constexpr std::uint32_t kFetchBias = 0x01000000;  // block offsets of the inlined fetch shader
+
+// BufferBinding::ranged: s_buffer_load at a register offset reads its V#'s
+// binding. BBHOST_CB_RANGED=0: those loads walk the page table instead, as
+// before (without GCN's range check).
+bool ranged_buffers_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CB_RANGED");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+// BufferBinding::written: a dword buffer store through a V# traced to user
+// data, at the V#'s base plus an SGPR or constant offset, writes the V#'s
+// binding in the no-fallback variant (Translator::store_bound).
+// BBHOST_BOUND_STORES=0: every store walks the page table, as before.
+bool bound_stores_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_BOUND_STORES");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 constexpr std::uint32_t kLdsWordsMax = 16384;  // GCN's 64 KiB per workgroup
 
 // COMPUTE_PGM_RSRC2.LDS_SIZE: bits 15..23, in units of 128 dwords. Declaring
@@ -94,6 +127,9 @@ struct Translator {
     Id lds_limit = 0;
     Id lds_patch_ok = 0;  // bool: the window's patch lies inside lds_bytes (0: not checked)
     bool params_head_v4 = false;
+    // TranslateOptions::gds_counters: the params block's member holding
+    // StageParams::gds_counter (0: the program counts nothing in GDS).
+    std::uint32_t gds_member = 0;
     Id p_in_v4f, p_in_v4u, p_in_u32, p_in_f32, p_in_v3u, p_in_bool, p_out_v4f, p_out_f32, p_uc_sampler;
     Id t_fn_main;
 
@@ -196,12 +232,25 @@ struct Translator {
     // (sym_key), or "?" for any other write. A V# bound once per draw is sound
     // only if the definitions of its registers that can reach the load are all
     // that V#'s words (see translate()).
+    //
+    // A copy - s_mov_b32/b64 of an SGPR, a v_readlane_b32 of a spill cell,
+    // and the v_writelane_b32 that fills the cell (a definition of the cell,
+    // kept under cell_def's register number) - records what it copies, and
+    // translate() gives it the key that holds there on every path in
+    // (resolve_copy_keys): a V# that comes back from a spill is the V#.
     struct SgprDef {
         std::uint64_t seq;
         std::string key;
         std::uint32_t block;  // start offset of the block it is in (straight-line: 0)
+        int copy_of = -1;     // a copy: the SGPR or cell (cell_def) it copies
     };
     std::map<int, std::vector<SgprDef>> sgpr_defs;
+    static constexpr int kCellDefBase = 1 << 16;
+    static int cell_def(int vgpr, int lane) { return kCellDefBase + vgpr * 64 + lane; }
+    // The definition write_s just made of `dst` copies `src`.
+    void note_copy(int dst, int src) {
+        if (dst < 104 && !in_smrd_write && !sgpr_defs[dst].empty()) sgpr_defs[dst].back().copy_of = src;
+    }
     std::uint64_t def_seq = 0;
     std::uint32_t cur_block = 0;  // block being emitted, in straight-line and forward-only programs
     std::map<std::uint32_t, std::set<std::uint32_t>> block_succ;  // forward-only programs: each block's successors
@@ -545,10 +594,12 @@ struct Translator {
     // v_cvt_pkrtz_f16_f32's two floats, by the VGPR that holds their pack, for as
     // long as it does and the block that packed them is the current one: a
     // compressed export of the VGPR rounds them (emit_rtz_half) rather than
-    // decoding the pack.
+    // decoding the pack - where the pack was written: under a varying EXEC
+    // (`exec`, the bit its write selected on) only where that bit is set.
     struct PackedPair {
         Id lo, hi;
         std::uint32_t block;
+        Id exec = 0;
     };
     std::map<int, PackedPair> packed_pairs;
     // The device rounds f32 to f16 toward zero itself (native_half_rtz, the
@@ -558,11 +609,13 @@ struct Translator {
     // A float pair rounded toward zero to half precision and back, natively.
     Id native_rtz_pair(Id v2f) { return m.emit(spv::OpFConvert, t_v2f, {m.emit(spv::OpFConvert, t_v2h, {v2f})}); }
     // VGPR write predicated on EXEC (a plain store where the lane bit is known set).
+    Id last_write_exec = 0;  // the EXEC bit the last write_v selected on (0: EXEC known set)
     void write_v(int idx, Id value) {
         if (!lane_syms.empty()) forget_lanes(idx);
         if (!packed_pairs.empty()) packed_pairs.erase(idx);
         const Id var = vgpr_var(idx);
-        m.store(var, exec_known() ? value : m.emit(spv::OpSelect, t_u32, {exec_bit(), value, ld(var)}));
+        last_write_exec = exec_known() ? 0 : exec_bit();
+        m.store(var, last_write_exec ? m.emit(spv::OpSelect, t_u32, {last_write_exec, value, ld(var)}) : value);
     }
     // VALU destination that may be a VGPR (VOP1/2) — same thing, kept for clarity.
     void write_vdst(const Inst& in, Id value) { write_v(in.dst, value); }
@@ -783,6 +836,110 @@ struct Translator {
                                     int n, Id guest_u64) {
         const std::size_t index = buffer_for(path, key, pointer, off_dw + static_cast<std::uint32_t>(n));
         return read_bound(index, reg, cu(off_dw), n, guest_u64);
+    }
+    // n dwords of an s_buffer_load_dword* at a register offset from the V# in
+    // SGPRs [reg, reg + 3], traced to `path` (BufferBinding::ranged). GCN
+    // reads dword (offset >> 2) + k of the V#'s memory - the two low bits of
+    // the byte offset are ignored - and returns 0 for a dword at or past the
+    // end of its range, num_records bytes, times the stride when that is not 0
+    // (vsharp_range_dwords). The host binds the whole range and passes its
+    // dwords as cb_stride; an index past them reads dword 0 of the binding,
+    // in bounds, and the result is replaced by 0. The fallback walk takes the
+    // range from the V#'s own words.
+    std::vector<Id> load_buffer_ranged(const Inst& in, const ResourcePath& path, const std::string& key, Id offset_bytes, int n, Id base_u64) {
+        const int reg = in.src0;
+        const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(n));
+        res.buffers[index].ranged = true;
+        res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
+        buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
+        const Id first = shr(offset_bytes, cu(2));
+        const auto bound_reads = [&] {
+            const Id bias = params_u32(4, index);
+            const Id range_dw = params_u32(5, index);
+            std::vector<Id> vals;
+            for (int k = 0; k < n; ++k) {
+                const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                const Id in_range = ult(at, range_dw);
+                const Id word = m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, iadd(bias, sel(in_range, at, c_zero_u))}));
+                vals.push_back(sel(in_range, word, c_zero_u));
+            }
+            return vals;
+        };
+        if (opt.cb_no_fallback) return bound_reads();
+        std::vector<Id> vars(static_cast<std::size_t>(n));
+        for (Id& v : vars) v = m.local_variable(p_fn_u32, c_zero_u);
+        const Id valid = buffer_bound(index);
+        const Id l_bound = m.fresh(), l_walk = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {valid, l_bound, l_walk});
+        m.label(l_bound);
+        {
+            const std::vector<Id> vals = bound_reads();
+            for (int k = 0; k < n; ++k) m.store(vars[static_cast<std::size_t>(k)], vals[static_cast<std::size_t>(k)]);
+        }
+        m.emit_void(spv::OpBranch, {l_merge});
+        m.label(l_walk);
+        {
+            const Id w1 = read_s(static_cast<std::uint16_t>(reg + 1), in), w2 = read_s(static_cast<std::uint16_t>(reg + 2), in);
+            const Id stride = ubfe(w1, 16, 14);
+            const Id records = m.emit(spv::OpUConvert, t_u64, {w2});
+            const Id bytes = m.emit(spv::OpSelect, t_u64, {ine(stride, c_zero_u), m.emit(spv::OpIMul, t_u64, {records, m.emit(spv::OpUConvert, t_u64, {stride})}), records});
+            const Id range_dw = m.emit(spv::OpShiftRightLogical, t_u64, {m.emit(spv::OpIAdd, t_u64, {bytes, m.const_u64(3)}), m.const_u64(2)});
+            for (int k = 0; k < n; ++k) {
+                const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                const Id in_range = m.emit(spv::OpULessThan, t_bool, {m.emit(spv::OpUConvert, t_u64, {at}), range_dw});
+                const Id byte = m.emit(spv::OpShiftLeftLogical, t_u64, {m.emit(spv::OpUConvert, t_u64, {sel(in_range, at, c_zero_u)}), m.const_u64(2)});
+                const Id word = load_u32_at(m.emit(spv::OpIAdd, t_u64, {base_u64, byte}));
+                m.store(vars[static_cast<std::size_t>(k)], sel(in_range, word, c_zero_u));
+            }
+        }
+        m.emit_void(spv::OpBranch, {l_merge});
+        m.label(l_merge);
+        std::vector<Id> vals;
+        for (Id v : vars) vals.push_back(ld(v));
+        return vals;
+    }
+    // buffer_store_dword* in the no-fallback variant through a V# traced to
+    // user data, with no index and no VGPR offset - the address is the V#'s
+    // base plus soffset (an SGPR or a constant) plus the instruction's offset,
+    // as the particle vertex shaders' copies write it: into the V#'s binding,
+    // which the host binds whole (BufferBinding::ranged, its length in dwords
+    // in cb_stride) and over the guest memory itself (BufferBinding::written:
+    // never a copy). The address is truncated to a dword, as the loads read
+    // it, and a dword at or past the range is not written, as GCN does not
+    // perform a store past num_records. False, with nothing emitted, for any
+    // other store: it walks the page table.
+    bool store_bindable(const Inst& in, ResourcePath& path, std::string& key) {
+        if (!opt.cb_ssbo || !opt.cb_no_fallback || !bound_stores_on() || in.op < 28 || in.op > 31 || in.idxen || in.offen || in.addr64) return false;
+        if (!sym_path(in.srsrc, 4, path) || path.user_sgpr < 0 || path.user_sgpr + 1 >= 16) return false;
+        key = path.str();
+        if (std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), key) != opt.cb_ssbo_exclude.end()) return false;
+        if (const auto it = buffer_index.find(key); it != buffer_index.end() && res.buffers[it->second].indexed) return false;
+        return buffer_index.count(key) || res.buffers.size() < kMaxBuffers;
+    }
+    bool store_bound(const Inst& in, int n) {
+        ResourcePath path;
+        std::string key;
+        if (!store_bindable(in, path, key)) return false;
+        const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(n));
+        res.buffers[index].ranged = true;
+        res.buffers[index].written = true;
+        res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
+        buffer_sites.push_back({in.srsrc, index, sym_key(sym_of(in.srsrc)), sym_key(sym_of(in.srsrc + 1)), def_seq++, cur_block});
+        const Id first = shr(iadd(cu(in.offset12), read_s(in.soffset, in)), cu(2));
+        std::vector<Id> vals;
+        for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
+        exec_guard([&] {
+            const Id bias = params_u32(4, index);
+            const Id range_dw = params_u32(5, index);
+            for (int k = 0; k < n; ++k) {
+                const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                if_then(ult(at, range_dw), [&] {
+                    m.store(m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, iadd(bias, at)}), vals[static_cast<std::size_t>(k)]);
+                });
+            }
+        });
+        return true;
     }
     // StageParams member `member` (an array of 8 dwords in uvec4s), entry `index`.
     Id params_u32(std::uint32_t member, std::size_t index) {
@@ -1179,19 +1336,30 @@ struct Translator {
         switch (op) {
         case 0: {  // v_cndmask_b32: src1 if mask bit else src0
             Id bit = vop3 ? mask_bit(carry_in_pair_lo, carry_in_pair_hi) : vcc_bit();
-            return done_u(sel(bit, s1, s0));
+            // VOP3: the sources' abs and neg modifiers apply, abs first, as to a
+            // float operation's (the compiler writes |a|, |b| and -a, -b forms):
+            // sign-bit operations on the words, which the select passes on.
+            const auto modified = [&](Id x, int k) {
+                if (!vop3) return x;
+                if (md.abs & (1 << k)) x = iand(x, cu(0x7fffffffu));
+                if (md.neg & (1 << k)) x = ixor(x, cu(0x80000000u));
+                return x;
+            };
+            return done_u(sel(bit, modified(s1, 1), modified(s0, 0)));
         }
         case 1: {  // v_readlane_b32 sdst, vsrc, lane
             int cell_lane = 0;
             Id v;
-            if (spill.reads.count(cur_offset) && in.src0 >= 256 &&
-                const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), cell_lane)) {
+            const bool cell = spill.reads.count(cur_offset) && in.src0 >= 256 &&
+                              const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), cell_lane);
+            if (cell) {
                 v = ld(spill_cell(in.src0 - 256, cell_lane));  // a spilled scalar: the cell its v_writelane_b32 filled
             } else {
                 const Id lane_sel = iand(s1, cu(63));
                 v = m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), s0, lane_sel});
             }
             write_s(in.dst, v);
+            if (cell) note_copy(in.dst, cell_def(in.src0 - 256, cell_lane));
             // A spilled scalar coming back (lane_syms): its resource path too.
             int ln = 0;
             if (in.dst < 104 && in.src0 >= 256 && const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln)) {
@@ -1203,11 +1371,13 @@ struct Translator {
         case 2: {  // v_writelane_b32 vdst, ssrc, lane
             const Id lane_sel = iand(s1, cu(63));
             const Id var = vgpr_var(in.dst);
+            packed_pairs.erase(in.dst);  // a lane of it is a scalar now, no pack's
             m.store(var, sel(ieq(lane(), lane_sel), s0, ld(var)));
             int ln = 0;
             if (cur_offset < kFetchBias && !spill.cells.empty() &&
                 const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln) && spill.cells.count({in.dst, ln})) {
                 m.store(spill_cell(in.dst, ln), s0);  // GCN's writelane ignores EXEC: so does the cell
+                sgpr_defs[cell_def(in.dst, ln)].push_back({def_seq++, "?", cur_block, in.src0 < 104 ? static_cast<int>(in.src0) : -1});
             }
             if (const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln)) {
                 const SymVal sv = in.src0 < 104 ? sym_of(in.src0) : SymVal{};
@@ -1309,7 +1479,7 @@ struct Translator {
             const Id v2 = m.emit(spv::OpCompositeConstruct, t_v2f, {lo, hi});
             done_u(native_rtz ? m.emit(spv::OpBitcast, t_u32, {m.emit(spv::OpFConvert, t_v2h, {v2})})
                               : m.ext_inst(t_u32, spv::GlslPackHalf2x16, {v2}));
-            if (exec_known() && export_rtz_on()) packed_pairs[in.dst] = {lo, hi, m.blocks()};
+            if (export_rtz_on()) packed_pairs[in.dst] = {lo, hi, m.blocks(), last_write_exec};
             return true;
         }
         case 48: {  // v_cvt_pk_u16_u32
@@ -1795,6 +1965,7 @@ struct Translator {
             const SymVal sv = in.src0 < 104 ? sym_of(in.src0) : SymVal{};
             write_s(in.dst, S0());
             if (in.dst < 104 && sv.kind != SymVal::Unknown) sym[in.dst] = sv;
+            if (in.src0 < 104) note_copy(in.dst, in.src0);
             break;
         }
         case 4: {
@@ -1806,6 +1977,10 @@ struct Translator {
             if (in.dst < 104) {
                 if (s0.kind != SymVal::Unknown) sym[in.dst] = s0;
                 if (s1.kind != SymVal::Unknown) sym[in.dst + 1] = s1;
+            }
+            if (in.src0 + 1 < 104) {
+                note_copy(in.dst, in.src0);
+                note_copy(in.dst + 1, in.src0 + 1);
             }
             break;
         }
@@ -2063,6 +2238,25 @@ struct Translator {
             as_buffer = std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), path_key) == opt.cb_ssbo_exclude.end() &&
                         (buffer_index.count(cb_key) || res.buffers.size() < kMaxBuffers);
         }
+        // An s_buffer_load at a register offset from a V# traced to user data
+        // reads the V#'s whole range through its binding (load_buffer_ranged).
+        // Not from a V# another load indexes: the two would want cb_stride for
+        // different things.
+        const char* ranged_why = "";
+        bool ranged = false;
+        if (opt.cb_ssbo && !known && !pointer && ranged_buffers_on()) {
+            ranged_why = " at a register offset from an untraced V#";
+            if (sym_path(in.src0, 2, cb_path) && cb_path.user_sgpr >= 0 && cb_path.user_sgpr + 1 < 16) {
+                cb_key = cb_path.str();
+                const auto existing = buffer_index.find(cb_key);
+                ranged_why = std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), cb_key) != opt.cb_ssbo_exclude.end()
+                                 ? " at a register offset, excluded"
+                             : existing != buffer_index.end() ? (res.buffers[existing->second].indexed ? " at a register offset from a V# a load indexes" : "")
+                             : res.buffers.size() >= kMaxBuffers ? " at a register offset past the buffer limit"
+                                                                 : "";
+                ranged = !*ranged_why;
+            }
+        }
         if (in.op < 8) {
             base = read_u64(in.src0, in);
         } else {
@@ -2072,10 +2266,10 @@ struct Translator {
             base = make_u64(w0, iand(w1, cu(0xff)));
         }
         const Id addr = addr_add(base, offset);
-        if (!as_buffer) {
+        if (!as_buffer && !ranged) {
             ResourcePath traced;
             const char* why = !opt.cb_ssbo                         ? " with constant buffers off"
-                              : !known                             ? " at a register offset"
+                              : !known                             ? (*ranged_why ? ranged_why : " at a register offset")
                               : !sym_path(in.src0, 2, traced)      ? " from an untraced base"
                               : traced.user_sgpr < 0 || traced.user_sgpr + 1 >= 16 ? " from outside user data"
                               : pointer && !traced.immediate       ? " through a loaded pointer"
@@ -2083,8 +2277,9 @@ struct Translator {
                                                                    : " excluded";
             note_walk(std::string(pointer ? "s_load" : "s_buffer_load") + why);
         }
-        const std::vector<Id> loaded = as_buffer ? load_buffer_run(cb_path, cb_key, pointer, in.src0, known_off, count, addr)
-                                                 : load_u32_run(addr, count);
+        const std::vector<Id> loaded = ranged      ? load_buffer_ranged(in, cb_path, cb_key, offset, count, base)
+                                       : as_buffer ? load_buffer_run(cb_path, cb_key, pointer, in.src0, known_off, count, addr)
+                                                   : load_u32_run(addr, count);
         in_smrd_write = true;
         for (int k = 0; k < count; ++k) {
             const Id v = loaded[k];
@@ -2136,7 +2331,11 @@ struct Translator {
     }
     void mubuf(const Inst& in) {
         const std::uint32_t op = in.op;
-        if (op < 112) note_walk(mnemonic(in) + buffer_walk_form(in));
+        {
+            ResourcePath path;
+            std::string key;
+            if (op < 112 && !store_bindable(in, path, key)) note_walk(mnemonic(in) + buffer_walk_form(in));
+        }
         if ((op >= 4 && op <= 7) || (op >= 24 && op <= 31) || (op >= 48 && op < 112)) note_store(in);
         auto load_n = [&](int n) {
             const BufferAddr ba = buffer_address(in);
@@ -2144,6 +2343,7 @@ struct Translator {
             for (int k = 0; k < n; ++k) write_v(in.vdata + k, vals[k]);
         };
         auto store_n = [&](int n) {
+            if (store_bound(in, n)) return;
             const BufferAddr ba = buffer_address(in);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
@@ -2168,6 +2368,7 @@ struct Translator {
             const int nv = static_cast<int>(op) - 3;
             std::vector<Id> vals;
             for (int k = 0; k < nv; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
+            vals = store_dst_sel_rt(vals, w3);
             exec_guard([&] { format_store_dynamic(ba.addr, dfmt, nfmt, vals); });
             break;
         }
@@ -2310,6 +2511,43 @@ struct Translator {
         }
         return out;
     }
+    // The data a format store writes through a descriptor's DST_SEL (word 3
+    // bits 11:0): memory component c takes the data component whose select
+    // names it - X..W are 4..7 - the first in x, y, z, w order, and 0 where
+    // none does. It is the inverse of what a load applies (apply_dst_sel_rt),
+    // so a store of what a load returned puts each component back where it
+    // came from. The game's texture upload depends on it: the copy shader GX
+    // runs for a texture created with data (gx_upload_initial_data, e2c27f0c)
+    // loads its source through a V# with the A8 select (0, 0, 0, X) and stores
+    // the (0, 0, 0, a) it gets through a T# with the same select, which on the
+    // console writes a to R. Stored as given, the 4x4 dither texture the hair
+    // and skin alpha test reads came out zero - every partly transparent hair
+    // card cut at an alpha threshold half a unit too high. `data` holds raw
+    // dwords; an identity select (0xfac over the components given) keeps them
+    // as they are, and the selects run only for another (word 3 is uniform).
+    std::vector<Id> store_dst_sel_rt(const std::vector<Id>& data, Id w3) {
+        const int n = static_cast<int>(data.size());
+        std::vector<Id> vars;
+        for (int k = 0; k < n; ++k) {
+            const Id v = m.local_variable(p_fn_u32, c_zero_u);
+            m.store(v, data[static_cast<std::size_t>(k)]);
+            vars.push_back(v);
+        }
+        const std::uint32_t mask = (1u << (3 * n)) - 1;
+        const Id other = m.emit(spv::OpINotEqual, t_bool, {iand(w3, cu(mask)), cu(0xfacu & mask)});
+        if_then(other, [&] {
+            for (int c = 0; c < n; ++c) {
+                Id v = c_zero_u;
+                for (int k = n - 1; k >= 0; --k) {
+                    v = sel(ieq(ubfe(w3, 3 * k, 3), cu(4u + static_cast<std::uint32_t>(c))), data[static_cast<std::size_t>(k)], v);
+                }
+                m.store(vars[static_cast<std::size_t>(c)], v);
+            }
+        });
+        std::vector<Id> out;
+        for (Id v : vars) out.push_back(ld(v));
+        return out;
+    }
     // Writes `n` loaded components to VGPRs vdata.. through the V#'s DST_SEL.
     // Nearly every V# a shader loads through - arrays of constants, instance
     // data - selects X, Y, Z, W: the components go as loaded, and the selects
@@ -2349,13 +2587,12 @@ struct Translator {
     // TranslateOptions::cb_ssbo: a typed load indexed into a V# traced to user
     // data or a table (tbuffer_load_format_* with idxen: arrays of constants)
     // reads the V#'s storage buffer at dword (offset12 + soffset) / 4 + index *
-    // stride / 4, with the stride and word 3 the host passes. The host binds
-    // the V#'s records and leaves the binding unbound when the stride is not in
-    // dwords. False when the load has another shape.
+    // stride / 4, with the stride the host passes. The host binds the V#'s
+    // records and leaves the binding unbound when the stride is not in dwords.
+    // False when the load has another shape.
     const char* indexed_reject = "";  // why indexed_buffer_load declined the last load, for TranslateResult::walks
-    Id cb_w3_spec[kMaxBuffers] = {};   // the specialization constant of each buffer's word 3, once used
-    Id cb_stride_spec[kMaxBuffers] = {};  // and of its stride (kCbStrideSpecId)
-    bool indexed_buffer_load(const Inst& in, std::vector<Id>& comps, Id& w3) {
+    Id cb_stride_spec[kMaxBuffers] = {};  // the specialization constant of each buffer's stride (kCbStrideSpecId)
+    bool indexed_buffer_load(const Inst& in, std::vector<Id>& comps) {
         int count = 0, bits[4] = {};
         const auto reject = [&](const char* why) {
             indexed_reject = why;
@@ -2373,6 +2610,9 @@ struct Translator {
         const std::string key = path.str();
         if (std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), key) != opt.cb_ssbo_exclude.end()) return reject(", excluded");
         if (!buffer_index.count(key) && res.buffers.size() >= kMaxBuffers) return reject(", past the buffer limit");
+        if (const auto it = buffer_index.find(key); it != buffer_index.end() && res.buffers[it->second].ranged) {
+            return reject(", a V# also read at a register offset");  // cb_stride holds its range
+        }
         int total = 0;
         for (int k = 0; k < count; ++k) total += bits[k];
         const int nwords = (total + 31) / 32;
@@ -2389,13 +2629,6 @@ struct Translator {
         // The element's guest address feeds only the fallback walk.
         const Id guest = opt.cb_no_fallback ? m.const_u64(0) : buffer_address(in).addr;
         comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
-        if (opt.cb_no_fallback) {
-            Id& spec = cb_w3_spec[index];  // translate.h kCbW3SpecId
-            if (!spec) spec = m.spec_const_u32(0, kCbW3SpecId + static_cast<std::uint32_t>(index));
-            w3 = sel(ine(spec, c_zero_u), spec, params_u32(6, index));
-        } else {
-            w3 = sel(buffer_bound(index), params_u32(6, index), read_s(in.srsrc + 3, in));
-        }
         return true;
     }
     // A static format's `want` components from the dwords holding one element.
@@ -2586,15 +2819,23 @@ struct Translator {
     void mtbuf(const Inst& in) {
         const int n = (in.op & 3) + 1;
         if (in.op < 4) {
+            // A typed load takes its format from the instruction and the
+            // identity select, whatever the V#'s DST_SEL says (the Sea Islands
+            // ISA's table 8.4: X000, XY00, XYZ0 or XYZW by the format's
+            // components, so a VGPR past them reads 0). BBHOST_TBUFFER_DST_SEL=1
+            // applies the V#'s select instead, as before.
             std::vector<Id> comps;
-            Id w3 = 0;
-            if (!indexed_buffer_load(in, comps, w3)) {
+            if (!indexed_buffer_load(in, comps)) {
                 note_walk(mnemonic(in) + buffer_walk_form(in) + indexed_reject);
                 comps = format_load(buffer_address(in).addr, in.dfmt, in.nfmt, 4);
-                w3 = read_s(in.srsrc + 3, in);
             }
-            const Id is_int = m.const_bool(in.nfmt == 4 || in.nfmt == 5);
-            write_swizzled(in.vdata, n, comps, w3, is_int);
+            if (tbuffer_dst_sel()) {
+                write_swizzled(in.vdata, n, comps, read_s(in.srsrc + 3, in), m.const_bool(in.nfmt == 4 || in.nfmt == 5));
+            } else {
+                int count = 0, bits[4] = {};
+                format_layout(in.dfmt, count, bits);
+                for (int k = 0; k < n; ++k) write_v(in.vdata + k, k < count ? comps[static_cast<std::size_t>(k)] : c_zero_u);
+            }
         } else {
             note_walk(mnemonic(in) + buffer_walk_form(in));
             note_store(in);
@@ -2738,7 +2979,9 @@ struct Translator {
         }
         case 118: write_v(in.dst, rd(iadd(addr, cu(off)))); write_v(in.dst + 1, rd(iadd(addr, cu(off + 4)))); break;
         case 53: {  // ds_swizzle_b32
-            const Id v = read_s(in.src0, in);
+            // Its one operand is the VGPR in the address field; DATA0 is unused
+            // (the game's programs leave it 0, so reading it shuffled v0).
+            const Id v = addr;
             const Id l = lane();
             Id src_lane;
             if (off & 0x8000) {  // quad permute mode
@@ -2757,7 +3000,13 @@ struct Translator {
             break;
         }
         case 61: case 62: {  // ds_consume / ds_append: counter at M0 base + offset
-            const Id base = iadd(ld(v_m0), cu(off));
+            if (in.gds && opt.gds_counters) {
+                gds_counter(in, off);
+                break;
+            }
+            // Off, the whole of M0 was taken for the address (GX's 0x200020 a
+            // dword far past any LDS) and each lane given its rank on top.
+            const Id base = opt.gds_counters ? iadd(iand(ld(v_m0), cu(0xffff)), cu(off)) : iadd(ld(v_m0), cu(off));
             const Id active = exec_cond();
             Id blo, bhi;
             ballot(active, blo, bhi);
@@ -2780,12 +3029,51 @@ struct Translator {
                 m.store(result, r);
             });
             const Id broadcast = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)});
-            write_v(in.dst, in.op == 62 ? iadd(broadcast, rank) : isub(broadcast, iadd(rank, c_one_u)));
+            if (opt.gds_counters) {
+                write_v(in.dst, broadcast);  // GCN hands every lane the value from before; the shader adds its rank
+            } else {
+                write_v(in.dst, in.op == 62 ? iadd(broadcast, rank) : isub(broadcast, iadd(rank, c_one_u)));
+            }
             break;
         }
         default:
             error(std::string("unsupported ") + mnemonic(in));
         }
+    }
+
+    // ds_append / ds_consume in GDS (TranslateOptions::gds_counters): the
+    // counter is the guest word the dispatch bound for the GDS dword at
+    // M0[15:0] + offset (M0[31:16] is the range's size). GCN adds or takes a
+    // wave's active lanes at once and gives every lane the value from before;
+    // here each subgroup does that with one atomic in the word, and the
+    // shader's own v_mbcnt (over the same subgroup's lanes) makes each lane's
+    // index unique. A dword with no word bound does nothing and returns 0.
+    void gds_counter(const Inst& in, std::uint32_t off) {
+        if (!gds_member) {
+            error(std::string(mnemonic(in)) + " in GDS outside a compute program: no counter to bind");
+            return;
+        }
+        ++res.gds_counters;
+        const Id active = exec_cond();
+        Id blo, bhi;
+        ballot(active, blo, bhi);
+        const Id total = iadd(popcnt(blo), popcnt(bhi));
+        const Id addr = iadd(iand(ld(v_m0), cu(0xffff)), cu(off));
+        const Id base = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(3), cu(2)}));  // StageParams::gds_base
+        const Id slot = isub(shr(addr, cu(2)), base);
+        const Id inside = ult(slot, cu(kGdsCounters));
+        const Id at = shl(sel(inside, slot, c_zero_u), c_one_u);  // the address's low dword in the uvec4[4]
+        const Id lo = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(at, cu(3))}));
+        const Id hi = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(iadd(at, c_one_u), cu(3))}));
+        const Id bound = band(inside, ine(ior(lo, hi), c_zero_u));
+        const Id result = m.local_variable(p_fn_u32, c_zero_u);
+        const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+        if_then(band(first, bound), [&] {
+            const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
+            const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
+            m.store(result, r);
+        });
+        write_v(in.dst, m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)}));
     }
 
     // ---- images
@@ -2801,11 +3089,14 @@ struct Translator {
             std::vector<Id> coords;
             for (int k = 0; k < ncoord; ++k) coords.push_back(i(ld(vgpr_var(in.vaddr + k))));
             const Id coord = ncoord == 1 ? coords[0] : m.emit(spv::OpCompositeConstruct, ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : t_v4i, coords);
+            // DMASK names the data components the consecutive VGPRs hold, R
+            // first; the others are 0 (the ISA's MIMG DMASK field: "missing
+            // components get 0"). Then the inverse of the T#'s select.
+            std::vector<Id> raws;
+            for (int k = 0, next = 0; k < 4; ++k) raws.push_back((in.dmask >> k) & 1 ? ld(vgpr_var(in.vdata + next++)) : c_zero_u);
+            raws = store_dst_sel_rt(raws, read_s(in.srsrc + 3, in));
             std::vector<Id> vals;
-            for (int k = 0; k < 4; ++k) {
-                const Id raw = ld(vgpr_var(in.vdata + std::min(k, popcount4(in.dmask) - 1)));
-                vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
-            }
+            for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
             const Id texel = img.kind ? m.emit(spv::OpCompositeConstruct, texel_type(img), vals) : vec4f(vals[0], vals[1], vals[2], vals[3]);
             exec_guard([&] {
                 const Id image = load_image(img);
@@ -3020,7 +3311,6 @@ struct Translator {
         }
         write_texel(in, texel);
     }
-    static int popcount4(std::uint32_t m4) { return ((m4 >> 0) & 1) + ((m4 >> 1) & 1) + ((m4 >> 2) & 1) + ((m4 >> 3) & 1); }
     static std::uint32_t gather_component(std::uint32_t dmask) {
         for (std::uint32_t k = 0; k < 4; ++k) if ((dmask >> k) & 1) return k;
         return 0;
@@ -3061,6 +3351,27 @@ struct Translator {
         if (in.compr) {
             for (int pair = 0; pair < 2; ++pair) {
                 if (!((in.dmask >> (pair * 2)) & 3)) continue;
+                if (const auto pk = packed_pairs.find(in.vsrc[pair]); pk != packed_pairs.end() && pk->second.block == m.blocks() && pk->second.exec) {
+                    // Packed under a varying EXEC: rounded where it was written, the old word decoded elsewhere.
+                    const Id packed = ld(vgpr_var(in.vsrc[pair]));
+                    Id r0, r1, d0, d1;
+                    if (native_rtz) {
+                        const Id r = native_rtz_pair(m.emit(spv::OpCompositeConstruct, t_v2f, {pk->second.lo, pk->second.hi}));
+                        r0 = extract(t_f32, r, 0);
+                        r1 = extract(t_f32, r, 1);
+                        const Id d = m.emit(spv::OpFConvert, t_v2f, {m.emit(spv::OpBitcast, t_v2h, {packed})});
+                        d0 = extract(t_f32, d, 0);
+                        d1 = extract(t_f32, d, 1);
+                    } else {
+                        r0 = emit_rtz_half(m, half_types(), pk->second.lo);
+                        r1 = emit_rtz_half(m, half_types(), pk->second.hi);
+                        d0 = emit_unpack_half16(m, half_types(), iand(packed, cu(0xffff)));
+                        d1 = emit_unpack_half16(m, half_types(), shr(packed, cu(16)));
+                    }
+                    comps[pair * 2] = m.emit(spv::OpSelect, t_f32, {pk->second.exec, r0, d0});
+                    comps[pair * 2 + 1] = m.emit(spv::OpSelect, t_f32, {pk->second.exec, r1, d1});
+                    continue;
+                }
                 if (const auto pk = packed_pairs.find(in.vsrc[pair]); pk != packed_pairs.end() && pk->second.block == m.blocks()) {
                     if (native_rtz) {
                         const Id r = native_rtz_pair(m.emit(spv::OpCompositeConstruct, t_v2f, {pk->second.lo, pk->second.hi}));
@@ -3341,6 +3652,21 @@ struct Translator {
         // the dword after cb_valid): member 3 becomes the uvec4 of both, the
         // same 16 bytes at the same offset.
         params_head_v4 = opt.tess_role != TranslateOptions::TessRole::None && opt.tess_lds_bound;
+        // TranslateOptions::gds_counters: a compute program's counters are the
+        // words StageParams::gds_counter names - member 7, where a vertex
+        // stage keeps its formats - from the GDS dword gds_base (member 3 as
+        // the uvec4 the tessellation stages also read it as).
+        if (opt.gds_counters && opt.stage == Stage::Compute && opt.tess_role == TranslateOptions::TessRole::None && !vertex_w3 &&
+            !patch_cull) {
+            for (const Inst& in : prog.insts) {
+                if (in.enc == Enc::DS && in.gds && (in.op == 61 || in.op == 62)) {
+                    gds_member = static_cast<std::uint32_t>(members.size());
+                    members.push_back(t_bias_arr);
+                    params_head_v4 = true;
+                    break;
+                }
+            }
+        }
         if (params_head_v4) members[3] = t_v4u;
         // TranslateOptions::bindless: StageParams::image_index and
         // sampler_index follow whatever the stage declares, at their own offsets.
@@ -3360,6 +3686,7 @@ struct Translator {
         m.member_decorate(t_ubo, 5, spv::DecOffset, {160});
         m.member_decorate(t_ubo, 6, spv::DecOffset, {224});
         if (vertex_w3 || patch_cull) m.member_decorate(t_ubo, 7, spv::DecOffset, {288});
+        if (gds_member) m.member_decorate(t_ubo, gds_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, gds_counter))});
         if (patch_cull) {
             m.member_decorate(t_ubo, 8, spv::DecOffset, {352});
             m.member_decorate(t_ubo, 9, spv::DecOffset, {368});
@@ -4125,9 +4452,102 @@ struct Translator {
 
 }  // namespace
 
+namespace {
+// Translator::SgprDef: each copy takes the key of what it copies where it
+// runs - the one definition of the source reaching it, or every one reaching
+// it agreeing - or "?" otherwise. The source's value at the program's entry
+// counts as a definition here (user data for a user SGPR, unknown for any
+// other register or a cell), so a path that reaches the copy without one is
+// counted, and a spill of user data is the user data. Copies start unknown
+// and become known only when everything reaching them is, until nothing
+// changes; a copy in a cycle of copies stays unknown. Straight-line programs
+// and guarded blocks (forward-only, or with loops of direct branches, whose
+// back edges the reaching sets follow) only: in the dispatcher's programs
+// copies stay unknown, as every other write.
+// BBHOST_COPY_DEFS=0: every copy is unknown, as before.
+void resolve_copy_keys(Translator& t) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_COPY_DEFS");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return;
+    std::vector<Translator::SgprDef*> copies;
+    for (auto& [reg, defs] : t.sgpr_defs) {
+        for (auto& d : defs) {
+            if (d.copy_of >= 0) copies.push_back(&d);
+        }
+    }
+    if (copies.empty() || (!t.ordered && !t.dag)) return;
+    const int nuser = t.user_sgpr_count();
+    const auto entry_key = [nuser](int reg) { return reg < nuser ? "u" + std::to_string(reg) + "#0" : std::string("?"); };
+    for (int round = 0; round < 64; ++round) {
+        // The keys reaching each block's entry, the entry values included.
+        std::map<std::uint32_t, std::map<int, std::set<std::string>>> in;
+        if (t.dag && !t.block_starts.empty()) {
+            std::map<std::uint32_t, std::map<int, std::pair<std::uint64_t, std::string>>> last_def;
+            for (const auto& [reg, defs] : t.sgpr_defs) {
+                for (const auto& d : defs) {
+                    auto& slot = last_def[d.block][reg];
+                    if (slot.second.empty() || d.seq > slot.first) slot = {d.seq, d.key};
+                }
+            }
+            auto& entry = in[*t.block_starts.begin()];
+            for (const auto& [reg, defs] : t.sgpr_defs) entry[reg].insert(entry_key(reg));
+            for (bool added = true; added;) {
+                added = false;
+                for (std::uint32_t b : t.block_starts) {
+                    std::map<int, std::set<std::string>> out = in[b];
+                    for (const auto& [reg, def] : last_def[b]) out[reg] = {def.second};
+                    for (std::uint32_t s : t.block_succ[b]) {
+                        for (const auto& [reg, keys] : out) {
+                            std::set<std::string>& into = in[s][reg];
+                            const std::size_t before = into.size();
+                            into.insert(keys.begin(), keys.end());
+                            added |= into.size() != before;
+                        }
+                    }
+                }
+            }
+        }
+        bool changed = false;
+        for (Translator::SgprDef* c : copies) {
+            std::set<std::string> keys;
+            const Translator::SgprDef* latest = nullptr;
+            if (const auto it = t.sgpr_defs.find(c->copy_of); it != t.sgpr_defs.end()) {
+                for (const auto& d : it->second) {
+                    if (d.block == c->block && d.seq < c->seq && (!latest || d.seq > latest->seq)) latest = &d;
+                }
+            }
+            if (latest) {
+                keys.insert(latest->key);
+            } else if (t.dag) {
+                const auto bi = in.find(c->block);
+                const auto ri = bi == in.end() ? decltype(bi->second.end()){} : bi->second.find(c->copy_of);
+                if (bi != in.end() && ri != bi->second.end()) {
+                    keys = ri->second;
+                } else if (!t.sgpr_defs.count(c->copy_of)) {
+                    keys.insert(entry_key(c->copy_of));  // never written: its entry value everywhere
+                } else {
+                    keys.insert("?");  // a block no edge reaches
+                }
+            } else {
+                keys.insert(entry_key(c->copy_of));  // straight-line: nothing before it in the one block
+            }
+            const std::string key = keys.size() == 1 ? *keys.begin() : std::string("?");
+            if (key != c->key) {
+                c->key = key;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+}
+}  // namespace
+
 TranslateResult translate(const Program& program, const TranslateOptions& options) {
     Translator t(program, options);
     t.run();
+    resolve_copy_keys(t);
     // A bound V# must hold wherever its loads run. The symbolic tracking
     // follows instruction order, not the control-flow graph. In a straight-line
     // or forward-only program (no inlined fetch shader) instruction order is
@@ -4143,8 +4563,10 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
     // - otherwise they must all be.
     // Elsewhere (the dispatcher loop, the fetch shader's call and return)
     // every definition of those registers must be. A user-data V#'s registers
-    // must not be written where it counts. Failing that, the V# goes back to
-    // the page-table path.
+    // must not be written where it counts, except by a copy of the same user
+    // data. A copy's definition is what it copies (resolve_copy_keys), so a V#
+    // that went through a spill or an s_mov is still the V#. Failing that, the
+    // V# goes back to the page-table path.
     TranslateOptions again = options;
     const bool ordered = t.ordered;
     // Programs of guarded blocks: the definitions reaching each block's entry,
@@ -4197,7 +4619,7 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
                 if (reach && d.block != site_block) continue;
                 if (d.seq < site_seq && (!latest || d.seq > latest->seq)) latest = &d;
             }
-            if (latest && latest->block == site_block) return expect[0] == 'l' && latest->key == expect;
+            if (latest && latest->block == site_block) return expect != "?" && latest->key == expect;
             if (!reach) return true;
             {
                 const auto bi = reach_in.find(site_block);
@@ -4205,14 +4627,14 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
                 const auto ri = bi->second.find(reg);
                 if (ri == bi->second.end()) return true;
                 for (const std::string& key : ri->second) {
-                    if (expect[0] != 'l' || key != expect) return false;
+                    if (expect == "?" || key != expect) return false;
                 }
                 return true;
             }
         }
         for (const auto& d : it->second) {
             if (ordered && d.seq > site_seq) continue;
-            if (expect[0] != 'l' || d.key != expect) return false;
+            if (expect == "?" || d.key != expect) return false;
         }
         return true;
     };

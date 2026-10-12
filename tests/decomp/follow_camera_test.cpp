@@ -18,6 +18,7 @@
 // same; with the three the mouse holds, ours also runs on the game's own
 // bytes holding them by its flag alone.
 #include "decomp/decomp.h"
+#include "engine/frame_rate_step.h"
 #include "engine/mouse_camera.h"
 #include "engine/mouse_camera_step.h"
 #include "engine/mouse_camera_stubs.h"
@@ -447,7 +448,7 @@ int main(int argc, char** argv) {
     g_mouse_camera_resume = 0x183ce67;
     std::memcpy(g_store_game, eboot_kit::at(kTurnStore), sizeof g_store_game);
     for (int i = 0; i < 2; ++i) std::memcpy(g_ramp_game[i], eboot_kit::at(kRampExits[i]), 14);
-    int mouse_frames = 0, held_frames = 0;
+    int mouse_frames = 0, held_frames = 0, original_frames = 0;
     u8* a = block(kCam);
     u8* b = block(kCam);
     u8 gsm_a[0x20], gsm_b[0x20];
@@ -465,9 +466,17 @@ int main(int argc, char** argv) {
         eboot_kit::at(0x183dc97)[0] = sixty ? 0xd6 : 0x57;
         eboot_kit::at(0x183dc97)[1] = sixty ? 0x05 : 0x06;
         eboot_kit::at(0x183dcfe)[0] = sixty ? 0x00 : 0x01;
-        const u32 ease = sixty ? 0x3ccccccdu : 0x3dcccccdu, rate = sixty ? 0x3c89b0c3u : 0x3d088889u;  // engine/frame_rate.cpp
+        const u32 ease = sixty ? 0x3d523176u : 0x3dcccccdu, rate = sixty ? 0x3c89b0c3u : 0x3d088889u;  // engine/frame_rate.cpp at 60
         std::memcpy(eboot_kit::at(0x4d25e68), &ease, 4);
         std::memcpy(eboot_kit::at(0x4d25e94), &rate, 4);
+        // The Camera tuning Original at a frame of 1/30 s (engine/frame_rate.cpp)
+        // on every other camera with the game's sites: the converted path,
+        // with the game's own values and a frame of the rate they are for, so
+        // every weight it converts is the game's and the step must be too.
+        const bool original = !sixty && (c / 5) % 2 == 1;
+        frame_rate_step::g_frame_seconds.store(original ? 1.0f / 30.0f : 0.0f);
+        frame_rate_step::g_camera_tuned_fps.store(original ? 30 : 0);
+        if (original) original_frames += frames;
         // The mouse on odd cameras, at a sensitivity and with axes of its own.
         const bool mouse = c % 2 == 1;
         place_mouse_stubs(mouse);
@@ -578,7 +587,10 @@ int main(int argc, char** argv) {
     }
     place_mouse_stubs(false);
     place_hold_nops(0);
-    std::printf("%s: %d cameras, %d frames, %d differ; %d frames turned by the mouse, %d with auto-rotation held\n", test,
-                cameras, steps, bad, mouse_frames, held_frames);
-    return bad || !mouse_frames || !held_frames ? 1 : 0;
+    frame_rate_step::g_frame_seconds.store(0.0f);
+    frame_rate_step::g_camera_tuned_fps.store(0);
+    std::printf("%s: %d cameras, %d frames, %d differ; %d frames turned by the mouse, %d with auto-rotation held, %d with "
+                "the Original camera tuning at a 1/30 s frame\n",
+                test, cameras, steps, bad, mouse_frames, held_frames, original_frames);
+    return bad || !mouse_frames || !held_frames || !original_frames ? 1 : 0;
 }

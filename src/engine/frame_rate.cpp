@@ -1,5 +1,7 @@
 #include "guest_abi.h"
 #include "engine/frame_rate.h"
+#include "engine/frame_rate_step.h"
+#include "engine/frame_tick.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
@@ -46,24 +48,34 @@ constexpr std::uint8_t kFrameManagerPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 
                                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
 constexpr std::uint32_t kModeSixty = 2;
 
-// The game's pace: 30 (its own), 60 or 90 (a fixed rate, Kyo's "60 FPS++" and
-// "90 FPS++" lists for 1.09 made native), or uncapped (the 90 package with the
-// frame-rate-dependent values following the measured frame time every frame).
-// Kyo's lists are the source: every value and code site below is one of them,
-// checked against the eboot's bytes before anything is written.
+// The game's pace: 30 (its own), a fixed rate (60, 90, 120: the game's mode 2
+// with a 1/fps target), or uncapped (the same with the target the display's
+// refresh rate or 1/240 s). Kyo's FPS++ lists for 1.09 (60 and 90 FPS++ 1.0,
+// and his 1.3 lists with yogesh1239's high-FPS fixes) are the source of most
+// of what follows; every value and code site is checked against the eboot's
+// bytes before anything is written, and each is done natively - values for
+// the rate, loads and in-place rewrites, no new code in the image.
 //
-// The game's fixed steps, converted: every site the "60 FPS++" list gives a
-// float constant, as the value it had and the value it gets at 60. 86 are
-// 1/30 s steps made 1/60, 29 are 30 steps a second made 60; the rest are
-// per-frame weights and decays retuned to the shorter frame (0.1 -> 0.05,
-// 0.95 -> 0.983...). Some are immediates in instructions, some constants in
-// .rodata; each is checked for its old value before anything is written, and
-// one mismatch leaves the game at 30. The list's code rewrites are kSixtySites
-// below. Above 60 almost all of them keep their 60 value - Kyo's 60, 90, 120
-// and uncapped lists all hold 1/60 and 60 there, so they are not a frame's
-// step (Kyo: "the known-good 120 FPS++ block holds 1/60 at these same
-// addresses while running correctly at ~120 fps"); the few that follow the
-// rate are kRated, with the rule each follows.
+// The game's task step is a fixed 1/30 a frame (sub_2418d20's step-info,
+// 0x2418e36); the 60 FPS++ cave (0x2418e3d, sixty_fps_sites.inc) replaces it
+// with the measured frame time clamped to [target, 1/30] and keeps that in a
+// slot (0x575a908) that the steps the game builds for itself read instead of
+// their 1/30 (the list's own loads, and kFrameTimeSites: the physics and AI
+// worlds, the ragdoll/clip drive, grass). What is not a step is converted:
+//
+// The game's fixed steps as values: every site the "60 FPS++" list gives a
+// float constant, as the value it had and the value it gets at 60. 83 are
+// 1/30 s steps made 1/60, 30 are 30 a second made 60; the rest are per-frame
+// weights and decays retuned to the shorter frame (0.1 -> 0.05, 0.95 ->
+// 0.9747...). Some are immediates in instructions, some constants in .rodata;
+// each is checked for its old value before anything is written, and one
+// mismatch leaves the game at 30. The list's code rewrites are kSixtySites
+// below. Above 60 the ones in kRated follow the rate - the .rodata ones written
+// from each frame's time - and the rest keep their 60 value, as Kyo's 90 and
+// 120 lists hold them; that rule was his ("the known-good 120 FPS++ block
+// holds 1/60 at these same addresses while running correctly at ~120 fps"),
+// and the physics world's step (kFrameTimeSites) was one it got wrong, so a
+// site leaves it only once its system is read.
 //
 // Not every 1/30 in the game is a step. A duration the data gives in frames
 // (an event's "wait N frames", a light's fade frames, param fields) becomes
@@ -74,13 +86,27 @@ constexpr std::uint32_t kModeSixty = 2;
 // and set 15 of their constants to 1/60 (halving the durations at 60), and
 // two more conversions (0x4caf1c0, 0x4d27284) to 1/15 (doubling them): one
 // "wait N frames" command ran four times as long by one path as by the
-// other. Kyo's later list leaves them all at 1/30, and so does this table.
-// Three per-frame amounts it also leaves at 1/30 are made per-frame for 60
-// here instead: the debug camera's step (0x1972a80), the target bank's
-// refresh accumulator (0x4d2577c), and a camera smoothing weight
-// (0x4d25e94: 1 - sqrt(1 - 1/30), the same decay over two frames). Two the
-// later list puts back to 1/30 stay 1/60 as this build has always run them:
-// the physics world's step (0x0f383ca) and 0x4d29170's per-call step.
+// other. Kyo's later list leaves them all at 1/30, and so does this table -
+// with three more his 1.3 list (from yogesh1239's timing measurements) puts
+// back: 0x4c88688 (a count of 1/30 s frames in sub_11ca140's rate sums) and
+// the two shortest-duration floors max(t, 1/30) at 0x12f06f1 and 0x12f6992,
+// which at 1/60 let the durations they guard run at half length.
+// Three per-frame amounts the lists leave at 1/30 are made per-frame here
+// instead: the debug camera's step (0x1972a80), the target bank's refresh
+// accumulator (0x4d2577c, read through the frame's time below anyway), and
+// the follow camera's chase-rate ease (0x4d25e94: 1 - (1 - 1/30)^(30 dt)).
+// The physics world's expected minimum step (hkpWorldCinfo, 0x0f383ca) is a
+// tolerance hint at 1/fps; 0x4d29170's step is read by one load the 60 FPS++
+// sites point at the frame's time.
+// Not here: the effects' rate. The effect manager's constructor (sub_26fb190)
+// stores 30.0 at its +0 (the immediate at 0x26fb39f) and the GPU particle
+// update multiplies elapsed seconds by 0x4cad7fc (30.0): both turn effect
+// data, written in 30 fps frames, into seconds - an emitter's interval is its
+// frames / 30 counted down by elapsed time - so they are the data's rate, not
+// the game's. The FPS++ lists set both to 60, which halved every frame-given
+// interval and lifetime of the sfx emitters and ran GPU particles at twice
+// their speed; Dark Souls III on PC, at 60, keeps the same constructor's 30.
+// The FX particle system steps by the frame's time and reads neither.
 struct Constant {
     std::uint32_t at;
     std::uint32_t was, now;  // the eboot's value, and the one at 60
@@ -120,21 +146,10 @@ constexpr Constant kConstants[] = {
     {0x183aa47, 0x3f860a92, 0x3f32b8c2},  // 1.0472 -> 0.698132
     {0x183aa51, 0x3d75c28f, 0x3d23d70a},  // 0.06 -> 0.04
     {0x183aa5b, 0x3e99999a, 0x3e19999a},  // 0.3 -> 0.15
-    {0x187305d, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x187458d, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x187afec, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x187b0ad, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x1880cfd, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x1880e1a, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x18b254d, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x18b382d, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x1972a80, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x1ab67ef, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x1bf9b74, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x1c0ca9a, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x1c9f889, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x1ca975a, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x1ca9892, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x1daa65e, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x1ea4003, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x1ea40a0, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
@@ -183,7 +198,6 @@ constexpr Constant kConstants[] = {
     {0x2012ac4, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x2012c32, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x203acb7, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x21bb004, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x222bcd7, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x23dd026, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x23dede6, 0x41f00000, 0x42700000},  // 30 -> 60
@@ -193,66 +207,45 @@ constexpr Constant kConstants[] = {
     {0x243485f, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x2434883, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x24348b8, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x26fb39f, 0x41f00000, 0x42700000},  // 30 -> 60
+    {0x25df519, 0x3c888889, 0x3c088889},  // 0.0166667 -> 0.00833333
     {0x4befdcc, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4c88688, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4c9f358, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x4cad65c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4cad660, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4cad664, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4cad7fc, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4cadc08, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4cadd28, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4ccc3f4, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4cf6420, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
     {0x4cf6424, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
     {0x4cf6428, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
     {0x4cf642c, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
-    {0x4d02f10, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f14, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f18, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f1c, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f70, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f74, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f78, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f7c, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d0b5b0, 0x3f733333, 0x3f7ba901},  // 0.95 -> 0.983048
-    {0x4d0b5b4, 0x3f733333, 0x3f7ba901},  // 0.95 -> 0.983048
-    {0x4d0b5b8, 0x3f733333, 0x3f7ba901},  // 0.95 -> 0.983048
-    {0x4d0b5bc, 0x3f733333, 0x3f7ba901},  // 0.95 -> 0.983048
     {0x4d2577c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d25e68, 0x3dcccccd, 0x3ccccccd},  // 0.1 -> 0.025
+    {0x4d25e68, 0x3dcccccd, 0x3d523176},  // 0.1 -> 0.0513167 (1 - 0.9^(1/2))
     {0x4d25e94, 0x3d088889, 0x3c89b0c3},  // 0.0333333 -> 0.0168070
     {0x4d265fc, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d26618, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d26c9c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d270e4, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d27554, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d275f4, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d27720, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d27c4c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d27fd4, 0xbdcccccd, 0xbd4ccccd},  // -0.1 -> -0.05
-    {0x4d27fe0, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
-    {0x4d28418, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d28e98, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d29170, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d29b80, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d29e74, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
 };
 
-// The constants above that follow the rate, and how. Each rule reproduces the
-// value Kyo's lists give at 90 and 120, and at 60 the table's own but one
-// (the aerial momentum: below); the rest of the table keeps its 60 value at
-// every rate above 30. `each_frame`: in uncapped
-// mode the value is written again every frame from the frame's seconds (they
-// are .rodata the game reads where it uses them); the others are code
-// immediates or tied to a frame count (0x4cf6420, a tenth of 0x192c405's
-// interval a frame), and take the uncapped mode's reference rate, 90.
+// The constants above that follow the rate, and how; the rest of the table
+// keeps its 60 value at every rate above 30. `each_frame`: .rodata the game
+// reads where it uses it, written again every frame from the frame's seconds
+// at every converted rate (the same clamped frame time the FPS++ cave hands
+// the game's task step: each_frame below), so it follows a frame that ran
+// long as the task step does. The others are code immediates
+// or tied to a frame count (0x4cf6420, a tenth of 0x192c405's interval a
+// frame) and take the rate's value (uncapped: its reference rate, 120).
 enum class Kind : std::uint8_t {
-    Step,    // a frame's seconds: 1 / fps
-    Amount,  // an amount a frame, the game's own at 30 a second: was * 30 / fps
-    Decay,   // a smoothing weight a frame: 1 - (1 - was)^(30 / fps)
-    Keep,    // a share kept a frame: was^(30 / fps), the same share kept a second
+    Step,    // a frame's seconds: dt
+    Amount,  // an amount a frame, the game's own at 30 a second: was * 30 dt
+    Decay,   // a smoothing weight a frame: 1 - (1 - was)^(30 dt)
+    Keep,    // a share kept a frame: was^(30 dt), the same share kept a second
+    Rate,    // a count a second the game wrote as 30 (frames in a second): was / (30 dt)
 };
 struct Rated {
     std::uint32_t at;
@@ -260,38 +253,39 @@ struct Rated {
     bool each_frame;
 };
 constexpr Rated kRated[] = {
-    // The physics world's default step (Kyo's 90: 1/90; his 60 leaves 1/30,
-    // this build has run it at 1/60).
+    // The physics world's expected minimum step (hkpWorldCinfo, sub_f38300):
+    // a tolerance hint, 1/fps (Kyo's 90 and 120: 1/90, 1/120).
     {0x0f383ca, Kind::Step, false},
     // The debug camera's step: a code immediate.
     {0x1972a80, Kind::Step, false},
+    // The ragdoll keyframe controller's drive step (sub_1c0c2b0, an
+    // hkaRagdollRigidBodyController's +0x60, checked > 0 at 0xae461a): the
+    // physics world's step, which now follows the frame.
+    {0x1c0ca9a, Kind::Step, false},
+    // YEBIS's elapsed time once more: the post-process context's +4 (set to
+    // 1/60 here in its initialisation, 0x25df516, and never again) is stored
+    // into CPostEffect+0x6ac every frame (0x25d7e56) after the write of
+    // 0x4d2979c's value (0x25d6af0, kDtLoads), so it is the one the eye
+    // adaptation and afterimage decays read; half a frame, at the rate's value.
+    {0x25df519, Kind::Amount, false},
     // A tenth of the change over 0x192c3ff's 10-frame interval, a frame: it
     // and the interval (kCounts) go together, 1/20 and 20 at 60, 1/30 and 30
-    // at 90.
+    // at 90, 1/40 and 40 at 120.
     {0x4cf6420, Kind::Amount, false},
     {0x4cf6424, Kind::Amount, false},
     {0x4cf6428, Kind::Amount, false},
     {0x4cf642c, Kind::Amount, false},
-    // The aerial momentum kept a frame (vmulps at 0x1e4abca on the X and Z of
-    // a character's body velocity). Kyo's 90 and 120: 0.95^(1/3), 0.95^(1/4),
-    // "so total damping over 1 second matches the original 30fps behavior".
-    // His 60 list holds the 90 value too (his notes call that block "90fps
-    // calibrated"), and 60 keeps it as it has always run; uncapped follows
-    // the rule, so a jump carries as far at any frame rate.
-    {0x4d0b5b0, Kind::Keep, true},
-    {0x4d0b5b4, Kind::Keep, true},
-    {0x4d0b5b8, Kind::Keep, true},
-    {0x4d0b5bc, Kind::Keep, true},
-    // The target bank's refresh accumulator, added to a frame (0x16a4416).
-    {0x4d2577c, Kind::Step, true},
-    // A camera smoothing weight (0x183e2b3: value += (target - value) * w).
+    // The follow camera's distance ease, 0.1 a frame at 30 (0x183af8c); Kyo's
+    // first 60 list held 0.025, half the 60 value (his 1.3: scaled by dt).
+    {0x4d25e68, Kind::Decay, true},
+    // The follow camera's chase-rate ease (0x183e2b3: value += (target - value) * w).
     {0x4d25e94, Kind::Decay, true},
-    // A fade's step down and up a frame, 0.1 at 30 (0x1d084f5..0x1d0854c).
-    {0x4d27fd4, Kind::Amount, true},
-    {0x4d27fe0, Kind::Amount, true},
-    // A per-call step (0x1915fab, moved here by kBytes): 1/fps in Kyo's 90
-    // and 120 lists.
-    {0x4d29170, Kind::Step, true},
+    // The per-frame values that were here (the sprint's wall test, remote
+    // characters' locomotion, the hitbox velocity, the targeting ring, the
+    // bone impulse, the UI steps, the ghosts' fade, YEBIS's frame time,
+    // momentum, the sprint ramps and the slope slide) are read through
+    // kDtLoads' slots instead; 0x4d2577c and 0x4d29170, whose loads the 60
+    // FPS++ sites point at the frame-time slot, need nothing.
 };
 constexpr bool rated_in_constants() {
     for (const Rated& r : kRated) {
@@ -312,8 +306,8 @@ static_assert(rated_in_constants(), "every rated value is one of kConstants (its
 // +0x8d4 (sub_2bf67f0, strtol base 10; the engine's own default is 16666).
 // Bloodborne ships 33333: at 60 the game posts two frames of sound requests
 // per update, and some attack sounds played half as often as at 30
-// (2026-09-30). The digits, in place: one update a frame at 60
-// and 90, and at the uncapped mode's 240 (04166).
+// (2026-09-30). The digits, in place: one update a frame at every rate, and
+// at the uncapped mode's 240 (04166).
 enum class Count : std::uint8_t {
     Frames,  // was * fps / 30
     Micros,  // was * 30 / fps
@@ -332,18 +326,17 @@ constexpr Counted kCounts[] = {
     {0x4b33c51, 5, 33333, Count::Digits},
 };
 
-// And the same at every rate: one load moved from a 1/30 constant that stays
-// 1/30 for its other readers to one kConstants converts (0x1915fab), and the
-// frame-time manager's catch-up allowance zeroed (its movabs rcx, 0x1e0000000n
-// into +0x268/+0x26c) - inside the function ours replaces, where it only
-// matters with BBHOST_FRAME_SOURCE=0.
+// And the same at every rate: the frame-time manager's catch-up allowance
+// zeroed (its movabs rcx, 0x1e0000000n into +0x268/+0x26c) - inside the
+// function ours replaces, where it only matters with BBHOST_FRAME_SOURCE=0.
+// (A load of the ragdoll/clip drive's step was moved here to a converted
+// constant until 2026-10-10; kFrameTimeSites reads the frame's time there.)
 struct Bytes {
     std::uint32_t at;
     std::uint8_t n;
     std::uint8_t was[10], now[10];
 };
 constexpr Bytes kBytes[] = {
-    {0x1915faf, 4, {0xb1, 0x03, 0x41, 0x03}, {0xbd, 0x31, 0x41, 0x03}},
     {0x2434863, 10, {0x48, 0xb9, 0x01, 0, 0, 0, 0x1e, 0, 0, 0}, {0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0}},
     {0x2434887, 10, {0x48, 0xb9, 0, 0, 0, 0, 0x1e, 0, 0, 0}, {0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0}},
 };
@@ -359,7 +352,9 @@ constexpr Bytes kBytes[] = {
 //    cloth and jumping fixes at 60 to these). The target is ours (1/60, 1/90,
 //    or the uncapped limit), so this is what makes 90 and uncapped real time;
 //  - two runs of parameter reads (0x183ff29, 0x1840799, beside the camera's
-//    field-of-view clamp) replaced by stores of the list's 60 fps values;
+//    field-of-view clamp) replaced by stores of the list's 60 fps values, and
+//    two edits in the camera's update (0x183dc97, 0x183dcfe) - left out with
+//    the Camera tuning Original (kKyoCameraSites);
 //  - a few constants and table bytes (0x47df586, 0x3abc2xx), the cloth's
 //    substep count forced to 1 (0xb6e67a: Kyo's "the part files were authored
 //    at 30 fps with 2 substeps: a rate of 60"), the motion blur's sample
@@ -379,35 +374,225 @@ constexpr Site kSixtySites[] = {
 #include "engine/sixty_fps_sites.inc"
 };
 
-// What Kyo's "90 FPS++" does beyond that, written over it at 90 and
-// uncapped (tools/fps_sites.py). At 90 one cloth substep is a solver rate of
-// 90 against the 60 the part files were authored for, and Kyo's package takes
-// up the ratio: the six hcl constraint operators multiply their stiffness by
-// 2/3 (a cave each in a dead hkMonitorStream timer block, its guard JAE made
-// a JMP), the damping exponent powf(1-A, E) reads 2/3 (0xb6fbd4), and the
-// integrator's dt * dt is multiplied by 1.5 (0xb73f84) so the cloth hangs as
-// low. The scalars are 32 bytes at 0x4d3bd00, over the tail of an assert
-// message's file name and its text ("DLLightMutex.cpp", "Mutex is no"), read
-// only when a mutex assert fires. And the character turn's step is a fixed
-// 0.0125 (0x1cbdb42, Kyo's 90 value) instead of the frame's.
-constexpr Site kNinetySites[] = {
+// Steps the lists left fixed, made to read the frame's time - the clamped
+// measured frame time the 60 FPS++ cave keeps in its slot (0x575a908) every
+// frame, what the game's task step is at every converted rate. Applied with
+// the 60 FPS++ sites (the slot is theirs) at every rate. Each found by Kyo's
+// 1.3 lists and yogesh1239's Timing and AI/Camera fixes (min(dt, 1/30) in
+// caves at 0x5490000) except the physics world, and done here as loads and
+// in-place rewrites, no new code: Binary Ninja addresses, the eboot's bytes,
+// ours.
+constexpr Site kFrameTimeSites[] = {
+    // NS_SPRJ::SprjTargetBankManager::Update's refresh accumulator:
+    // vaddss xmm0, xmm0, [0x4d2577c -> the slot].
+    {0x016a4416, "c5fa58055e136803", "c5fa5805ea640b04"},
+    // The ragdoll/clip drive (sub_1915ec0, from ChrIns::vfunc_34) hands its
+    // three players a step of 1/30 s a call (about 220 calls a second near
+    // enemies): yogesh1239 measured those clocks at 2.0 and 4.0 s a second at
+    // 60 and 120. Path B (to 0x1c11650) and path C (to 0x1c0df90):
+    // vmovss xmm0, [0x4d26364 -> the slot].
+    {0x01915fab, "c5fa1005b1034103", "c5fa10055549e403"},
+    {0x01916030, "c5fa10052c034103", "c5fa1005d048e403"},
+    // Path A (to 0x1c11040) uses the same 1/30 first to turn a frame count
+    // into seconds - which must stay 1/30 - and then as the step. Before:
+    // vcvtsi2ss xmm1,xmm0,ecx; vmovss xmm0,[1/30]; vmulss xmm1,xmm1,xmm0;
+    // mov rdi,[rbx+0x20]; mov eax,[rax+0x1e1]; test al,4; sete al; movzx
+    // ecx,al; mov rsi,r14; mov rdx,r15; add rsp,8. After: mov rdi,[rbx+0x20];
+    // vcvtsi2ss xmm1,xmm0,ecx; vmulss xmm1,xmm1,[1/30]; vmovss xmm0,[slot];
+    // xor ecx,ecx; test byte [rax+0x1e1],4; sete cl; mov rsi,r14;
+    // mov rdx,r15; pop rax (the prologue's alignment push); nop.
+    {0x01915f65, "c5fa2ac9c5fa1005f3034103c5f259c8488b7b208b80e1010000a8040f94c00fb6c84c89f64c89fa4883c408",
+     "488b7b20c5fa2ac9c5f2590def034103c5fa10058b49e40331c9f680e1010000040f94c14c89f64c89fa5890"},
+    // SprjHkAiManager's Havok AI world step (sub_222bc10): the step-info
+    // {0x56efd40, 1/30} it passes to 0x21cdad0 (hkaiWorld's character and
+    // behaviour step). The lists run it at 1/60 at every rate - enemy steering
+    // 1.5 times as fast at 90. Before: lea rcx,[0x56efd30]; add rcx,0x10;
+    // mov [rbp-0x1c0],rcx; mov dword [rbp-0x1b8],1/30. After: lea
+    // rcx,[0x56efd40]; mov [rbp-0x1c0],rcx; mov ecx,[slot];
+    // mov [rbp-0x1b8],ecx; nop2 (rcx is not an argument of the call).
+    {0x0222bcbf, "488d0d6a404c034883c11048898d40feffffc78548feffff8988083d",
+     "488d0d7a404c0348898d40feffff8b0d35ec5203898d48feffff6690"},
+    // The Havok physics world's step (sub_1bf99d0: hkpWorld's multithreaded
+    // step through sub_f5a2e0 and sub_f5b100, a step-info whose dt is 1/30):
+    // every list held 1/60 at every rate (Lance McDonald's uncapped list alone
+    // reads the frame time, capped at 1/60), so rigid bodies, ragdolls and
+    // breakables ran 1.5 times as fast at 90 and twice at 120. Before:
+    // mov qword [rbp-0x40],0 (dead: the next store fills it); mov dword
+    // [rbp-0x48],1/30. After: mov eax,[slot] (rax is loaded next);
+    // mov [rbp-0x48],eax; nop6.
+    {0x01bf9b69, "48c745c000000000c745b88988083d", "8b05990db6038945b8660f1f440000"},
+    // Grass sway (sub_2713870): with the GX device's +0x100 at 1 it steps a
+    // fixed 1/60 a frame (the 60 FPS++ sites already point its other path at
+    // the slot): vmovss xmm4, [0x4d29e70 -> the slot].
+    {0x02713d8d, "c5fa1025db606102", "c5fa1025736b0403"},
+};
+
+// The play time (GameDataMan+0x94, milliseconds: the save list's clock and
+// the play log's): NS_SPRJ::MoveMapStep::InGameUpdate adds the frame's step
+// to it in whole milliseconds, truncated - (int)(dt * 1000) - so a 16.7 ms
+// frame adds 16 and the clock runs 4% slow at 60 and 120 (1% at the game's
+// own 30 and at 90, 14% at 144 Hz uncapped). At a converted rate it adds a
+// count of ours instead: the same step (the 60 FPS++ cave's
+// min(max(measured, target), 1/30)) in milliseconds with the remainder
+// carried, written by our SprjFlipper::Update every frame into the image's
+// tail (core/elf.h). Before: vmulss xmm0,xmm1,[1000.0]; vcvttss2si
+// rcx,xmm0. After: mov ecx,[count]; nop7 - xmm1 (the step) is what the code
+// after reads, and xmm0 is written before it is read again.
+// (NS_SPRJ::GameDataMan::AccumulatePlayTime, 0x18eb6a0, is the same code out
+// of line; nothing calls it.)
+constexpr std::uint32_t kPlayTimeAdd = 0x1d419d6;
+constexpr char kPlayTimeAddWas[] = "c5f259051267fe02c4e1fa2cc8";
+static_assert(sizeof(kPlayTimeAddWas) - 1 == 2 * 13, "the add and its replacement are 13 bytes");
+
+// The task step itself: the 60 FPS++ cave (0x2418e3d, as kSixtySites writes
+// it) computes it as movss xmm0,[rbx+0x264]; maxss xmm0,[rbx+0x18]; minss
+// xmm0,[1/30] - the flipper's measured frame time clamped to [target, 1/30]
+// - and stores it into the step-info and the slot. With our
+// SprjFlipper::Update the cave loads ours instead (movss xmm0,[step]; nop8;
+// nop5), written every frame in the image's tail just before the cave runs:
+// the same clamp, times a plugin's time scale (frame_rate_set_time_scale),
+// at most 1/30. Above 30 everything steps by that step, so slow motion
+// scales the step rather than stretching the frames.
+constexpr std::uint32_t kStepLoad = 0x2418e3d;
+constexpr char kStepLoadWas[] = "f30f108364020000f30f5f4318f30f5d0512d59002";
+static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions are 21 bytes");
+
+// The Camera tuning option (host/options.cpp camera_tuning;
+// BBHOST_CAMERA_TUNING=fps++|original), read when the game starts. FPS++
+// keeps Kyo's retune of the follow camera from his 60 FPS++ list, as bbhost
+// always has: his parameter stores (0x183ff29, 0x1840799, kSixtySites), the
+// constructor's defaults (kConstants 0x183a4c3..0x183aa5b, the halved chase
+// rates and a 40 degree direct pitch angle) and two edits in the camera's
+// update (0x183dc97, the jump past the chase-rate pick; 0x183dcfe, the wall
+// escape when neither probe hits), with its weights converted from a 60 fps
+// frame (frame_rate_step::g_camera_tuned_fps). Original leaves all of those
+// as the game has them and converts the game's own weights from a 30 fps
+// frame - the camera of the game at 30 at every rate. At 30 nothing here is
+// written: the camera is the game's either way (Kyo's 30 FPS++ list, a
+// separate retune with stale values, was never applied).
+constexpr std::uint32_t kKyoCameraSites[] = {0x183dc97, 0x183dcfe, 0x183ff29, 0x1840799};
+constexpr std::uint32_t kKyoCameraFirst = 0x183a4c3, kKyoCameraLast = 0x183aa5b;  // the constructor's immediates
+bool kyo_camera_site(std::uint32_t at) {
+    return std::find(std::begin(kKyoCameraSites), std::end(kKyoCameraSites), at) != std::end(kKyoCameraSites);
+}
+bool kyo_camera_constant(std::uint32_t at) { return at >= kKyoCameraFirst && at <= kKyoCameraLast; }
+
+// Redirected loads: a constant the game reads where it means "a frame" - a
+// weight or a share kept a frame, an amount a frame, a step, a count a
+// second - is read from a slot of ours instead, in the image's tail
+// (core/elf.h), which each frame's seconds rewrite. The instruction's rip
+// displacement is pointed at the slot; the constant itself stays the game's.
+// So a constant other code reads with another meaning (a duration, a unit)
+// keeps it, no page of .rodata is written while the game runs, and any rate -
+// one that moves every frame too - converts exactly. The table,
+// engine/frame_rate_dt_loads.inc, is generated by tools/dt_loads.py from
+// tools/dt_loads.txt and the eboot: each instruction's bytes and its
+// displacement's target are checked first, and one mismatch leaves the whole
+// table out. Kinds as kRated's; an Amount may be negative (a timer counted
+// down a fixed amount a call).
+struct DtLoad {
+    std::uint32_t insn;      // the instruction (Binary Ninja address)
+    std::uint8_t len, disp;  // its length and where its 4-byte rip displacement is
+    std::uint32_t constant;  // the value it reads (.rodata or .data)
+    Kind kind;               // how that value follows the frame's time
+    std::uint8_t lanes;      // 1 (a dword), 2 (a qword), 4 (an xmmword)
+    const char* bytes;       // the instruction as the eboot has it
+};
+//
+// What it holds (each with its reader in the .inc):
+//  - kept shares a frame: the movement controller's momentum (0.95 a frame on
+//    the body's X/Z, chr_motion_physics_update; 0.95^(30 dt) keeps a jump's
+//    reach at any rate), the sprint wall test's ramps (x0.8 blocked, x1.2
+//    free), CSSlopeCtrl's slope fall damping (0.65, a .data tunable);
+//  - amounts a frame: the slope fall speed (1.0, .data), the replay ghosts'
+//    fade (+-0.1), YEBIS's frame time (half a 30 fps frame: the eye
+//    adaptation's), a state-table fade (+-0.05 at 0x1d3251e/0x1d3259b), and
+//    SprjWorldAiManager::TickLua's timer (-1/30 a call before a full GC of
+//    the AI Lua state: every 0.25 s at 60, 0.125 s at 120 until now);
+//  - rates (a distance this frame times 30 is a speed: 1/dt): the sprint's
+//    wall test (blocked under 1 unit a second; at 60 a sprint from rest
+//    started blocked), remote characters' locomotion (NetAIManipulator's 2.5,
+//    NetworkManipulator's 0.01/2/6: at 60 a remote player never showed the
+//    dash), the attack hitbox velocity (two 4-lane vectors), a physics-driven
+//    bone's impulse (close the gap in one physics step), the targeting ring's
+//    slot (x30) and overflow (/30);
+//  - steps: the equipment screen's character preview, the shop's tab
+//    animation.
+constexpr DtLoad kDtLoads[] = {
+#include "engine/frame_rate_dt_loads.inc"
+};
+constexpr bool dt_loads_apart() {
+    for (const DtLoad& d : kDtLoads) {
+        for (const Constant& c : kConstants)
+            if (c.at >= d.constant && c.at < d.constant + 4u * d.lanes) return false;
+    }
+    return true;
+}
+static_assert(dt_loads_apart(), "a redirected constant is not also rewritten in place (kConstants)");
+
+// The cloth above 60 (tools/fps_sites.py, from Kyo's "90 FPS++"). With one
+// substep a frame (0xb6e67a above) the hcl solver runs at the frame rate,
+// against the 60 the part files were authored for (30 fps, 2 substeps), and
+// the six constraint operators' stiffness takes up the ratio: each gets a
+// cave in a dead hkMonitorStream timer block (its guard JAE made a JMP) that
+// multiplies the stiffness it is called with (lane 0, which the operator
+// broadcasts) by the scalars at 0x4d3bd00 - written over the tail of an
+// assert message's file name ("DLLightMutex.cpp"), read only when a mutex
+// assert fires. The scalar is (60 dt)^2, at most 1, every frame: Kyo's 1.3
+// package (4/9 at 90, 1/4 at 120). His first package multiplied by 60 dt and
+// also changed the damping exponent (0xb6fbd4) and the integrator's dt * dt
+// (0xb73f84); 1.3 leaves both as the game has them, and so does this table.
+// His first 90 list also fixed the character turn's step at 0.0125
+// (0x1cbdb42) - turns 12.5% fast at 90 - which 1.3 drops: the turn steps by
+// the frame's time, as at every other rate.
+constexpr Site kClothSites[] = {
 #include "engine/ninety_fps_sites.inc"
 };
 
-// Uncapped: Kyo's 90 package, but the turn steps by the frame's real time as
-// at 60 (Kyo's uncapped list leaves 0x1cbdb42 too), and the damping
-// exponent reads the stiffness scalar - the two are the same ratio, 60 / fps,
-// which uncapped_each_frame writes there every frame.
-constexpr std::uint32_t kNinetyNotUncapped[] = {0x1cbdb42};
-constexpr Site kUncappedSites[] = {
-    {0x00b6fbd4, "70350404", "28c11c04"},  // vmovss xmm0, [0x4d3bd00]: 0xb6fbd8 + 0x41cc128
-};
-constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x stiffness and damping exponent, then 4 x acceleration scale
+// No redirected load is an instruction another table rewrites (the 60 FPS++
+// list points some loads at the frame-time slot; those constants are dead).
+constexpr std::size_t hex_len(const char* h) {
+    std::size_t n = 0;
+    while (h[n]) ++n;
+    return n / 2;
+}
+template <std::size_t N>
+constexpr bool dt_loads_clear_of(const Site (&sites)[N]) {
+    for (const DtLoad& d : kDtLoads) {
+        for (const Site& site : sites) {
+            if (d.insn < site.at + hex_len(site.was) && site.at < d.insn + d.len) return false;
+        }
+    }
+    return true;
+}
+static_assert(dt_loads_clear_of(kSixtySites) && dt_loads_clear_of(kFrameTimeSites) && dt_loads_clear_of(kClothSites),
+              "a redirected load is not rewritten by another table");
+constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x the stiffness scale
+constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't', 'M', 'u', 't', 'e', 'x', '.', 'c', 'p', 'p'};
 
 // The uncapped mode: the game's frame limit and the reference rate for what
-// cannot follow the frame time (code immediates, frame counts).
+// cannot follow the frame time (code immediates, frame counts) - Kyo's
+// uncapped list takes 120's values too.
 constexpr int kUncappedMaxFps = 240;
-constexpr int kUncappedReferenceFps = 90;
+constexpr int kUncappedReferenceFps = 120;
+
+// The rates the Frame rate option offers besides 30 and uncapped
+// (host/options.cpp, engine/option_menu.cpp, host/launcher.cpp list the
+// same): each runs the game's mode 2 with a 1/fps target.
+constexpr int kFrameRates[] = {60, 90, 120};
+
+// A frame rate as one of the modes: 30, a converted rate, or 0 (uncapped).
+// Another number takes the nearest mode below it.
+int mode_of(int fps) {
+    if (fps <= 0) return 0;
+    int mode = 30;
+    for (const int r : kFrameRates) {
+        if (fps >= r) mode = r;
+    }
+    return mode;
+}
+
+std::string mode_name(int fps) { return fps == 0 ? std::string("uncapped") : std::to_string(fps); }
 
 std::vector<std::uint8_t> hex_bytes(const char* h) {
     std::vector<std::uint8_t> out;
@@ -438,6 +623,7 @@ float rated_value(Kind kind, float was, double fps) {
         case Kind::Amount: return static_cast<float>(static_cast<double>(was) * 30.0 / fps);
         case Kind::Decay: return static_cast<float>(1.0 - std::pow(1.0 - static_cast<double>(was), 30.0 / fps));
         case Kind::Keep: return static_cast<float>(std::pow(static_cast<double>(was), 30.0 / fps));
+        case Kind::Rate: return static_cast<float>(static_cast<double>(was) * fps / 30.0);
     }
     return was;
 }
@@ -471,12 +657,13 @@ void count_was(const Counted& c, std::uint8_t* out) {
     std::memcpy(out, &c.was, c.n);
 }
 
-// The game's pace: 30, 60, 90, or 0 for uncapped.
+// The game's pace: 30, a converted rate (60, 90, 120), or 0 for uncapped.
 int g_game_fps = 30;
-std::size_t g_sites_applied = 0, g_ninety_applied = 0;
+std::size_t g_sites_applied = 0, g_frame_time_applied = 0, g_cloth_applied = 0;
 std::atomic<std::uint64_t> g_frames{0};
-// Uncapped: where the every-frame values go, what each started from, and the
-// frame time the cloth's scalars follow (smoothed over ~10 frames).
+// The every-frame values (kRated's each_frame) at every converted rate: where
+// each goes and what it started from; above 60 the cloth's stiffness scale,
+// over a frame time smoothed across ~10 frames so a hitch does not jolt it.
 struct EachFrame {
     std::uint64_t va;
     float was;
@@ -484,12 +671,24 @@ struct EachFrame {
 };
 std::vector<EachFrame> g_each;
 std::uint64_t g_cloth_va = 0;
-// Their pages, made writable at install and again on the first frame, after
-// every other installer (one that put a page back to read-only would make
-// the first store fault).
-std::vector<std::uint64_t> g_each_pages;
-GuestMemory g_each_mem;
-float g_cloth_dt = 1.0f / static_cast<float>(kUncappedReferenceFps);
+float g_cloth_dt = 1.0f / 60.0f;
+// The play time's count (kPlayTimeAdd) and the part of a millisecond carried.
+std::uint64_t g_play_ms_va = 0;
+double g_play_ms_carry = 0.0;
+// The task step the cave loads (kStepLoad); while it is ours a plugin's time
+// scale scales the step, not the frames' pace.
+std::uint64_t g_step_va = 0;
+std::atomic<bool> g_scale_by_step{false};
+// The redirected loads' slots (kDtLoads): one per constant, kind and width,
+// 16 bytes each in the image's tail, rewritten every frame from the constant
+// as it is then (a .data tunable the debug menu edits keeps working).
+struct DtSlot {
+    std::uint64_t va, src;
+    Kind kind;
+    std::uint8_t lanes;
+};
+std::vector<DtSlot> g_dt_slots;
+std::size_t g_dt_loads_applied = 0;
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -678,7 +877,6 @@ const bool g_bench_uncapped = [] {
 }();
 
 constexpr float kThirtieth = 0.0333333351f, kSixtieth = 0.0166666675f;  // 0x3d088889, 0x3c888889
-constexpr float kNinetieth = 1.0f / 90.0f;
 
 // `target`: 0 runs the game's own mode (30); above 0 the converted pace, the
 // game's mode 2 with this target - kSixtieth at 60, so 60 is the eboot's own
@@ -740,10 +938,14 @@ void sprj_flipper_update(SprjFlipper* f, FlipClock& clock, float target) {
     f->previous_frame_microseconds = f->current_frame_microseconds;
     std::int64_t now = clock.now();
     f->current_frame_microseconds = static_cast<std::uint64_t>(now);
-    // A plugin's time scale (frame_rate_set_time_scale): the game advances a
-    // fixed step a frame, so a longer frame is slower time and a shorter one
-    // faster, as far as the machine keeps up.
-    std::int64_t interval_us = seconds_to_us(f->target_frame_seconds / g_time_scale.load(std::memory_order_relaxed));
+    // A plugin's time scale (frame_rate_set_time_scale): at 30 the game
+    // advances a fixed step a frame, so a longer frame is slower time and a
+    // shorter one faster, as far as the machine keeps up. At a converted rate
+    // with the step ours (each_frame) the step scales and the pace stays.
+    const float pace_scale = converted && g_scale_by_step.load(std::memory_order_relaxed)
+                                 ? 1.0f
+                                 : g_time_scale.load(std::memory_order_relaxed);
+    std::int64_t interval_us = seconds_to_us(f->target_frame_seconds / pace_scale);
 
     // The last frames that ran behind, up to the foreground count of them:
     // how much time they took together.
@@ -944,61 +1146,146 @@ float uncapped_target() {
     return 1.0f / limit;
 }
 
-// The converted pace's target for this frame; 0 at 30.
-float pace_target() {
-    switch (g_game_fps) {
-        case 60: return kSixtieth;
-        case 90: return kNinetieth;
-        case 0: return uncapped_target();
-        default: return 0.0f;
+// BBHOST_TEST_FPS_SWING (a test switch, converted rates only): the target
+// moves while the game runs, so one process can be held at two rates or at a
+// rate that keeps changing - what a variable refresh display, a busy scene
+// or a debugger does to the frame time. The same heap at both rates is what
+// a rate-invariance differential compares (tmp tools: rateinv).
+//   square:<lo>:<hi>:<s>   <lo> fps for <s> seconds, then <hi> for <s>, ...
+//   random:<lo>:<hi>:<s>   a new rate in [lo, hi] every <s> seconds
+//   jitter:<lo>:<hi>       a new rate in [lo, hi] every frame
+//   sine:<lo>:<hi>:<s>     from lo to hi and back over <s> seconds
+// The code immediates and counts keep the mode's values (uncapped: 120's).
+struct FpsSwing {
+    enum Kind { Off, Square, Random, Jitter, Sine } kind = Off;
+    float lo = 0, hi = 0, period = 1;
+};
+const FpsSwing g_swing = [] {
+    FpsSwing s;
+    const char* e = std::getenv("BBHOST_TEST_FPS_SWING");
+    if (!e || !*e) return s;
+    char kind[16] = {};
+    float lo = 0, hi = 0, period = 1;
+    const int n = std::sscanf(e, "%15[a-z]:%f:%f:%f", kind, &lo, &hi, &period);
+    if (n < 3 || !(lo >= 10.0f) || !(hi >= lo) || !(hi <= 1000.0f) || !(period > 0.0f)) {
+        host_log("frame rate: BBHOST_TEST_FPS_SWING=%s not understood (kind:lo:hi[:seconds]); ignored", e);
+        return s;
     }
+    s.kind = !std::strcmp(kind, "square")   ? FpsSwing::Square
+             : !std::strcmp(kind, "random") ? FpsSwing::Random
+             : !std::strcmp(kind, "jitter") ? FpsSwing::Jitter
+             : !std::strcmp(kind, "sine")   ? FpsSwing::Sine
+                                            : FpsSwing::Off;
+    s.lo = lo;
+    s.hi = hi;
+    s.period = period;
+    if (s.kind == FpsSwing::Off) host_log("frame rate: BBHOST_TEST_FPS_SWING kind %s unknown; ignored", kind);
+    else host_log("frame rate: BBHOST_TEST_FPS_SWING %s %.1f..%.1f fps, %.2f s (a test switch)", kind, static_cast<double>(lo),
+                  static_cast<double>(hi), static_cast<double>(period));
+    return s;
+}();
+
+// The swing's target for this frame, or `base` when it is off.
+float swing_target(float base) {
+    if (g_swing.kind == FpsSwing::Off) return base;
+    static const auto t0 = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    static std::uint64_t rng = 0x9e3779b97f4a7c15ull;
+    const auto next_unit = [] {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return static_cast<double>(rng >> 11) * (1.0 / 9007199254740992.0);
+    };
+    double fps = g_swing.lo;
+    switch (g_swing.kind) {
+        case FpsSwing::Square: fps = (static_cast<std::int64_t>(t / g_swing.period) & 1) ? g_swing.hi : g_swing.lo; break;
+        case FpsSwing::Random: {
+            static std::int64_t slot = -1;
+            static double held = g_swing.lo;
+            const auto now_slot = static_cast<std::int64_t>(t / g_swing.period);
+            if (now_slot != slot) {
+                slot = now_slot;
+                held = g_swing.lo + (g_swing.hi - g_swing.lo) * next_unit();
+            }
+            fps = held;
+            break;
+        }
+        case FpsSwing::Jitter: fps = g_swing.lo + (g_swing.hi - g_swing.lo) * next_unit(); break;
+        case FpsSwing::Sine:
+            fps = g_swing.lo + (g_swing.hi - g_swing.lo) * 0.5 * (1.0 - std::cos(2.0 * 3.14159265358979 * t / g_swing.period));
+            break;
+        case FpsSwing::Off: break;
+    }
+    return static_cast<float>(1.0 / fps);
 }
 
-// Uncapped, after the update: the values that follow the frame's seconds,
-// for the frame about to run. dt is what the FPS++ cave (0x2418e3d) hands the
-// game this frame - the measured frame time clamped to [target, 1/30] - with
-// the uncapped limit as the floor while a loading screen has no target. The
-// cloth's scalars take the ratio of its solver rate (one substep a frame) to
-// the 60 its part files were authored at, as Kyo's 90 and 120 values do:
-// stiffness and the damping exponent 60 / fps (at most 1: below 60 the cloth
-// keeps the 60 tuning rather than over-relaxing), the acceleration scale its
-// inverse - over a smoothed frame time, so a hitch does not jolt the cloth.
-// Each store is one aligned float; a reader on a worker sees the last frame's
-// value or this one's.
-void uncapped_each_frame(const SprjFlipper* f) {
-    const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
-    const float dt = std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth);
-    if (!(dt > 0.0f)) return;  // also NaN
-    const double fps = 1.0 / static_cast<double>(dt);
-    static bool pages_kept = false;
-    if (!pages_kept) {
-        pages_kept = true;
-        for (const std::uint64_t p : g_each_pages) guest_protect_rwx(&g_each_mem, p, 0x1000);
-    }
-    for (const EachFrame& e : g_each) put<float>(e.va, rated_value(e.kind, e.was, fps));
-    g_cloth_dt += (dt - g_cloth_dt) * 0.1f;
-    if (g_cloth_va) {
-        const float s = std::min(1.0f, 60.0f * g_cloth_dt);
-        for (int k = 0; k < 4; ++k) {
-            put<float>(g_cloth_va + 4 * static_cast<std::uint64_t>(k), s);
-            put<float>(g_cloth_va + 0x10 + 4 * static_cast<std::uint64_t>(k), 1.0f / s);
+// The converted pace's target for this frame; 0 at 30.
+float pace_target() {
+    if (g_game_fps == 0) return swing_target(uncapped_target());
+    if (g_game_fps == 60) return swing_target(kSixtieth);  // the eboot's own mode 2
+    if (g_game_fps > 60) return swing_target(1.0f / static_cast<float>(g_game_fps));
+    return 0.0f;
+}
+
+// After the update, at every converted rate, for the frame about to run: the
+// task step (kStepLoad) - the measured frame time clamped to [target, 1/30]
+// as the 60 FPS++ cave has it (a loading screen has no target: the measured
+// time), times a plugin's time scale, at most 1/30 - the play time's
+// milliseconds from it, and the values that follow the frame's seconds, from
+// dt: the same with the uncapped limit as the floor while a loading screen
+// has no target. Above 60 the cloth's stiffness scale: the square of its
+// solver rate (one substep a frame) against the 60 its part files were
+// authored at, (60 dt)^2, at most 1 (below 60 the cloth keeps the 60
+// tuning), over a smoothed frame time. Each store is one aligned value; a
+// reader on a worker sees the last frame's value or this one's.
+void each_frame(const SprjFlipper* f) {
+    const float scale = g_scale_by_step.load(std::memory_order_relaxed) ? g_time_scale.load(std::memory_order_relaxed) : 1.0f;
+    const auto scaled = [scale](float s) { return scale == 1.0f ? s : std::min(s * scale, kThirtieth); };
+    const float step = scaled(std::min(std::max(f->measured_frame_seconds, f->target_frame_seconds), kThirtieth));
+    if (step > 0.0f) {  // also NaN: the cave keeps the last step
+        frame_tick_frame(step);  // the fixed ticks' count for this frame (engine/frame_tick.h)
+        if (g_step_va) put<float>(g_step_va, step);
+        if (g_play_ms_va) {
+            // The step in whole milliseconds, the rest carried to the next frame.
+            g_play_ms_carry += static_cast<double>(step) * 1000.0;
+            const auto ms = static_cast<std::int32_t>(g_play_ms_carry);
+            g_play_ms_carry -= ms;
+            put<std::int32_t>(g_play_ms_va, ms);
         }
     }
-    // BBHOST_UNCAPPED_LOG=1: what this wrote, once a second.
+    const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
+    const float dt = scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
+    if (!(dt > 0.0f)) return;  // also NaN
+    frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
+    const double fps = 1.0 / static_cast<double>(dt);
+    for (const EachFrame& e : g_each) put<float>(e.va, rated_value(e.kind, e.was, fps));
+    for (const DtSlot& d : g_dt_slots) {
+        for (std::uint8_t k = 0; k < d.lanes; ++k) put<float>(d.va + 4u * k, rated_value(d.kind, get<float>(d.src + 4u * k), fps));
+    }
+    g_cloth_dt += (dt - g_cloth_dt) * 0.1f;
+    const float cloth = std::min(1.0f, 60.0f * g_cloth_dt);
+    if (g_cloth_va) {
+        for (int k = 0; k < 4; ++k) put<float>(g_cloth_va + 4 * static_cast<std::uint64_t>(k), cloth * cloth);
+    }
+    // BBHOST_FRAME_RATE_LOG=1 (or the older BBHOST_UNCAPPED_LOG=1): what this
+    // wrote, once a second.
     static const bool log_each = [] {
-        const char* e = std::getenv("BBHOST_UNCAPPED_LOG");
-        return e && e[0] == '1';
+        const char* e = std::getenv("BBHOST_FRAME_RATE_LOG");
+        const char* u = std::getenv("BBHOST_UNCAPPED_LOG");
+        return (e && e[0] == '1') || (u && u[0] == '1');
     }();
     if (log_each) {
         static auto last = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
         if (now - last >= std::chrono::seconds(1)) {
             last = now;
-            host_log("frame rate: uncapped frame %.2f ms (%.0f fps, %.0f measured over 16), momentum kept %.5f, cloth %.3f / %.3f",
+            host_log("frame rate: frame %.2f ms (%.0f fps, %.0f measured over 16), momentum kept %.5f, sprint test x%.1f, "
+                     "cloth stiffness %.3f",
                      static_cast<double>(dt) * 1000.0, fps, static_cast<double>(f->calculated_fps),
                      static_cast<double>(rated_value(Kind::Keep, 0.95f, fps)),
-                     static_cast<double>(std::min(1.0f, 60.0f * g_cloth_dt)),
-                     static_cast<double>(1.0f / std::min(1.0f, 60.0f * g_cloth_dt)));
+                     static_cast<double>(rated_value(Kind::Rate, 30.0f, fps)),
+                     static_cast<double>(g_cloth_va ? cloth * cloth : 1.0f));
         }
     }
 }
@@ -1023,11 +1310,10 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         g_fast_target = converted && (g_bench_uncapped || loading_fast_now());
         sprj_flipper_update(f, clock, pace_target());
         g_fast_target = false;
-        if (g_game_fps == 0) uncapped_each_frame(f);
+        if (converted) each_frame(f);
         if (g_frames.fetch_add(1, std::memory_order_relaxed) == 0) {
             host_log("frame source: SprjFlipper::Update is ours (0x%llx, %s); the guest's no longer runs",
-                     static_cast<unsigned long long>(saved[5]),
-                     g_game_fps == 60 ? "60" : g_game_fps == 90 ? "90" : g_game_fps == 0 ? "uncapped" : "the game's own mode");
+                     static_cast<unsigned long long>(saved[5]), converted ? mode_name(g_game_fps).c_str() : "the game's own mode");
         }
         return 1;  // done: the stub returns to the caller
     }
@@ -1060,17 +1346,6 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     return 0;
 }
 
-// A frame rate as one of the modes: 30, 60, 90, or 0 (uncapped). Another
-// number takes the nearest mode below it.
-int mode_of(int fps) {
-    if (fps <= 0) return 0;
-    if (fps >= 90) return 90;
-    if (fps >= 60) return 60;
-    return 30;
-}
-
-const char* mode_name(int fps) { return fps == 0 ? "uncapped" : fps == 90 ? "90" : fps == 60 ? "60" : "30"; }
-
 // The Frame rate option as the game started with it. BBHOST_GAME_FPS=30, 60,
 // 90 or 0 (also "uncapped": atoi reads 0) overrides it.
 int wanted_fps() {
@@ -1078,7 +1353,18 @@ int wanted_fps() {
     return mode_of(host_settings().frame_cap);
 }
 
-constexpr std::size_t kSixtyCount = sizeof(kSixtySites) / sizeof(kSixtySites[0]);
+// The follow camera's tuning above 30 fps: the game's own (Original) unless
+// BBHOST_CAMERA_TUNING=fps++ (or kyo, 0) asks for Kyo's 60 FPS++ retune. The
+// menus no longer offer it; a saved camera_tuning is ignored.
+bool camera_original() {
+    if (const char* e = std::getenv("BBHOST_CAMERA_TUNING"); e && *e) {
+        const std::string v(e);
+        if (v == "original" || v == "orig" || v == "1") return true;
+        if (v == "fps++" || v == "kyo" || v == "0") return false;
+        host_log("frame rate: BBHOST_CAMERA_TUNING=%s is neither fps++ nor original; Original runs", e);
+    }
+    return true;
+}
 
 // Whether every site of a group holds the list's old bytes; the first that
 // does not is named.
@@ -1122,20 +1408,25 @@ int apply_rate(ElfImage* image, int want) {
             return 30;
         }
     }
-    // The code rewrites, by group: all of a group or none of it.
+    // The code rewrites, by group: all of a group or none of it. The
+    // frame-time sites read the slot the 60 FPS++ cave keeps, so they go with
+    // the 60 FPS++ sites; the cloth's caves are for rates above 60.
     static const bool sites_on = [] {
         const char* e = std::getenv("BBHOST_SIXTY_SITES");
         return !(e && e[0] == '0');
     }();
     if (!sites_on) host_log("frame rate: BBHOST_SIXTY_SITES=0, the 60 FPS++ code rewrites left out");
-    const bool sixty_ok = sites_on && sites_hold(image, kSixtySites, "the 60 FPS++ list");
+    const bool sixty_ok = sites_on && sites_hold(image, kSixtySites, "the 60 FPS++ list") &&
+                          sites_hold(image, kFrameTimeSites, "the frame-time sites");
     int mode = want;
     if (mode != 60) {
-        const bool ninety_ok = sixty_ok && sites_hold(image, kNinetySites, "the 90 FPS++ list") &&
-                               (mode != 0 || sites_hold(image, kUncappedSites, "the uncapped mode"));
-        if (!ninety_ok) {
-            host_log("frame rate: %s needs the 60 and 90 FPS++ code rewrites, which were refused; the game runs at 60",
-                     mode_name(mode));
+        const bool cloth_ok = sixty_ok && sites_hold(image, kClothSites, "the cloth caves") &&
+                              std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(kClothScalars))),
+                                          kClothScalarsWas, sizeof(kClothScalarsWas)) == 0;
+        if (!cloth_ok) {
+            host_log("frame rate: %s needs the 60 FPS++, frame-time and cloth code rewrites, which were refused; the game "
+                     "runs at 60",
+                     mode_name(mode).c_str());
             mode = 60;
         }
     }
@@ -1151,17 +1442,32 @@ int apply_rate(ElfImage* image, int want) {
         if (bn < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
         else guest_protect_rw(&image->mem, lo, hi - lo);
     };
-    // 90's values for uncapped's code immediates and frame counts; the sound
-    // thread keeps up with the fastest frame.
+    // The Camera tuning: Original leaves Kyo's camera sites and constants out.
+    const bool original_camera = camera_original();
+    const auto write_sites = [&](const auto& sites) {
+        std::size_t n = 0;
+        for (const Site& site : sites) {
+            if (original_camera && kyo_camera_site(site.at)) continue;
+            const std::vector<std::uint8_t> now = hex_bytes(site.now);
+            write(site.at, now.data(), now.size());
+            ++n;
+        }
+        return n;
+    };
+    // The reference rate's values for uncapped's code immediates and frame
+    // counts; the sound thread keeps up with the fastest frame.
     const int fps = mode == 0 ? kUncappedReferenceFps : mode;
-    std::size_t rated_written = 0;
+    // A rated constant's rule gives the table's own value at 60.
+    std::size_t rated_fixed = 0, camera_kept = 0;
     for (const Constant& c : kConstants) {
+        if (original_camera && kyo_camera_constant(c.at)) {
+            ++camera_kept;
+            continue;
+        }
         std::uint32_t now = c.now;
-        if (mode != 60) {
-            if (const Rated* r = rated(c.at)) {
-                now = float_bits(rated_value(r->kind, bits_float(c.was), fps));
-                ++rated_written;
-            }
+        if (const Rated* r = rated(c.at); r && mode != 60) {
+            now = float_bits(rated_value(r->kind, bits_float(c.was), fps));
+            rated_fixed += r->each_frame ? 0 : 1;
         }
         write(c.at, &now, 4);
     }
@@ -1171,50 +1477,156 @@ int apply_rate(ElfImage* image, int want) {
         write(c.at, now, c.n);
     }
     for (const Bytes& b : kBytes) write(b.at, b.now, b.n);
+    // After the constants: two frame-time sites rewrite instructions whose
+    // immediates kConstants converts (0x1bf9b74, 0x222bcd7, for a run
+    // without the code rewrites).
     if (sixty_ok) {
-        for (const Site& site : kSixtySites) {
-            const std::vector<std::uint8_t> now = hex_bytes(site.now);
-            write(site.at, now.data(), now.size());
+        g_sites_applied = write_sites(kSixtySites);
+        g_frame_time_applied = write_sites(kFrameTimeSites);
+        // The task step and the play time's count, ours: written by our
+        // SprjFlipper::Update every frame, in 16 bytes of the image's tail
+        // (with the guest's, BBHOST_FRAME_SOURCE=0 or 2 at 60, the cave and
+        // the game's add stay).
+        const std::uint64_t block = image->tail_va + image->tail_used + kPreferredGuestSlide;  // as a BN address
+        const std::uint64_t step_bn = block, play_bn = block + 8;
+        const std::int64_t step_disp = static_cast<std::int64_t>(step_bn) - static_cast<std::int64_t>(kStepLoad + 8);
+        const std::int64_t play_disp = static_cast<std::int64_t>(play_bn) - static_cast<std::int64_t>(kPlayTimeAdd + 6);
+        const auto holds = [&](std::uint32_t at, const char* hex) {
+            const std::vector<std::uint8_t> was = hex_bytes(hex);
+            return std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(at))), was.data(), was.size()) == 0;
+        };
+        const auto rel32 = [](std::int64_t d) { return d >= INT32_MIN && d <= INT32_MAX; };
+        if (g_source != Source::Ours) {
+            host_log("frame rate: the guest's SprjFlipper::Update runs; the task step and the play time stay the game's");
+        } else if (image->tail_used + 16 > image->tail_size || !rel32(step_disp) || !rel32(play_disp)) {
+            host_log("frame rate: no room in the image's tail; the task step and the play time stay the game's");
+        } else {
+            image->tail_used += 16;
+            const auto le = [](std::int64_t d, std::uint8_t* out) {
+                const auto u = static_cast<std::uint32_t>(static_cast<std::int32_t>(d));
+                for (int k = 0; k < 4; ++k) out[k] = static_cast<std::uint8_t>(u >> (8 * k));
+            };
+            if (holds(kStepLoad, kStepLoadWas)) {
+                g_step_va = va(static_cast<std::uint32_t>(step_bn));
+                put<float>(g_step_va, 1.0f / static_cast<float>(fps));
+                std::uint8_t now[21] = {0xf3, 0x0f, 0x10, 0x05, 0, 0, 0, 0,               // movss xmm0, [step]
+                                        0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,  // nop8
+                                        0x0f, 0x1f, 0x44, 0x00, 0x00};                   // nop5
+                le(step_disp, now + 4);
+                write(kStepLoad, now, sizeof(now));
+                g_scale_by_step.store(true, std::memory_order_relaxed);
+            } else {
+                host_log("frame rate: 0x%x does not hold the 60 FPS++ cave's step; the cave keeps computing it", kStepLoad);
+            }
+            if (holds(kPlayTimeAdd, kPlayTimeAddWas)) {
+                g_play_ms_va = va(static_cast<std::uint32_t>(play_bn));
+                put<std::int32_t>(g_play_ms_va, static_cast<std::int32_t>(1000 / fps));
+                std::uint8_t now[13] = {0x8b, 0x0d, 0, 0, 0, 0,                    // mov ecx, [count]
+                                        0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00};  // nop7
+                le(play_disp, now + 2);
+                write(kPlayTimeAdd, now, sizeof(now));
+            } else {
+                host_log("frame rate: 0x%x does not hold the play time's add; the game's stays", kPlayTimeAdd);
+            }
         }
-        g_sites_applied = kSixtyCount;
+        // The redirected loads (kDtLoads): every instruction checked, then
+        // the slots placed and the displacements pointed at them.
+        bool dt_ok = sizeof(kDtLoads) > 0;
+        for (const DtLoad& d : kDtLoads) {
+            const std::vector<std::uint8_t> was = hex_bytes(d.bytes);
+            const auto* p = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va(d.insn)));
+            std::int32_t disp;
+            std::memcpy(&disp, p + d.disp, 4);
+            if (was.size() != d.len || std::memcmp(p, was.data(), was.size()) != 0 ||
+                static_cast<std::int64_t>(d.insn) + d.len + disp != static_cast<std::int64_t>(d.constant)) {
+                host_log("frame rate: 0x%x is not the load of 0x%x the redirected loads expect; the %zu are left out", d.insn,
+                         d.constant, sizeof(kDtLoads) / sizeof(kDtLoads[0]));
+                dt_ok = false;
+                break;
+            }
+        }
+        if (dt_ok) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> keys;  // (constant | kind | lanes, slot BN address)
+            const auto key_of = [](const DtLoad& d) {
+                return static_cast<std::uint64_t>(d.constant) << 16 | static_cast<std::uint64_t>(d.kind) << 8 | d.lanes;
+            };
+            for (const DtLoad& d : kDtLoads) {
+                if (std::none_of(keys.begin(), keys.end(), [&](const auto& k) { return k.first == key_of(d); })) keys.push_back({key_of(d), 0});
+            }
+            const std::uint64_t start = (image->tail_used + 15) & ~std::uint64_t(15);
+            if (start + 16 * keys.size() > image->tail_size) {
+                host_log("frame rate: no room in the image's tail for %zu redirected loads' slots; left out", keys.size());
+            } else {
+                image->tail_used = start + 16 * keys.size();
+                for (std::size_t i = 0; i < keys.size(); ++i) {
+                    keys[i].second = image->tail_va + start + 16 * i + kPreferredGuestSlide;  // as a BN address
+                    DtSlot slot{};
+                    slot.va = va(static_cast<std::uint32_t>(keys[i].second));
+                    const auto constant = static_cast<std::uint32_t>(keys[i].first >> 16);
+                    slot.kind = static_cast<Kind>((keys[i].first >> 8) & 0xff);
+                    slot.lanes = static_cast<std::uint8_t>(keys[i].first & 0xff);
+                    slot.src = va(constant);
+                    for (std::uint8_t k = 0; k < slot.lanes; ++k)
+                        put<float>(slot.va + 4u * k, rated_value(slot.kind, get<float>(slot.src + 4u * k), fps));
+                    g_dt_slots.push_back(slot);
+                }
+                for (const DtLoad& d : kDtLoads) {
+                    const auto it = std::find_if(keys.begin(), keys.end(), [&](const auto& k) { return k.first == key_of(d); });
+                    const std::int64_t nd = static_cast<std::int64_t>(it->second) - (static_cast<std::int64_t>(d.insn) + d.len);
+                    if (nd < INT32_MIN || nd > INT32_MAX) continue;  // the tail is within reach of all of the code
+                    const auto d32 = static_cast<std::int32_t>(nd);
+                    write(d.insn + d.disp, &d32, 4);
+                    ++g_dt_loads_applied;
+                }
+            }
+        }
+    }
+    // The camera's weights hold Kyo's 60 fps values (kConstants' defaults,
+    // and his stores with the sites) or, with Original, the game's 30 fps
+    // ones: the decomp camera converts them from a frame of that rate to each
+    // frame's length (decomp/camera/follow_camera.cpp), from the frame time
+    // each_frame keeps, which needs no site.
+    frame_rate_step::g_camera_tuned_fps.store(original_camera ? 30 : 60, std::memory_order_relaxed);
+    if (original_camera) {
+        host_log("frame rate: the follow camera's tuning is Original: the game's own values, converted from its 30 fps "
+                 "frames to each frame's length (Kyo's %zu camera sites and the constructor's %zu defaults left as the "
+                 "game has them)",
+                 sizeof(kKyoCameraSites) / sizeof(kKyoCameraSites[0]), camera_kept);
+    } else {
+        host_log("frame rate: the follow camera's tuning is FPS++: Kyo's 60 fps retune from his 60 FPS++ list, converted "
+                 "from 60 fps frames to each frame's length (Camera tuning: Original for the game's own)");
     }
     if (mode != 60) {
-        for (const Site& site : kNinetySites) {
-            if (mode == 0 && std::find(std::begin(kNinetyNotUncapped), std::end(kNinetyNotUncapped), site.at) != std::end(kNinetyNotUncapped))
-                continue;
-            const std::vector<std::uint8_t> now = hex_bytes(site.now);
-            write(site.at, now.data(), now.size());
-            ++g_ninety_applied;
-        }
-    }
-    if (mode == 0) {
-        for (const Site& site : kUncappedSites) {
-            const std::vector<std::uint8_t> now = hex_bytes(site.now);
-            write(site.at, now.data(), now.size());
-        }
-        // The every-frame values: their pages stay writable (they are .rodata
-        // in the executable segment; RWX, as the writes above make them for a
-        // moment, in case a page also holds code).
-        std::vector<std::uint64_t>& pages = g_each_pages;
-        for (const Rated& r : kRated) {
-            if (!r.each_frame) continue;
-            const Constant* c = std::find_if(std::begin(kConstants), std::end(kConstants), [&](const Constant& k) { return k.at == r.at; });
-            g_each.push_back({va(r.at), bits_float(c->was), r.kind});
-            pages.push_back(va(r.at) & ~0xfffull);
-        }
+        g_cloth_applied = write_sites(kClothSites);
         g_cloth_va = va(kClothScalars);
-        pages.push_back(g_cloth_va & ~0xfffull);
-        std::sort(pages.begin(), pages.end());
-        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-        g_each_mem = image->mem;
-        for (const std::uint64_t p : pages) guest_protect_rwx(&image->mem, p, 0x1000);
-        host_log("frame rate: uncapped - %zu values and the cloth's 8 scalars follow the frame time every frame "
-                 "(%zu pages of .rodata kept writable); code immediates and frame counts at %d's values",
-                 g_each.size(), pages.size(), kUncappedReferenceFps);
+        const float scale = std::min(1.0f, 60.0f / static_cast<float>(fps));
+        const float scalars[4] = {scale * scale, scale * scale, scale * scale, scale * scale};
+        write(kClothScalars, scalars, sizeof(scalars));
+        g_cloth_dt = 1.0f / static_cast<float>(fps);
     }
-    if (mode != 60) {
-        host_log("frame rate: %zu of the constants follow the rate (written at %d), the rest at their 60 values", rated_written, fps);
+    // The every-frame values: their pages stay writable for good (they are
+    // .rodata in the executable segment, RWX in case a page also holds code),
+    // whatever another writer does to them later - live resolution writes
+    // the plate sizes beside the sprint test's value and puts that page back
+    // to read-only (core/memory.h).
+    std::vector<std::uint64_t> pages;
+    for (const Rated& r : kRated) {
+        if (!r.each_frame) continue;
+        const Constant* c = std::find_if(std::begin(kConstants), std::end(kConstants), [&](const Constant& k) { return k.at == r.at; });
+        g_each.push_back({va(r.at), bits_float(c->was), r.kind});
+        pages.push_back(va(r.at) & ~0xfffull);
     }
+    if (g_cloth_va) pages.push_back(g_cloth_va & ~0xfffull);
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (const std::uint64_t p : pages) {
+        if (p < va(kCodeEnd)) guest_keep_writable(&image->mem, p);  // .data pages are writable already
+    }
+    host_log("frame rate: %zu values%s follow the frame time every frame (%zu pages of .rodata kept writable), and %zu loads "
+             "read %zu slots of ours that do; %zu other constants follow the rate (code immediates and counts at %d's values), "
+             "the rest at their 60 values",
+             g_each.size(), g_cloth_va ? " and the cloth's stiffness scale" : "", pages.size(), g_dt_loads_applied, g_dt_slots.size(),
+             rated_fixed, fps);
     return mode;
 }
 
@@ -1264,13 +1676,15 @@ void frame_rate_install(ElfImage* image) {
     const int want = wanted_fps();
     // 90 and uncapped set a target the game's own modes do not have: ours
     // runs them (compare and the guest's run at 30 and 60).
-    if ((want == 90 || want == 0) && g_source != Source::Ours) {
-        host_log("frame source: BBHOST_FRAME_SOURCE runs the guest's update at 30 and 60 only; ours runs %s", mode_name(want));
+    if ((want > 60 || want == 0) && g_source != Source::Ours) {
+        host_log("frame source: BBHOST_FRAME_SOURCE runs the guest's update at 30 and 60 only; ours runs %s", mode_name(want).c_str());
         g_source = Source::Ours;
     }
     if (g_source == Source::Compare) g_frame_after_thunk = hle_wrap_fn(reinterpret_cast<void*>(&frame_after));
     if (want == 30) {
-        host_log("frame rate: the game's own 30");
+        host_log("frame rate: the game's own 30; the follow camera is the game's own (the Camera tuning, %s, applies above "
+                 "30)",
+                 camera_original() ? "Original" : "FPS++");
         // Ours runs the game's own mode at 30 (or the guest's does with
         // BBHOST_FRAME_SOURCE=0, when only the online test tick needs the hook).
         {  // ours runs the game's own mode at 30 (the param walk and the online tick ride on the same hook)
@@ -1298,24 +1712,22 @@ void frame_rate_install(ElfImage* image) {
         return;  // the hook keeps mode 2 only while g_game_fps says 60
     }
     g_game_fps = got;
-    hle_video_set_game_pace(got);  // 90 and uncapped: flips complete at once (hle/video.cpp)
+    hle_video_set_game_pace(got);  // above 60 and uncapped: flips complete at once (hle/video.cpp)
+    frame_tick_install(image);
     const std::size_t kCountsN = sizeof(kCounts) / sizeof(kCounts[0]), kBytesN = sizeof(kBytes) / sizeof(kBytes[0]);
     const std::size_t constants = sizeof(kConstants) / sizeof(kConstants[0]);
-    if (got == 60) {
-        host_log("frame rate: 60 (the frame-time manager's mode 2; %zu constants and %zu other values converted, %zu 60 FPS++ "
-                 "code sites)",
-                 constants, kCountsN + kBytesN, g_sites_applied);
-    } else if (got == 90) {
-        host_log("frame rate: 90 (mode 2 with a 1/90 s target; %zu constants and %zu other values converted, %zu 60 FPS++ and "
-                 "%zu 90 FPS++ code sites)",
-                 constants, kCountsN + kBytesN, g_sites_applied, g_ninety_applied);
+    char target[96];
+    if (got == 0) {
+        std::snprintf(target, sizeof(target), "the step following the measured frame time, clamped to 1/%d..1/30 s", kUncappedMaxFps);
     } else {
-        host_log("frame rate: uncapped (mode 2, the step following the measured frame time, clamped to 1/%d..1/30 s; %zu "
-                 "constants and %zu other values converted, %zu 60 FPS++, %zu 90 FPS++ and %zu uncapped code sites)",
-                 kUncappedMaxFps, constants, kCountsN + kBytesN, g_sites_applied, g_ninety_applied,
-                 sizeof(kUncappedSites) / sizeof(kUncappedSites[0]));
+        std::snprintf(target, sizeof(target), "a 1/%d s target", got);
     }
-    if (got != want) host_log("frame rate: %s was asked for; %s runs (the reason is above)", mode_name(want), mode_name(got));
+    host_log("frame rate: %s (the frame-time manager's mode 2, %s; %zu constants and %zu other values converted, %zu 60 FPS++, "
+             "%zu frame-time and %zu cloth code sites%s%s)",
+             mode_name(got).c_str(), target, constants, kCountsN + kBytesN, g_sites_applied, g_frame_time_applied, g_cloth_applied,
+             g_step_va ? ", the task step ours" : "", g_play_ms_va ? ", the play time's add" : "");
+    if (got != want)
+        host_log("frame rate: %s was asked for; %s runs (the reason is above)", mode_name(want).c_str(), mode_name(got).c_str());
 }
 
 void frame_rate_set_time_scale(float scale) {

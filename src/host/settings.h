@@ -20,7 +20,7 @@ struct HostSettings {
     // Display
     bool fullscreen = false;
     bool vsync = true;
-    int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30, 60, 90; 0 is uncapped
+    int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30, 60, 90, 120; 0 is uncapped
     bool fps_counter = false;
     int res_width = 1920, res_height = 1080;  // the render resolution (BBHOST_RES wins)
 
@@ -28,6 +28,10 @@ struct HostSettings {
     float fov_scale = 1.0f;              // 1.0 the game's own; +5% a step
     float camera_distance_scale = 1.0f;  // 1.0 the game's own; 10% a step either way
     float camera_height_scale = 1.0f;
+    // The follow camera's tuning above 30 fps, read when the game starts
+    // (engine/frame_rate.cpp): false FPS++, Kyo's 60 fps retune; true
+    // Original, the game's own values. At 30 the camera is the game's either way.
+    bool camera_original = false;
 
     // Controls
     bool mouse_menu = true;     // the pointer drives the menus through the pad

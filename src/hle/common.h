@@ -20,12 +20,13 @@
 
 inline constexpr int kSceOk = 0;
 
-// Host errno -> FreeBSD (Orbis) errno. 1..34 coincide; the rest do not.
+// Host errno -> FreeBSD (Orbis) errno. Microsoft CRT values also differ:
+// EAGAIN is 11 there (guest 35), EDEADLK is 36 (guest 11).
 inline int to_freebsd(int e) {
     if (e == 0) {
         return 0;
     }
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     switch (e) {
         case EAGAIN: return 35;
         case EDEADLK: return 11;
@@ -37,9 +38,13 @@ inline int to_freebsd(int e) {
         case EPROTOTYPE: return 41;
         case ENOPROTOOPT: return 42;
         case EPROTONOSUPPORT: return 43;
+#ifdef ESOCKTNOSUPPORT
         case ESOCKTNOSUPPORT: return 44;
+#endif
         case EOPNOTSUPP: return 45;
+#ifdef EPFNOSUPPORT
         case EPFNOSUPPORT: return 46;
+#endif
         case EAFNOSUPPORT: return 47;
         case EADDRINUSE: return 48;
         case EADDRNOTAVAIL: return 49;
@@ -51,19 +56,33 @@ inline int to_freebsd(int e) {
         case ENOBUFS: return 55;
         case EISCONN: return 56;
         case ENOTCONN: return 57;
+#ifdef ESHUTDOWN
         case ESHUTDOWN: return 58;
+#endif
+#ifdef ETOOMANYREFS
         case ETOOMANYREFS: return 59;
+#endif
         case ETIMEDOUT: return 60;
         case ECONNREFUSED: return 61;
         case ELOOP: return 62;
         case ENAMETOOLONG: return 63;
+#ifdef EHOSTDOWN
         case EHOSTDOWN: return 64;
+#endif
         case EHOSTUNREACH: return 65;
         case ENOTEMPTY: return 66;
+#ifdef EUSERS
         case EUSERS: return 68;
+#endif
+#ifdef EDQUOT
         case EDQUOT: return 69;
+#endif
+#ifdef ESTALE
         case ESTALE: return 70;
+#endif
+#ifdef EREMOTE
         case EREMOTE: return 71;
+#endif
         case ENOLCK: return 77;
         case ENOSYS: return 78;
         case EIDRM: return 82;
@@ -72,7 +91,9 @@ inline int to_freebsd(int e) {
         case ECANCELED: return 85;
         case EILSEQ: return 86;
         case EBADMSG: return 89;
+#ifdef EMULTIHOP
         case EMULTIHOP: return 90;
+#endif
         case ENOLINK: return 91;
         case EPROTO: return 92;
         case ENOTRECOVERABLE: return 95;

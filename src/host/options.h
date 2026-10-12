@@ -43,7 +43,7 @@ bool host_opt_get(const char* key);
 bool host_opt_resolution(int* w, int* h);
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);
-// The game's frame rate (engine/frame_rate.h): 30, 60, 90, or 0 for
+// The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, or 0 for
 // uncapped; the file's key is still frame_cap. Same setting, same file.
 int host_opt_frame_cap();
 void host_opt_set_frame_cap(int fps);

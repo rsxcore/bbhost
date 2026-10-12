@@ -15,6 +15,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <deque>
 #include <bit>
@@ -28,6 +29,7 @@
 #include <chrono>
 #include <cstring>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 namespace gpu {
@@ -518,6 +520,10 @@ struct Surface {
     // command buffer, and a CP write over it (mark_surfaces_dirty_locked)
     // clears this so the next bind looks again.
     std::uint64_t refreshed_serial = 0;
+    // The flip and the time (steady clock, ms) it was made at or a shader, a
+    // fill, a copy or an upload last wrote its image: its age and order for
+    // the reuse retire (textures_retire_reused_locked).
+    std::uint64_t written_flip = 0, written_ms = 0;
     std::uint32_t hot = 0;  // checks left before backing off again; see below
     std::uint32_t unchanged = 0;  // consecutive checks that found the memory unchanged (check backoff)
     std::uint32_t uploads = 0;
@@ -545,6 +551,10 @@ struct Surface {
     bool gx_registered = false;  // its memory is a live GX resource's
     // Created at the resource's creation, ahead of its first bind.
     bool ahead = false, ahead_used = false;
+    // When it was made or a bind last looked it up (steady ms; a bind the
+    // view memos answer stamps it once a recording, from a coarse clock):
+    // what the cold-texture eviction ranks by (evict_cold_surfaces_locked).
+    std::uint64_t used_ms = 0;
     // The last upload's untile and hashes, while the prep pool still has them
     // (TexturePrep); settle_prep() takes the hashes.
     std::shared_ptr<struct TexturePrep> prep;
@@ -1320,13 +1330,24 @@ bool surface_pages(std::uint64_t va, std::uint64_t end) {
     }
     return false;
 }
+void surface_written(Surface& sf) {
+    sf.written_flip = hle_video_flip_count();
+    sf.written_ms = now_ms();
+}
+// Surfaces whose image is in host memory for want of video memory
+// (textures_return_from_host_locked looks for them only while there are any).
+std::uint64_t g_host_surfaces = 0;
+bool surface_in_host(const Surface& sf) { return sf.image && !image_memory_in_vram(sf.memory); }
 void note_surface_added(Surface& sf) {
+    surface_written(sf);
+    if (surface_in_host(sf)) ++g_host_surfaces;
     occupancy_add(sf, 1);
     if (sf.total_src <= kLargeSurfaceSrc) return;
     g_large_surfaces[sf.base] = &sf;
     g_max_large_src = std::max(g_max_large_src, sf.total_src);
 }
 void note_surface_erased(const Surface& sf) {
+    if (surface_in_host(sf) && g_host_surfaces) --g_host_surfaces;
     occupancy_add(sf, ~0u);
     g_large_surfaces.erase(sf.base);
 }
@@ -1683,12 +1704,18 @@ const bool g_refresh_once = [] {
     return !e || e[0] != '0';
 }();
 
+// The clock Surface::used_ms is stamped from at a bind the view memos
+// answer: read once a submission (textures_before_submit), so a bind pays a
+// store, not a clock read.
+std::uint64_t g_coarse_ms = 0;
+
 void refresh_surface_locked(Surface& sf) {
     if (g_refresh_once) {
         const std::uint64_t stamp = g.record_serial + 1;  // 0 stays "never"
         if (sf.refreshed_serial == stamp) return;
         sf.refreshed_serial = stamp;
     }
+    sf.used_ms = g_coarse_ms;
     // A write the watch saw: upload now, whatever the hash schedule below
     // says. That schedule backs off to 2 s for a surface that sits still, so
     // a glyph drawn into a menu atlas that had been idle took up to that long
@@ -1956,6 +1983,14 @@ void drop_rt_region(RtRegion& reg) {
     defer_destroy_image(reg.img.image, reg.img.memory);
 }
 
+void textures_drop_rt_regions_locked(std::uint64_t base) {
+    for (auto it = g_rt_regions.lower_bound(std::make_tuple(base, 0u, 0u, std::numeric_limits<int>::min()));
+         it != g_rt_regions.end() && std::get<0>(it->first) == base;) {
+        drop_rt_region(it->second);
+        it = g_rt_regions.erase(it);
+    }
+}
+
 VkImageView rt_region_view(RtImage& rt, const std::uint32_t* w, std::uint32_t width, std::uint32_t height) {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_RT_REGIONS");
@@ -2029,7 +2064,7 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
         if (vkCreateImage(g.device, &ici, nullptr, &nr.img.image) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(g.device, nr.img.image, &req);
-        if (!image_memory_alloc(req, nr.img.memory)) {
+        if (!image_memory_alloc(req, nr.img.memory, true)) {
             vkDestroyImage(g.device, nr.img.image, nullptr);
             return VK_NULL_HANDLE;
         }
@@ -2149,7 +2184,7 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
         if (vkCreateImage(g.device, &ici, nullptr, &na.img.image) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(g.device, na.img.image, &req);
-        if (!image_memory_alloc(req, na.img.memory)) {
+        if (!image_memory_alloc(req, na.img.memory, true)) {
             vkDestroyImage(g.device, na.img.image, nullptr);
             return VK_NULL_HANDLE;
         }
@@ -2495,7 +2530,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         }
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(g.device, sf.image, &req);
-        if (!image_memory_alloc(req, sf.memory)) {
+        if (!image_memory_alloc(req, sf.memory, true)) {
             vkDestroyImage(g.device, sf.image, nullptr);
             sf.image = VK_NULL_HANDLE;
             sf.failed = true;
@@ -2557,6 +2592,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     }
     Surface& sf = it->second;
     g_last_view_surface = &sf;
+    if (!t_force_async || !sf.used_ms) sf.used_ms = now_ms();
     if (sf.ahead && !sf.ahead_used && !t_force_async) {
         sf.ahead_used = true;
         g_ahead_used.fetch_add(1, std::memory_order_relaxed);
@@ -2847,6 +2883,7 @@ void surface_queue_writeback(std::uint64_t base) {
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end() || it->second.failed || it->second.thick) return;
     it->second.gpu_written = true;
+    surface_written(it->second);
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 16) {
         const Surface& sf = it->second;
@@ -2858,12 +2895,30 @@ void surface_queue_writeback(std::uint64_t base) {
 // A texture created ahead of its first bind, from the T# GX
 // built for it. Resolved the way a bind resolves it (so the first bind finds
 // the surface, its upload already queued to the prep pool).
-std::atomic<std::uint64_t> g_ahead_surfaces{0}, g_ahead_already{0}, g_ahead_failed{0};
+std::atomic<std::uint64_t> g_ahead_surfaces{0}, g_ahead_already{0}, g_ahead_failed{0}, g_ahead_held{0};
+
+// While video memory is down to the reserve and a block (where the image heap
+// may no longer grow for textures, and the eviction looks for room), none is
+// made ahead: 62-64% of those are never bound, and each would take video
+// memory a bound texture wants - or go to host memory for nothing. The first
+// bind makes it, as before ahead creation. BBHOST_AHEAD_HOLD=0: always made.
+bool ahead_held_back() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_AHEAD_HOLD");
+        return !(e && e[0] == '0');
+    }();
+    return on && vram_within_reserve(256ull << 20);
+}
 
 bool textures_create_ahead_locked(const std::uint32_t* w) {
     const std::uint64_t base = tsharp_base(w);
     if (g_surfaces.count(base)) {
         g_ahead_already.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (ahead_held_back()) {
+        if (g_ahead_held.fetch_add(1, std::memory_order_relaxed) == 0)
+            host_log("texture: video memory is down to the reserve: textures are made at their first bind, not ahead, until there is room");
         return false;
     }
     bool dims_ok = true, arrayed = false;
@@ -2937,6 +2992,7 @@ int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const flo
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
         rec().clear_color_image(sf.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+        surface_written(sf);
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
@@ -2965,6 +3021,15 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
     if (it == g_surfaces.end() && tsharp) {
         if (textures_create_ahead_locked(tsharp)) g_region_created.fetch_add(1, std::memory_order_relaxed);
         it = g_surfaces.find(base);
+    }
+    if (const std::uint64_t probe = tex_probe_base(); probe && base == probe) {
+        std::uint64_t head[2] = {};
+        std::memcpy(head, data, std::min<std::size_t>(bytes, sizeof(head)));
+        host_log("texture probe: 0x%llx upload token mip %u layer %u %ux%u at %u,%u (%zu bytes, rows of %u): %s; first %016llx %016llx (flip %llu)",
+                 static_cast<unsigned long long>(base), mip, layer, w, h, x, y, bytes, row_bytes,
+                 it == g_surfaces.end() ? "no surface" : it->second.failed ? "failed surface" : "into the surface",
+                 static_cast<unsigned long long>(head[0]), static_cast<unsigned long long>(head[1]),
+                 static_cast<unsigned long long>(hle_video_flip_count()));
     }
     if (it == g_surfaces.end() || it->second.failed || !it->second.image) {
         g_region_no_surface.fetch_add(1, std::memory_order_relaxed);
@@ -3005,6 +3070,7 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
     r.imageOffset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 0};
     r.imageExtent = {w, h, 1};
     rec().copy_buffer_to_image(staging.buffer, sf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    surface_written(sf);
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3126,6 +3192,12 @@ bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, 
 
 bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     CopySide src, dst;
+    if (tex_probe_base() && (tsharp_base(c.dst_tsharp) == tex_probe_base() || tsharp_base(c.src_tsharp) == tex_probe_base())) {
+        host_log("texture probe: copy token 0x%llx mip %u layer %u -> 0x%llx mip %u layer %u, %ux%u (flip %llu)",
+                 static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), c.src_mip, c.src_layer,
+                 static_cast<unsigned long long>(tsharp_base(c.dst_tsharp)), c.dst_mip, c.dst_layer, c.w, c.h,
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
     // A refused token is a copy that did not happen (the game's method did
     // not run either): the destination's history says so, for F12.
     const auto refused = [&](const char* why) {
@@ -3154,15 +3226,26 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     const std::uint32_t dw = std::max(1u, dst.width >> c.dst_mip), dh = std::max(1u, dst.height >> c.dst_mip);
     if (!c.w || !c.h || c.src_mip >= src.levels || c.dst_mip >= dst.levels || c.src_layer >= src.layers || c.dst_layer >= dst.layers ||
         c.src_x + c.w > sw || c.src_y + c.h > sh || c.dst_x + c.w > dw || c.dst_y + c.h > dh) {
-        if (g_image_copy_range.fetch_add(1, std::memory_order_relaxed) < 8) {
-            host_log("texture: copy token refused: src 0x%llx %ux%u levels %u layers %u%s mip %u layer %u at %u,%u; dst 0x%llx %ux%u levels %u layers %u%s "
-                     "mip %u layer %u at %u,%u; %ux%u",
-                     static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), src.width, src.height, src.levels, src.layers, src.rt ? " (render target)" : "",
-                     c.src_mip, c.src_layer, c.src_x, c.src_y, static_cast<unsigned long long>(tsharp_base(c.dst_tsharp)), dst.width, dst.height, dst.levels,
-                     dst.layers, dst.rt ? " (render target)" : "", c.dst_mip, c.dst_layer, c.dst_x, c.dst_y, c.w, c.h);
+        g_image_copy_range.fetch_add(1, std::memory_order_relaxed);
+        const char* why = !c.w || !c.h                                       ? "an empty region"
+                          : c.src_mip >= src.levels || c.src_layer >= src.layers ? "source mip or layer out of range"
+                          : c.src_x + c.w > sw || c.src_y + c.h > sh         ? "source region out of range"
+                                                                             : "destination mip, layer or region out of range";
+        // Each source, destination and reason once (32 lines at most). The
+        // first eight refusals used to be the only ones logged, and those are
+        // the first frame's cube faces (copied before anything drew them, no
+        // loss), so every later refusal went by without a word.
+        static std::set<std::tuple<std::uint64_t, std::uint64_t, const char*>> seen;  // under g.mu
+        if (seen.size() < 32 && seen.emplace(tsharp_base(c.src_tsharp), tsharp_base(c.dst_tsharp), why).second) {
+            host_log("texture: copy token refused (%s): src 0x%llx %ux%u levels %u layers %u%s mip %u layer %u at %u,%u; dst 0x%llx %ux%u levels %u "
+                     "layers %u%s mip %u layer %u at %u,%u; %ux%u; flip %llu",
+                     why, static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), src.width, src.height, src.levels, src.layers,
+                     src.rt ? " (render target)" : "", c.src_mip, c.src_layer, c.src_x, c.src_y,
+                     static_cast<unsigned long long>(tsharp_base(c.dst_tsharp)), dst.width, dst.height, dst.levels, dst.layers,
+                     dst.rt ? " (render target)" : "", c.dst_mip, c.dst_layer, c.dst_x, c.dst_y, c.w, c.h,
+                     static_cast<unsigned long long>(hle_video_flip_count()));
         }
-        refused(c.src_mip >= src.levels || c.src_layer >= src.layers ? "source mip or layer out of range"
-                                                                     : "destination mip, layer or region out of range");
+        refused(why);
         return false;
     }
     if (src.rt) g_image_copy_rt_src.fetch_add(1, std::memory_order_relaxed);
@@ -3187,6 +3270,7 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (dst.surface) surface_written(*dst.surface);
     if (dst.surface && !dst.surface->gpu_written) {
         dst.surface->gpu_written = true;
         dst.surface->watched = false;
@@ -3258,9 +3342,170 @@ void retire_surfaces_locked() {
 }
 
 void textures_before_submit() {
+    g_coarse_ms = now_ms();
     for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) PrepPool::get().wait(*p);
     g_batch_preps.clear();
     retire_surfaces_locked();
+    image_reuse_sweep_locked();
+    evict_cold_surfaces_locked();
+    textures_return_from_host_locked();
+}
+
+// BBHOST_VRAM_EVICT_S=<s> (20; 0: never, as before; on with the reserve):
+// when video memory is down to the reserve - the image heap may not grow, so
+// a new texture would go to host memory - and the heap's blocks have less
+// than 256 MiB free for the textures to come, textures no bind has looked up
+// for <s> seconds go, up to that room and 256 MiB a second: those made ahead
+// at their resource's creation and never bound first, then the oldest. The
+// next bind makes one again from the guest memory that holds its texels.
+// Never one a shader or a copy wrote (its image holds what guest memory does
+// not). On a 6 GB card the made-ahead textures alone were 0.16-0.59 GiB.
+std::uint64_t g_evicted_surfaces = 0, g_evicted_bytes = 0, g_evicted_ahead = 0;
+
+void evict_cold_surfaces_locked() {
+    static const std::uint64_t idle_ms = [] {
+        const char* e = std::getenv("BBHOST_VRAM_EVICT_S");
+        return (e && *e ? std::strtoull(e, nullptr, 10) : 20ull) * 1000;
+    }();
+    if (!idle_ms || !vram_reserve_bytes()) return;
+    static std::uint64_t last_ms = 0;
+    const std::uint64_t now = now_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    constexpr std::uint64_t kWant = 256ull << 20;
+    if (!vram_within_reserve(kWant)) return;
+    const std::uint64_t free_in_blocks = image_heap_vram_free_locked();
+    if (free_in_blocks >= kWant) return;
+    const std::uint64_t target = kWant - free_in_blocks;
+    struct Cold {
+        bool used;  // false: made ahead and never bound - these go first
+        std::uint64_t used_ms, base;
+        bool operator<(const Cold& o) const { return used != o.used ? !used : used_ms < o.used_ms; }
+    };
+    std::vector<Cold> cold;
+    for (const auto& [base, sf] : g_surfaces) {
+        if (!sf.image || sf.failed || sf.gpu_written || sf.copied_mips || surface_in_host(sf)) continue;
+        if (!sf.used_ms || now - sf.used_ms < idle_ms) continue;
+        cold.push_back({!(sf.ahead && !sf.ahead_used), sf.used_ms, base});
+    }
+    if (cold.empty()) return;
+    std::sort(cold.begin(), cold.end());
+    std::uint64_t freed = 0, n = 0;
+    for (const Cold& c : cold) {
+        if (freed >= target) break;
+        auto it = g_surfaces.find(c.base);
+        if (it == g_surfaces.end()) continue;
+        Surface& sf = it->second;
+        freed += sf.memory.size;
+        ++n;
+        if (!c.used) ++g_evicted_ahead;
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        g_surfaces.erase(it);
+    }
+    if (!n) return;
+    bump_view_epoch();
+    g_evicted_surfaces += n;
+    g_evicted_bytes += freed;
+    static int logs = 0;
+    if (logs++ < 12)
+        host_log("texture: video memory down to the reserve: %llu textures not bound for %llu s evicted (%llu MiB; %llu so far, %llu MiB, "
+                 "%llu of them made ahead and never bound)",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(idle_ms / 1000),
+                 static_cast<unsigned long long>(freed >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
+                 static_cast<unsigned long long>(g_evicted_bytes >> 20), static_cast<unsigned long long>(g_evicted_ahead));
+}
+
+// Textures a shortage (or the reserve) put in host memory come back once
+// video memory has room again: the surface goes as a retired one does, and its
+// next bind makes it again - in video memory now - from the guest memory that
+// holds its texels. Never one a shader or a copy wrote (its image holds what
+// guest memory does not). Once a second, 64 MiB a turn at most, with 512 MiB
+// to spare above the reserve so what comes back does not push other textures
+// out again.
+std::uint64_t g_returned_surfaces = 0, g_returned_bytes = 0;
+
+void textures_return_from_host_locked() {
+    if (!g_host_surfaces || !vram_return_on()) return;
+    static std::uint64_t last_ms = 0;
+    const std::uint64_t now = now_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    const std::int64_t room = vram_headroom() - static_cast<std::int64_t>(vram_reserve_bytes() + (512ull << 20));
+    if (room <= 0) return;
+    std::uint64_t budget = std::min<std::uint64_t>(static_cast<std::uint64_t>(room), 64ull << 20);
+    bool any = false;
+    for (auto it = g_surfaces.begin(); it != g_surfaces.end() && budget;) {
+        Surface& sf = it->second;
+        if (!surface_in_host(sf) || sf.failed || sf.gpu_written || sf.copied_mips || sf.memory.size > budget) {
+            ++it;
+            continue;
+        }
+        budget -= sf.memory.size;
+        ++g_returned_surfaces;
+        g_returned_bytes += sf.memory.size;
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        it = g_surfaces.erase(it);
+        any = true;
+    }
+    if (any) bump_view_epoch();
+}
+
+std::string textures_return_report() {
+    char buf[224];
+    std::snprintf(buf, sizeof(buf), ", textures in host memory %llu, back from it %llu (%llu MiB), evicted cold %llu (%llu MiB), not made ahead %llu",
+                  static_cast<unsigned long long>(g_host_surfaces), static_cast<unsigned long long>(g_returned_surfaces),
+                  static_cast<unsigned long long>(g_returned_bytes >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
+                  static_cast<unsigned long long>(g_evicted_bytes >> 20), static_cast<unsigned long long>(g_ahead_held.load()));
+    return buf;
+}
+
+ReuseRetired textures_retire_reused_locked(std::uint64_t now, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
+    ReuseRetired out;
+    static std::uint64_t cursor = 0;  // the next base the scan looks at
+    int k = 0;
+    auto it = g_surfaces.lower_bound(cursor);
+    for (; it != g_surfaces.end();) {
+        if ((++k & 15) == 0 && std::chrono::steady_clock::now() >= deadline) break;
+        Surface& sf = it->second;
+        const std::size_t span = std::max<std::size_t>(sf.total_src, 1);
+        if (!sf.image || !sf.gpu_written || sf.written_ms + idle_ms > now || gx_resource_at(sf.base, span, nullptr) ||
+            (!gx_resource_newer_overlapping(sf.base, span, sf.written_flip) &&
+             !render_target_newer_overlapping_locked(sf.base, span, sf.written_flip, nullptr))) {
+            ++it;
+            continue;
+        }
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) {
+            host_log("texture: shader-written 0x%llx %ux%u (%llu KiB) retired: a newer object holds its memory, last written %llu s ago",
+                     static_cast<unsigned long long>(sf.base), sf.width, sf.height, static_cast<unsigned long long>(sf.memory.size >> 10),
+                     static_cast<unsigned long long>((now - sf.written_ms) / 1000));
+        }
+        ++out.n;
+        out.bytes += sf.memory.size;
+        // The copies made of its levels go with it: keyed by its base, they
+        // would hold their memory until a surface at that base was read again.
+        for (auto la = g_level_aliases.lower_bound(std::make_tuple(sf.base, 0u, 0u, 0u, std::numeric_limits<int>::min()));
+             la != g_level_aliases.end() && std::get<0>(la->first) == sf.base;) {
+            invalidate_rt_views(la->second.img.base);
+            defer_destroy_view(la->second.img.view);
+            defer_destroy_image(la->second.img.image, la->second.img.memory);
+            la = g_level_aliases.erase(la);
+        }
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        it = g_surfaces.erase(it);
+    }
+    cursor = it == g_surfaces.end() ? 0 : it->first;  // at the end the next scan starts over
+    if (out.n) bump_view_epoch();
+    return out;
 }
 
 // The wait above, made first without the renderer's mutex, for the jobs
@@ -3629,6 +3874,7 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes) {
     for (auto kv = g_large_surfaces.lower_bound(large_first); kv != g_large_surfaces.end() && kv->first < end; ++kv) {
         if (kv->second->base + kv->second->total_src > va) hit.push_back(kv->second);
     }
+    const std::uint64_t probe = tex_probe_base();  // BBHOST_TEX_PROBE; 0 (off) checks nothing below
     for (Surface* sp : hit) {
         Surface& sf = *sp;
         ++touched;
@@ -3640,6 +3886,13 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes) {
         sf.unchanged = 0;
         sf.cp_dirty = true;
         if (sf.hot < 2) sf.hot = 2;
+        if (probe && sf.base == probe) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 24) {
+                host_log("texture probe: 0x%llx under a GPU write to [0x%llx,+0x%zx) (gpu-written %d, flip %llu)", static_cast<unsigned long long>(sf.base),
+                         static_cast<unsigned long long>(va), bytes, sf.gpu_written ? 1 : 0, static_cast<unsigned long long>(hle_video_flip_count()));
+            }
+        }
         if (sf.gpu_written && sf.width >= 16) {
             tex_event(sf.base, sf.total_src, "dirty 0x%llx (gpu-written %ux%u) by a write to [0x%llx,+0x%zx)", static_cast<unsigned long long>(sf.base),
                       sf.width, sf.height, static_cast<unsigned long long>(va), bytes);
@@ -3677,6 +3930,16 @@ std::uint64_t textures_hash_us() { return g_hash_us.load(); }
 std::uint64_t textures_replacements() { return g_surface_replacements.load(); }
 
 void textures_report() {
+    if (const std::uint64_t probe = tex_probe_base(); probe && hle_kernel_va_mapped(probe, 32)) {
+        std::uint64_t head[4] = {};
+        std::memcpy(head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(probe)), sizeof(head));
+        auto it = g_surfaces.find(probe);
+        host_log("texture probe: 0x%llx memory now %016llx %016llx %016llx %016llx; surface %s (gpu-written %d, watched %d, uploads %u)",
+                 static_cast<unsigned long long>(probe), static_cast<unsigned long long>(head[0]), static_cast<unsigned long long>(head[1]),
+                 static_cast<unsigned long long>(head[2]), static_cast<unsigned long long>(head[3]), it == g_surfaces.end() ? "none" : "cached",
+                 it == g_surfaces.end() ? 0 : it->second.gpu_written ? 1 : 0, it == g_surfaces.end() ? 0 : it->second.watched ? 1 : 0,
+                 it == g_surfaces.end() ? 0u : it->second.uploads);
+    }
     if (const std::uint64_t n = g_view_memo_hits + g_view_memo_misses) {
         host_log("texture: view memo %llu of %llu descriptor lookups (%.1f%%), %llu resolved, %llu evicted%s",
                  static_cast<unsigned long long>(g_view_memo_hits), static_cast<unsigned long long>(n),

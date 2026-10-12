@@ -4,6 +4,10 @@
  *
  * Every second it logs where the player is:
  *     mapval pos <epoch s> <block hex> <x> <y> <z> <yaw> <hp>
+ * as they happen, a loading screen coming and going (mapval loading-begins,
+ * loading-ends), the player's death (mapval death) and each time the game
+ * places the player in a map - a load, a death's respawn, a lamp (mapval
+ * placed: the host's on_world_load);
  * and, once the player has been in the world BBHOST_MAPVAL_START seconds
  * (default 55: the frozen seed's scripted death and respawn are over), it
  * runs the tour in BBHOST_MAPVAL_TOUR, one step a line:
@@ -17,13 +21,34 @@
  *                                             driver presses attack)
  *     falldeath <name> <x> <y> <z> <height>   HP to 1, dropped from height
  *                                             above the point: a death there
- *     travel <return point> <block hex> <name>
+ *     travel <return point> <block hex> <name> [<event flag>...]
  *                                             lamp travel (a full map load,
  *                                             api->lamp_warp); done once the
- *                                             player stands in that block
+ *                                             player stands still in that block
+ *                                             with the loading screen gone. Up
+ *                                             to four event flags are turned on
+ *                                             first, as the load reads them: a
+ *                                             door's "opened", say
  *     walk <name> <s>                         log walk-ready and give the
  *                                             driver <s> seconds to walk
  *     wait <s>
+ * and, for tools/area_check.py, which measures each place it stands in:
+ *     hold <s>                                wait with the player's HP kept full
+ *     mark <name>                             log `mapval mark <name> <t> <block>
+ *                                             <x> <y> <z> yaw <yaw> hp <hp> loading
+ *                                             <0|1>`: where the player is then
+ *     camera                                  the follow camera back behind the
+ *                                             player, facing as the player does
+ *     quiet <radius m>                        switch off the ordinary enemies
+ *                                             within the radius (the game's own
+ *                                             "disable character"; a load makes
+ *                                             them again), so the place holds still
+ *     dump <name>                             this frame to
+ *                                             $BBHOST_MAPVAL_DUMPS/<name>.ppm
+ *     capture <n> [<name>]                    let BBHOST_CAPTURE_DRAW take up to n
+ *                                             draws, into
+ *                                             $BBHOST_MAPVAL_CAPTURES/<name>; 0 stops
+ * (the last two ask the host through BBHOST_TEST_REQUESTS, hle/video.cpp).
  * Each step logs what it did with the time, so the dataset script can find
  * the play-log samples of the same seconds. While a warp or kill step runs
  * the player's HP is kept full (the seed stands among enemies).
@@ -33,6 +58,7 @@
 #include "bbhost_plugin.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,15 +79,36 @@ static uint64_t rd64(uint64_t a) {
     return ok(a & ~7ull) ? *(const uint64_t*)(uintptr_t)a : 0;
 }
 
+/* --- loading screens -------------------------------------------------------- */
+
+/* A loading screen is up: the game's NowLoading request (a byte at
+ * 0x596286b) with no in-game frame run since (CSNowLoadingHelper, *0x593e8b8,
+ * +0x50 or +0x51) - the host's own test (src/engine/loading.cpp), which
+ * prints `loading:`. 0 when it cannot be read. A lamp travel puts the player
+ * in its block well before the screen goes: a load's flips complete at once,
+ * so the travel's ninety still frames came and went under it. */
+static int loading_screen(void) {
+    uint8_t requested = 0;
+    uint64_t helper = 0;
+    if (api->read(0x596286b, &requested, 1) || !requested) return 0;
+    if (api->read(0x593e8b8, &helper, 8) || !ok(helper)) return 1;
+    const volatile uint8_t* h = (const volatile uint8_t*)(uintptr_t)helper;
+    return !(h[0x50] || h[0x51]);
+}
+static int loading;        /* this frame's answer */
+static double loading_t0;  /* when the screen came up */
+
 /* --- the tour ------------------------------------------------------------ */
 
-enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK };
+enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE };
 typedef struct {
     int kind;
     char name[64];
     float x, y, z, yaw, hold;
     int team;
     uint32_t block; /* warp into this block (0: the current one) */
+    uint32_t flags[4]; /* travel: event flags turned on before it */
+    int nflags;
 } Step;
 static Step steps[1024];
 static int nsteps, cur = -1;
@@ -79,6 +126,8 @@ static int retravel;
 static int retravel_step = -1, retravel_count;
 static int warp_retries;
 static float travel_last[3];
+static double travel_still_t;  /* when the player came to rest for the travel's stillness */
+static double travel_loading;  /* loading-screen seconds within the current travel step */
 static int dump_chrs = 0, want_team = -1;
 
 static void load_tour(const char* path) {
@@ -109,12 +158,33 @@ static void load_tour(const char* path) {
         }
         else if (!strcmp(kind, "falldeath") && sscanf(line, "%*s %63s %f %f %f %f", s.name, &s.x, &s.y, &s.z, &s.hold) == 5)
             s.kind = S_FALL;
-        else if (!strcmp(kind, "travel") && sscanf(line, "%*s %d %x %63s", &s.team, &s.block, s.name) == 3)
-            s.kind = S_TRAVEL; /* travel <return point id> <block hex> <name> */
+        else if (!strcmp(kind, "travel") && sscanf(line, "%*s %d %x %63s", &s.team, &s.block, s.name) == 3) {
+            s.kind = S_TRAVEL; /* travel <return point id> <block hex> <name> [<event flag>...] */
+            int used = 0;
+            unsigned f[4];
+            sscanf(line, "%*s %*d %*x %*63s%n", &used);
+            if (used > 0) s.nflags = sscanf(line + used, "%u %u %u %u", &f[0], &f[1], &f[2], &f[3]);
+            if (s.nflags < 0) s.nflags = 0;
+            for (int k = 0; k < s.nflags; ++k) s.flags[k] = f[k];
+        }
         else if (!strcmp(kind, "walk") && sscanf(line, "%*s %63s %f", s.name, &s.hold) == 2)
             s.kind = S_WALK; /* walk <name> <seconds>: the driver walks */
         else if (!strcmp(kind, "wait") && sscanf(line, "%*s %f", &s.hold) == 1)
             s.kind = S_WAIT, strcpy(s.name, "wait");
+        else if (!strcmp(kind, "hold") && sscanf(line, "%*s %f", &s.hold) == 1)
+            s.kind = S_HOLD, strcpy(s.name, "hold");
+        else if (!strcmp(kind, "mark") && sscanf(line, "%*s %63s", s.name) == 1)
+            s.kind = S_MARK;
+        else if (!strcmp(kind, "camera"))
+            s.kind = S_CAMERA, strcpy(s.name, "camera");
+        else if (!strcmp(kind, "quiet") && sscanf(line, "%*s %f", &s.hold) == 1)
+            s.kind = S_QUIET, strcpy(s.name, "quiet"); /* hold: the radius */
+        else if (!strcmp(kind, "dump") && sscanf(line, "%*s %63s", s.name) == 1)
+            s.kind = S_DUMP;
+        else if (!strcmp(kind, "capture") && sscanf(line, "%*s %d", &s.team) == 1) {
+            s.kind = S_CAPTURE; /* team: the draws */
+            if (sscanf(line, "%*s %*d %63s", s.name) != 1) s.name[0] = 0;
+        }
         else {
             api->log("mapval: bad tour line: %s", line);
             continue;
@@ -247,6 +317,80 @@ static int64_t player_hp(void) {
     return chr_hp(player_chr(), &hp, &mx) ? hp : 0;
 }
 
+/* --- for tools/area_check.py ------------------------------------------------ */
+
+/* A request to the host (BBHOST_TEST_REQUESTS, hle/video.cpp): one line in a
+ * file of its own, written beside and renamed into place, so the host never
+ * reads half of it. */
+static int request_seq;
+static void request(const char* line) {
+    const char* dir = getenv("BBHOST_TEST_REQUESTS");
+    char tmp[1024], req[1024];
+    if (!dir || !*dir) {
+        api->log("mapval: no BBHOST_TEST_REQUESTS for \"%s\"", line);
+        return;
+    }
+    snprintf(tmp, sizeof tmp, "%s/%06d.tmp", dir, request_seq);
+    snprintf(req, sizeof req, "%s/%06d.req", dir, request_seq);
+    ++request_seq;
+    FILE* f = fopen(tmp, "w");
+    if (!f) {
+        api->log("mapval: cannot write %s", tmp);
+        return;
+    }
+    fprintf(f, "%s\n", line);
+    fclose(f);
+    if (rename(tmp, req) != 0) api->log("mapval: cannot rename %s", tmp);
+}
+
+/* The follow camera's owner (CHR_CAM_OWNER_ROOT_PTR's object, +0x2830): its
+ * byte +0x80 asks for the camera to be put back behind the player
+ * (include/bbhost/engine/sprj/camera.hpp, ChrCamOwner). */
+static int reset_camera(void) {
+    uint64_t root = 0;
+    if (api->read(0x593e860, &root, 8) || !ok(root)) return 0;
+    uint64_t owner = rd64(root + 0x2830);
+    if (!ok(owner)) return 0;
+    *(volatile uint8_t*)(uintptr_t)(owner + 0x80) = 1;
+    return 1;
+}
+
+/* The game's "disable character" (EMEVD 2004[05]: its collision off and bit
+ * 0 of its ChrSetEntry's +0x20, which keeps it out of the world's update and
+ * draw), as plugins/boss_rush does it to clear an arena. */
+static int chr_disabled(const void* ins) {
+    const uint8_t* entry = (const uint8_t*)(uintptr_t)rd64((uint64_t)(uintptr_t)ins + 0x18);
+    return entry && ok((uint64_t)(uintptr_t)entry & ~7ull) && (entry[0x20] & 1);
+}
+static void quiet(float radius, double t) {
+    static BbChr chrs[1024]; /* ~56 KiB: not on the game's stack */
+    size_t n = 0;
+    float p[3];
+    int off = 0, left = 0;
+    if (api->version < 8 || api->chr_list(chrs, 1024, &n) || api->player_position(p, NULL)) {
+        api->log("mapval quiet %.3f unavailable", t);
+        return;
+    }
+    if (n > 1024) n = 1024;
+    for (size_t i = 0; i < n; ++i) {
+        const BbChr* c = &chrs[i];
+        float dx = c->pos[0] - p[0], dy = c->pos[1] - p[1], dz = c->pos[2] - p[2];
+        if (c->is_player || c->hp <= 0 || dx * dx + dz * dz > radius * radius || fabsf(dy) > 30) continue;
+        /* 23: an ordinary enemy's team (NpcParam teamType); bosses have their own */
+        if (c->team_type != 23 || c->npc_param <= 0 || !c->ins) {
+            ++left;
+            continue;
+        }
+        if (chr_disabled(c->ins)) continue;
+        BbCallRegs regs;
+        memset(&regs, 0, sizeof regs);
+        regs.arg[0] = (uint64_t)(uintptr_t)c->ins;
+        regs.arg[1] = 1;
+        if (api->call_guest(0x1cc6390, &regs) == 0) ++off;
+    }
+    api->log("mapval quiet %.3f %d enemies within %.0f m switched off, %d other characters left", t, off, radius, left);
+}
+
 /* --- per frame ------------------------------------------------------------- */
 
 static void begin(int i, double t) {
@@ -294,8 +438,13 @@ static void begin(int i, double t) {
         kill_last_warp = 0;
         api->log("mapval step %d kill %.3f radius %.1f", i, t, s->hold);
     } else if (s->kind == S_TRAVEL) {
+        for (int k = 0; k < s->nflags; ++k) {
+            int r = api->event_flag_set(s->flags[k], 1);
+            api->log("mapval flag %u on %.3f -> %s", s->flags[k], t, r ? "REFUSED" : "set");
+        }
         int r = api->size >= sizeof(BbHostApi) ? api->lamp_warp(s->team) : 1;
         travel_still = 0;
+        travel_loading = 0;
         tour_rp = s->team;
         tour_block = s->block;
         api->log("mapval step %d travel %s %.3f return point %d block %08x -> %s", i, s->name, t, s->team, s->block, r ? "REFUSED" : "queued");
@@ -304,6 +453,34 @@ static void begin(int i, double t) {
         float p[3] = {0, 0, 0};
         api->player_position(p, NULL);
         api->log("mapval walk-ready %s %.3f %.3f %.3f %.3f", s->name, t, p[0], p[1], p[2]);
+    } else if (s->kind == S_HOLD) {
+        api->log("mapval step %d hold %.3f %.1f s", i, t, s->hold);
+    } else if (s->kind == S_MARK) {
+        float p[3] = {0, 0, 0}, yaw = 0;
+        uint32_t b = 0;
+        api->player_position(p, &yaw);
+        api->player_block(&b);
+        api->log("mapval mark %s %.3f %08x %.3f %.3f %.3f yaw %.3f hp %lld loading %d", s->name, t, b, p[0], p[1], p[2], yaw,
+                 (long long)player_hp(), loading);
+    } else if (s->kind == S_CAMERA) {
+        api->log("mapval camera %.3f %s", t, reset_camera() ? "reset" : "unavailable");
+    } else if (s->kind == S_QUIET) {
+        quiet(s->hold, t);
+    } else if (s->kind == S_DUMP) {
+        const char* dir = getenv("BBHOST_MAPVAL_DUMPS");
+        char line[1100];
+        snprintf(line, sizeof line, "dump %s/%s.ppm", dir && *dir ? dir : ".", s->name);
+        request(line);
+        api->log("mapval dump %s %.3f", s->name, t);
+    } else if (s->kind == S_CAPTURE) {
+        const char* dir = getenv("BBHOST_MAPVAL_CAPTURES");
+        char line[1100];
+        if (s->name[0] && dir && *dir)
+            snprintf(line, sizeof line, "capture %d %s/%s", s->team, dir, s->name);
+        else
+            snprintf(line, sizeof line, "capture %d", s->team);
+        request(line);
+        api->log("mapval capture %d %s %.3f", s->team, s->name[0] ? s->name : "-", t);
     } else {
         api->log("mapval step %d wait %.3f %.1f s", i, t, s->hold);
     }
@@ -334,7 +511,7 @@ static void tick(double t) {
     if (retravel) {
         uint32_t b = 0;
         int in = have && api->player_block(&b) == 0 && b == tour_block;
-        if (in && fabsf(p[0] - travel_last[0]) + fabsf(p[1] - travel_last[1]) + fabsf(p[2] - travel_last[2]) < 0.05f) travel_still++;
+        if (in && !loading && fabsf(p[0] - travel_last[0]) + fabsf(p[1] - travel_last[1]) + fabsf(p[2] - travel_last[2]) < 0.05f) travel_still++;
         else travel_still = 0;
         if (have) memcpy(travel_last, p, sizeof travel_last);
         /* A request made while a load or respawn is still going can be
@@ -354,7 +531,7 @@ static void tick(double t) {
         heal();
         /* A warp made while a load is still on screen is dropped: warp
          * again (up to 10 times, 3 s apart) until the player is there. */
-        if (phase == 0 && el >= 1.5 && have && warp_retries < 10 && hypotf(p[0] - s->x, p[2] - s->z) > 2.5f) {
+        if (phase == 0 && el >= 1.5 && have && !loading && warp_retries < 10 && hypotf(p[0] - s->x, p[2] - s->z) > 2.5f) {
             float v[3] = {s->x, s->y, s->z};
             ++warp_retries;
             api->player_warp(s->block, v, s->yaw);
@@ -362,7 +539,7 @@ static void tick(double t) {
             api->log("mapval rewarp %s %.3f try %d (at %.3f %.3f %.3f)", s->name, t, warp_retries, p[0], p[1], p[2]);
             return;
         }
-        if (phase == 0 && el >= 1.5 && have) {
+        if (phase == 0 && el >= 1.5 && have && !loading) {
             uint32_t b = 0;
             api->player_block(&b);
             api->log("mapval at %s %.3f %08x %.3f %.3f %.3f yaw %.3f", s->name, t, b, p[0], p[1], p[2], yaw);
@@ -437,14 +614,17 @@ static void tick(double t) {
         uint32_t b = 0;
         int in = have && api->player_block(&b) == 0 && b == s->block;
         if (in) heal();
-        if (in && fabsf(p[0] - travel_last[0]) + fabsf(p[1] - travel_last[1]) + fabsf(p[2] - travel_last[2]) < 0.05f)
-            travel_still++;
-        else
+        if (in && !loading && fabsf(p[0] - travel_last[0]) + fabsf(p[1] - travel_last[1]) + fabsf(p[2] - travel_last[2]) < 0.05f) {
+            if (travel_still++ == 0) travel_still_t = t;
+        } else {
             travel_still = 0;
+        }
         if (have) memcpy(travel_last, p, sizeof travel_last);
-        /* In the block and still for ~3 s (90 frames at 30 fps). */
-        if (travel_still > 90 && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
-            api->log("mapval travel-done %s %.3f %08x %.3f %.3f %.3f after %.1f s", s->name, t, b, p[0], p[1], p[2], el);
+        /* In the block with the loading screen gone, and still for ~3 s (90
+         * frames at 30 fps, and 2 s however fast the frames come). */
+        if (travel_still > 90 && t - travel_still_t >= 2.0 && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
+            api->log("mapval travel-done %s %.3f %08x %.3f %.3f %.3f after %.1f s, %.1f s of it loading", s->name, t, b, p[0], p[1], p[2],
+                     el, travel_loading);
             next = 1;
         } else if (travel_failed || el > 150) {
             api->log("mapval travel-failed %s %.3f in %08x after %.1f s", s->name, t, b, el);
@@ -466,6 +646,11 @@ static void tick(double t) {
             api->log("mapval walk-end %s %.3f %.3f %.3f %.3f", s->name, t, p[0], p[1], p[2]);
             next = 1;
         }
+    } else if (s->kind == S_HOLD) {
+        heal();
+        if (el >= s->hold) next = 1;
+    } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE) {
+        next = 1; /* done in begin() */
     } else if (el >= s->hold) {
         next = 1;
     }
@@ -479,11 +664,48 @@ static void tick(double t) {
     }
 }
 
+/* A death: the player's HP gone to 0 (the same character as the last frame
+ * - a load builds a new one, whose HP reads 0 until it is set up). */
+static void watch_death(double t, const float p[3], int have) {
+    static uint64_t last_chr;
+    static int last_hp = -1;
+    int hp = 0, mx = 0;
+    uint64_t chr = have ? player_chr() : 0;
+    if (chr != last_chr) {
+        last_chr = chr;
+        last_hp = -1;
+    }
+    if (!chr || !chr_hp(chr, &hp, &mx) || mx <= 0) return;
+    if (hp <= 0 && last_hp > 0) {
+        uint32_t b = 0;
+        api->player_block(&b);
+        api->log("mapval death %.3f %08x %.3f %.3f %.3f", t, b, p[0], p[1], p[2]);
+    }
+    last_hp = hp;
+}
+
+/* The host's on_world_load: the player placed in a map (a load, a death's
+ * respawn, a lamp, a warp into another block). */
+static void placed(uint32_t block, void* u) {
+    (void)u;
+    api->log("mapval placed %.3f %08x", now_s(), block);
+}
+
 static void on_frame(void* u) {
     (void)u;
     double t = now_s();
     float p[3], yaw = 0;
     int have = api->player_position(p, &yaw) == 0;
+    int was = loading;
+    loading = loading_screen();
+    if (loading && !was) {
+        loading_t0 = t;
+        api->log("mapval loading-begins %.3f", t);
+    } else if (!loading && was) {
+        if (cur >= 0 && !tour_done && (steps[cur].kind == S_TRAVEL || retravel)) travel_loading += t - loading_t0;
+        api->log("mapval loading-ends %.3f after %.1f s", t, t - loading_t0);
+    }
+    watch_death(t, p, have);
     if (have) {
         if (!first_seen_t || t - last_seen_t > 30) first_seen_t = first_seen_t ? first_seen_t : t;
         last_seen_t = t;
@@ -519,6 +741,7 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     if (st && *st) start_after = atof(st);
     if (tour && *tour) load_tour(tour);
     a->on_frame(on_frame, 0);
+    if (a->size >= offsetof(BbHostApi, on_world_load) + sizeof(a->on_world_load) && a->on_world_load) a->on_world_load(placed, 0);
     a->log("mapval: loaded (start after %.0f s in the world)", start_after);
     return 0;
 }

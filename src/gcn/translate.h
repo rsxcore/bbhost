@@ -77,7 +77,26 @@ struct BufferBinding {
     // A load indexes it (tbuffer_load_format_* with idxen): the host binds the
     // V#'s records (count x stride) and passes cb_stride / cb_w3.
     bool indexed = false;
+    // A load reads it at a run-time offset (s_buffer_load_dword* with the
+    // offset in an SGPR): the host binds the V#'s whole range - num_records
+    // bytes, times the stride when that is not 0 - and passes its length in
+    // dwords as cb_stride, which the shader checks each dword against, as GCN
+    // does (a dword past the range reads 0). Never also `indexed`.
+    bool ranged = false;
+    // A buffer store writes it (buffer_store_dword* at the V#'s base plus an
+    // SGPR or constant offset, Translator::store_bound): always also `ranged`,
+    // and the host binds the guest memory itself - never a copy or snapshot,
+    // which would take the stores in its place.
+    bool written = false;
 };
+// A V#'s range in dwords as GCN checks a buffer load against it, from its
+// words 1 (stride in [29:16]) and 2 (num_records): num_records bytes, times the
+// stride when that is not 0, a dword in range when it starts inside.
+inline std::uint64_t vsharp_range_dwords(std::uint32_t w1, std::uint32_t w2) {
+    const std::uint32_t stride = (w1 >> 16) & 0x3fff;
+    const std::uint64_t bytes = stride ? std::uint64_t{w2} * stride : std::uint64_t{w2};
+    return (bytes + 3) / 4;
+}
 
 // One vertex element a vertex shader takes from Vulkan vertex input instead of
 // its fetch shader. The fetch shader would have loaded it with
@@ -341,6 +360,16 @@ struct TranslateOptions {
     // where they care - not all of them do.
     bool tess_patch_cull = false;
     bool tess_patch_cull_all = false;  // a check: leave every patch out
+    // ds_append / ds_consume with GDS set count in the guest word the dispatch
+    // binds for each GDS dword (StageParams::gds_counter): GX keeps an
+    // append/consume buffer's counter in the word past its records and only
+    // moves it through GDS around the dispatch, so that word is the counter -
+    // a D3D11 UAV's hidden counter. Each subgroup adds or takes its active
+    // lanes in one atomic and every lane gets the value from before, as GCN
+    // gives a wave (the shader adds its own v_mbcnt rank). Off (the host's
+    // BBHOST_GDS_COUNTERS=0), GDS is taken for LDS and each lane is handed its
+    // rank on top, as before.
+    bool gds_counters = true;
 };
 
 struct TranslateResult {
@@ -378,6 +407,9 @@ struct TranslateResult {
     // typed lift (gcn/lift.h) has no cross-lane
     // operation at all: the renderer clears it for one.
     std::uint32_t wave64_needs = kWave64NotPixel;
+    // TranslateOptions::gds_counters: the program's ds_append / ds_consume
+    // sites with GDS set - a dispatch of it binds their words.
+    std::uint32_t gds_counters = 0;
     bool ok() const { return errors.empty(); }
 };
 
@@ -410,14 +442,26 @@ struct StageParams {
     // TranslateOptions::tess_lds_bound: the bytes from lds_address the stage
     // may touch (0: none - every read is 0).
     std::uint32_t lds_bytes;
-    std::uint32_t pad[2];
+    // TranslateOptions::gds_counters: the GDS dword gds_counter[0] stands for.
+    std::uint32_t gds_base;
+    std::uint32_t pad;
     std::uint32_t cb_bias_dw[16];  // buffers[n]: dword index of the V# base inside its bound range
-    std::uint32_t cb_stride[16];   // buffers[n] read by index (BufferBinding::indexed): the V#'s stride in bytes
+    // buffers[n] read by index (BufferBinding::indexed): the V#'s stride in
+    // bytes; read at a run-time offset (BufferBinding::ranged): the V#'s range
+    // in dwords, rounded up (0 for a null or empty V#).
+    std::uint32_t cb_stride[16];
     std::uint32_t cb_w3[16];       // the same: the V#'s word 3 (data and number format, DST_SEL)
-    // TranslateOptions::vertex_formats_from_params: vertex_format_descriptor
-    // per vertex-input location. TessRole::LsCompute (no vertex input) reads
-    // [0..4] as the draw's control points instead (kTess*).
-    std::uint32_t vertex_formats[16];
+    union {
+        // TranslateOptions::vertex_formats_from_params: vertex_format_descriptor
+        // per vertex-input location. TessRole::LsCompute (no vertex input) reads
+        // [0..4] as the draw's control points instead (kTess*).
+        std::uint32_t vertex_formats[16];
+        // TranslateOptions::gds_counters, a compute dispatch (no vertex input):
+        // the guest address of the word each of GDS dwords gds_base.. counts
+        // in, 0 for none - its ds_append / ds_consume then do nothing and
+        // return 0.
+        std::uint64_t gds_counter[8];
+    };
     // TessRole::Domain: the row of the domain shader's projection that gives
     // clip w, the patch stride and base its constants hold, and the near plane
     // - what the prologue needs to leave out a patch whose centre is at or
@@ -432,6 +476,8 @@ struct StageParams {
     std::uint32_t sampler_index[16];
 };
 static_assert(offsetof(StageParams, image_index) == 384 && sizeof(StageParams) == 512, "the params block's layout is the shaders'");
+static_assert(offsetof(StageParams, gds_base) == 88 && offsetof(StageParams, gds_counter) == 288, "the params block's layout is the shaders'");
+constexpr std::uint32_t kGdsCounters = 8;  // StageParams::gds_counter
 // TessRole::LsCompute: StageParams::vertex_formats as the draw's control points.
 constexpr int kTessIndexLo = 0, kTessIndexHi = 1;  // index buffer guest address (0: none)
 constexpr int kTessCount = 2;                      // control points
@@ -465,6 +511,13 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
 // is the same texel (a gather keeps its Offset: shaderImageGatherExtended).
 void set_runtime_sample_offsets(bool on);
 bool runtime_sample_offsets();
+
+// Typed buffer loads (tbuffer_load_format_*) take the identity select - X000,
+// XY00, XYZ0 or XYZW by the format's components - whatever the V#'s DST_SEL
+// holds, as the ISA's buffer instruction table says. BBHOST_TBUFFER_DST_SEL=1
+// applies the V#'s select instead, as the translator did before (an A/B
+// switch, part of translation_switches()).
+bool tbuffer_dst_sel();
 
 // Every process-wide switch a translation reads besides its TranslateOptions -
 // the device features the host sets above (half.h's too) and the BBHOST_*

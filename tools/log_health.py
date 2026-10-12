@@ -29,6 +29,8 @@ CLASSES = [
     ('stale upload over a GPU texture', r'texture: STALE\? .* GPU-written texture'),
     ('shader-written texels lost', r'the GPU-written texels were LOST'),
     ('copy token refused', r'texture: copy token refused'),
+    ('target copy left as memory (stale image)', r"render: copy \w+ 0x[0-9a-f]+ -> 0x[0-9a-f]+ 0x[0-9a-f]+ bytes copied as memory, the destination's image"),
+    ('target copy: a larger source\'s overlap', r'render: copy \w+ 0x[0-9a-f]+ -> 0x[0-9a-f]+ 0x[0-9a-f]+ bytes, fewer than the \d+x\d+ source holds'),
     ('index/indirect not imported', r'render: (index buffer|indirect args) 0x[0-9a-f]+ not in imported memory'),
     ('descriptor set allocation failed', r'render: descriptor set allocation failed'),
     ('fallback binds differently', r'its fallback binds differently'),
@@ -43,6 +45,7 @@ TOTALS = [
     r'texture: uploads from memory the GPU holds newer bits for.*',
     r'texture: render targets sampled through a smaller T#.*',
     r'texture: copy-image tokens .*',
+    r'render: targets=\d+ .*target-copies-refused=.*',
     r'glitch: .*catches.*',
 ]
 

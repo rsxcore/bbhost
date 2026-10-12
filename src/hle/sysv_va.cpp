@@ -3,6 +3,8 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -38,14 +40,16 @@ struct Spec {
 // p points after the '%'. In scanf mode a leading '*' suppresses the
 // assignment; in printf mode '*' after the flags takes the width from an
 // argument.
-Spec parse_spec(const char* p, bool scanf) {
+template <typename Char>
+Spec parse_spec(const Char* p, bool scanf) {
     Spec s;
-    const char* q = p;
+    const Char* q = p;
     if (scanf && *q == '*') {
         s.star = true;
         ++q;
     }
-    while (!scanf && *q && std::strchr("-+ #0'", *q)) s.flags.push_back(*q++);
+    while (!scanf && *q && *q <= 127 && std::strchr("-+ #0'", *q))
+        s.flags.push_back(static_cast<char>(*q++));
     if (!scanf && *q == '*') {
         s.width = -2;
         ++q;
@@ -65,9 +69,10 @@ Spec parse_spec(const char* p, bool scanf) {
             while (*q >= '0' && *q <= '9') s.precision = s.precision * 10 + (*q++ - '0');
         }
     }
-    while (*q && std::strchr("hlLjzqt", *q)) s.length.push_back(*q++);
-    if (!*q) return s;
-    s.conv = *q++;
+    while (*q && *q <= 127 && std::strchr("hlLjzqt", *q))
+        s.length.push_back(static_cast<char>(*q++));
+    if (!*q || *q > 127) return s;
+    s.conv = static_cast<char>(*q++);
     s.len = static_cast<std::size_t>(q - p);
     return s;
 }
@@ -220,6 +225,118 @@ std::string format(const char* fmt, SysvVaList* ap) {
     return out;
 }
 
+struct WideFormat {
+    std::u16string text;
+    bool encoding_error = false;
+};
+
+// The native default multibyte decoder (0xf0e0..0xf2ff) accepts 1/2/3-byte
+// sequences, including overlong encodings and surrogate code units. Do not
+// substitute a modern strict UTF-8 codec or Microsoft's wide %s convention.
+bool native_multibyte(const unsigned char*& p, char16_t& value) {
+    unsigned code = *p++;
+    unsigned extra = 0;
+    if (code < 128) { value = static_cast<char16_t>(code); return true; }
+    if ((code & 0xe0) == 0xc0) { code &= 0x1f; extra = 1; }
+    else if ((code & 0xf0) == 0xe0) { code &= 0x0f; extra = 2; }
+    else return false;
+    while (extra--) {
+        if ((*p & 0xc0) != 0x80) return false;
+        code = (code << 6) | (*p++ & 0x3f);
+    }
+    value = static_cast<char16_t>(code);
+    return true;
+}
+
+// Literal text and %ls/%lc stay UTF-16. Numeric directives use the existing
+// LP64/SysV formatter; %s/%c follow the guest's multibyte decoder.
+
+WideFormat format_wide(const char16_t* fmt, SysvVaList* ap) {
+    WideFormat result;
+    auto& out = result.text;
+    for (const char16_t* p = fmt; *p;) {
+        if (*p != u'%') { out.push_back(*p++); continue; }
+        if (p[1] == u'%') { out.push_back(u'%'); p += 2; continue; }
+        const char16_t* begin = p++;
+        Spec s = parse_spec(p, false);
+        if (!s.len) break;
+        p += s.len;
+        if (s.conv == 'n') {
+            void* dst = reinterpret_cast<void*>(sysv_va_gp(ap));
+            if (!dst) continue;
+            const auto n = out.size();
+            if (s.length == "hh") *static_cast<signed char*>(dst) = static_cast<signed char>(n);
+            else if (s.length == "h") *static_cast<short*>(dst) = static_cast<short>(n);
+            else if (s.length.empty()) *static_cast<int*>(dst) = static_cast<int>(n);
+            else *static_cast<std::int64_t*>(dst) = static_cast<std::int64_t>(n);
+            continue;
+        }
+        if (s.conv != 's' && s.conv != 'c') {
+            std::string directive;
+            for (const char16_t* q = begin; q != p; ++q) directive.push_back(static_cast<char>(*q));
+            const auto numeric = format(directive.c_str(), ap);
+            out.append(numeric.begin(), numeric.end());
+            continue;
+        }
+        int width = s.width, precision = s.precision;
+        if (width == -2) {
+            width = static_cast<int>(sysv_va_gp(ap));
+            if (width < 0) {
+                s.flags.push_back('-');
+                width = width == INT_MIN ? INT_MAX : -width;
+            }
+        }
+        if (precision == -2) precision = static_cast<int>(sysv_va_gp(ap));
+        std::u16string text;
+        if (s.conv == 'c') {
+            const auto c = sysv_va_gp(ap);
+            if (s.length == "l") text.push_back(static_cast<char16_t>(c));
+            else {
+                const auto byte = static_cast<unsigned char>(c);
+                if (byte > 127) {
+                    // A valid multibyte lead is incomplete in a one-byte
+                    // %c conversion (-2); other bytes are EILSEQ (-1).
+                    if ((byte & 0xe0) != 0xc0 && (byte & 0xf0) != 0xe0) errno = EILSEQ;
+                    result.encoding_error = true;
+                    break;
+                }
+                text.push_back(static_cast<char16_t>(byte));
+            }
+        } else {
+            const auto arg = sysv_va_gp(ap);
+            if (!arg) {
+                text = u"(null)";
+                if (s.length != "l" && precision >= 0 && text.size() > static_cast<std::size_t>(precision))
+                    text.resize(static_cast<std::size_t>(precision));
+            } else if (s.length == "l") {
+                const auto* w = reinterpret_cast<const char16_t*>(arg);
+                while (*w && (precision < 0 || text.size() < static_cast<std::size_t>(precision)))
+                    text.push_back(*w++);
+            } else {
+                const auto* str = reinterpret_cast<const unsigned char*>(arg);
+                while (*str && (precision < 0 || text.size() < static_cast<std::size_t>(precision))) {
+                    char16_t value;
+                    if (!native_multibyte(str, value)) {
+                        errno = EILSEQ;
+                        result.encoding_error = true;
+                        break;
+                    }
+                    if (!value) break;
+                    text.push_back(value);
+                }
+                if (result.encoding_error) break;
+            }
+        }
+        const auto padding = width > 0 && static_cast<std::size_t>(width) > text.size()
+            ? static_cast<std::size_t>(width) - text.size() : 0;
+        const bool left = s.flags.find('-') != std::string::npos;
+        if (!left) out.append(padding, u' ');
+        out += text;
+        if (left) out.append(padding, u' ');
+    }
+    return result;
+}
+
 // scanf: each directive (or literal run) becomes one host call with `%n`
 // appended, so the host does the matching and reports how far it got.
 struct ScanIn {
@@ -351,6 +468,19 @@ int sysv_vfprintf(std::FILE* f, const char* fmt, SysvVaList* ap) {
     const std::string s = format(fmt, ap);
     if (std::fwrite(s.data(), 1, s.size(), f) != s.size()) return -1;
     return static_cast<int>(s.size());
+}
+
+int sysv_vswprintf(char16_t* out, std::size_t n, const char16_t* fmt, SysvVaList* ap) {
+    if (!fmt) { if (out && n) *out = 0; return -1; }
+    const auto result = format_wide(fmt, ap);
+    if (out && n) {
+        const auto count = std::min(result.text.size(), n - 1);
+        std::memcpy(out, result.text.data(), count * sizeof(char16_t));
+        out[count] = 0;
+    }
+    if (result.encoding_error) return -1;
+    if ((!result.text.empty() && result.text.size() >= n) || result.text.size() > INT_MAX) return -1;
+    return static_cast<int>(result.text.size());
 }
 
 int sysv_vsscanf(const char* s, const char* fmt, SysvVaList* ap) {

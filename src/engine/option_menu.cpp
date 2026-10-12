@@ -231,6 +231,7 @@ constexpr std::uint32_t kDeckFrameRate = 123000, kDeckModelDetail = 123001;
 constexpr std::uint32_t kCtlCamera = 118000, kCtlSensitivity = 118001, kCtlInvertX = 118002, kCtlInvertY = 118003;
 constexpr std::uint32_t kCtlFov = 118004;  // shown in PC Camera
 constexpr std::uint32_t kCamDistance = 121000, kCamHeight = 121001, kCamMouseAutoRotation = 121002;
+constexpr std::uint32_t kCamTuning = 121003;  // its two entries: 121030 FPS++ (Kyo), 121031 Original
 constexpr std::uint32_t kCtlMouseMenu = 116002, kCtlDrawCursor = 116003;
 // Key Bindings, 119000: the page row, seven placeholder rows whose captions
 // the port replaces with its own text, and the page names.
@@ -546,11 +547,10 @@ constexpr int kEffectsRows = kEffectsCount + 2;
 
 // The frame rate (engine/frame_rate.h), as a pick-list. The row stores the
 // chosen entry's int32, so the values are the rates themselves and 0 is
-// uncapped. Four entries: the widget's list has six slots, and with four (as
-// before 90 and 144 were added to the old Frame cap) the panel draws with a
-// gap under the last one.
+// uncapped. Five entries of the widget's six slots (the old Frame cap's
+// 30/60/90/120/144/Off had all six; 116034 was its 144).
 const Choice kFrameCaps[] = {
-    {30, 116030}, {60, 116031}, {90, 116032}, {0, 116035},
+    {30, 116030}, {60, 116031}, {90, 116032}, {120, 116033}, {0, 116035},
 };
 std::int32_t g_frame_cap = 30;
 
@@ -591,6 +591,11 @@ Slider g_cam_fov{"fov", kCtlFov, 0, 0xff};
 Slider g_cam_distance{"camera_distance", kCamDistance, 5, 0xff};
 Slider g_cam_height{"camera_height", kCamHeight, 5, 0xff};
 Toggle g_cam_mouse_auto_rotation{"mouse_auto_rotation", kCamMouseAutoRotation, 0, 0xff};
+// And its tuning above 30 fps (engine/frame_rate.cpp): a left/right choice of
+// two the port names, as the setting's index - 0 FPS++, 1 Original - read
+// when the game starts, so a change shows at once and applies then.
+const Choice kCameraTunings[2] = {{0, 121030}, {1, 121031}};
+std::uint8_t g_cam_tuning = 0, g_cam_tuning_last = 0xff;
 constexpr int kCameraRows = 4;
 
 // Steam Deck (on one only, host_steam_deck): the frame rate as a left/right
@@ -615,6 +620,11 @@ Toggle g_enhance[] = {
     {"five_players", kEnhFivePlayers, 1, 0xff},
 };
 constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhance[0]));
+
+void seed_camera_tuning() {
+    const int t = host_opt_index("camera_tuning");
+    g_cam_tuning = g_cam_tuning_last = static_cast<std::uint8_t>(t == 1 ? 1 : 0);
+}
 
 void seed_deck() {
     g_deck_rate = g_deck_rate_last = static_cast<std::uint8_t>(host_deck_profile());
@@ -816,7 +826,7 @@ GUEST_ABI void pc_controls_handler(void* dialog, void* params) {
     log_rows("PCControls", dialog, kControlsRows, kControlsRows);
 }
 
-// PC Camera: three sliders.
+// PC Camera: three sliders, the auto-rotation toggle and the tuning's pair.
 GUEST_ABI void pc_camera_handler(void* dialog, void* params) {
     host_log("pc-options: PCCamera opened, dialog=%p params=%p", dialog, params);
     alignas(16) std::uint8_t scratch[0x100]{};
@@ -1757,6 +1767,7 @@ void option_menu_poll() {
         seed(g_cam_distance);
         seed(g_cam_height);
         seed(g_cam_mouse_auto_rotation);
+        seed_camera_tuning();
         seed_controls();
         seed_deck();
         g_resolution = host_opt_resolution_index();
@@ -1786,6 +1797,12 @@ void option_menu_poll() {
     push(g_cam_distance);
     push(g_cam_height);
     push(g_cam_mouse_auto_rotation);
+    if (g_cam_tuning != g_cam_tuning_last) {
+        g_cam_tuning_last = g_cam_tuning;
+        host_opt_set_index("camera_tuning", g_cam_tuning);
+        host_log("pc-options: camera tuning %s from the System menu (applies on the next run)",
+                 g_cam_tuning ? "Original" : "FPS++ (Kyo)");
+    }
     for (auto& t : g_toggles) push(t);
     for (auto& t : g_enhance) push(t);
     // Steam Deck: the frame rate sets the frame cap, the resolution and the

@@ -1,5 +1,6 @@
 #include "host/translation_cache.h"
 
+#include "core/paced_file.h"
 #include "core/portable.h"
 #include "log.h"
 #include "translator_fingerprint.h"
@@ -36,21 +37,28 @@ static_assert(sizeof(gcn::ResourcePath) == 40 && sizeof(gcn::ResourceStep) == 8,
 static_assert(sizeof(gcn::ImageBinding) == 64 && sizeof(gcn::SamplerBinding) == 56 && sizeof(gcn::BufferBinding) == 56,
               "a new binding field: add it to the entry");
 static_assert(sizeof(gcn::VertexElement) == 16, "a new VertexElement field: add it to hash_options");
-static_assert(sizeof(gcn::LiftResult) == 104, "a new LiftResult field: add it to the lift's entry (write_lift, read_lift)");
+// (A lift's proof, listing, wave-operation counts and engine names are not
+// kept: the names are put on after the cache (render.cpp name_stage), the rest
+// is diagnostics.)
+static_assert(sizeof(gcn::LiftResult) == 288, "a new LiftResult field: add it to the lift's entry (write_lift, read_lift)");
 #endif
 
 constexpr std::uint32_t kMagic = 0x43544242;  // "BBTC"
 // The file's own layout. The translator's changes are its fingerprint's;
 // this changes only when the entries are written differently.
-constexpr std::uint32_t kVersion = 2;  // 2: wave64_needs
+constexpr std::uint32_t kVersion = 3;  // 2: wave64_needs; 3: gds_counters
 // What the file may hold (compressed; it is kept in memory while the game
 // runs): past it, the entries this run did not use go first. A world run's
 // ~9,000 translations and lifts are a few tens of MiB.
 constexpr std::size_t kMaxEntries = 65536;
 constexpr std::uint64_t kMaxBytes = 256ull << 20;
 constexpr std::uint32_t kMaxRaw = 64u << 20;  // one entry uncompressed: the largest translations are ~1 MiB
-// A periodic write at most this often; the exit writes regardless.
+// A periodic write at most this often, and only once this much is new
+// (compressed): 4 MiB or 2% of what the file holds, the pipeline cache's rule
+// (gpu.cpp). The file is rewritten whole, 170 MiB in a world run, and a minute
+// of play adds a dozen entries. The exit writes whatever is new.
 constexpr auto kSaveInterval = std::chrono::seconds(60);
+constexpr std::uint64_t kSaveMinNew = 4ull << 20;
 
 struct Key {
     std::uint64_t a = 0, b = 0;
@@ -157,6 +165,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.u32(near_bits);
     h.flag(o.tess_patch_cull);
     h.flag(o.tess_patch_cull_all);
+    h.flag(o.gds_counters);
 }
 
 // ---- an entry: the TranslateResult, every field ----
@@ -282,7 +291,7 @@ void write_result(Writer& w, const gcn::TranslateResult& r, bool with_spirv) {
         w.path(b.path);
         w.u32(b.binding);
         w.u32(b.max_dw);
-        w.u8(static_cast<std::uint8_t>((b.pointer ? 1 : 0) | (b.indexed ? 2 : 0)));
+        w.u8(static_cast<std::uint8_t>((b.pointer ? 1 : 0) | (b.indexed ? 2 : 0) | (b.ranged ? 4 : 0) | (b.written ? 8 : 0)));
     }
     w.at(r.image_at);
     w.at(r.sampler_at);
@@ -304,6 +313,7 @@ void write_result(Writer& w, const gcn::TranslateResult& r, bool with_spirv) {
     w.i32(r.vs_clip_count);
     w.u8(r.vs_point_size ? 1 : 0);
     w.u32(r.wave64_needs);  // what keeps a pixel program at 64 lanes (gcn/wave.h)
+    w.u32(r.gds_counters);
 }
 
 bool read_result(Reader& r, gcn::TranslateResult& t) {
@@ -339,6 +349,8 @@ bool read_result(Reader& r, gcn::TranslateResult& t) {
         const std::uint8_t f = r.u8();
         b.pointer = f & 1;
         b.indexed = f & 2;
+        b.ranged = f & 4;
+        b.written = f & 8;
     }
     r.at(t.image_at);
     r.at(t.sampler_at);
@@ -360,6 +372,7 @@ bool read_result(Reader& r, gcn::TranslateResult& t) {
     t.vs_clip_count = r.i32();
     t.vs_point_size = r.u8() != 0;
     t.wave64_needs = r.u32();
+    t.gds_counters = r.u32();
     return r.ok && r.p == r.end;
 }
 
@@ -379,6 +392,7 @@ struct Cache {
     std::vector<std::unique_ptr<std::uint8_t[]>> made;     // under mu: entries made in this run, never freed
     std::unordered_map<Key, Slot, KeyHash> slots;          // under mu
     std::uint64_t bytes = 0;                               // under mu: compressed, every slot
+    std::uint64_t saved_bytes = 0;                         // under mu: `bytes` at the last write (or the load)
     bool dirty = false;                                    // under mu
     std::chrono::steady_clock::time_point saved{};         // under mu: the last write
     std::size_t loaded = 0;
@@ -480,6 +494,16 @@ void store(const Key& key, const Writer& w) {
 
 std::string path_tmp(const std::string& path) { return path + ".tmp" + std::to_string(host_thread_id()); }
 
+// Under g_tc.mu: a write is due when entries came in (or one is to be left
+// out) and, unless forced, a minute has passed and enough of them are new.
+bool save_due_locked(bool force) {
+    if (!g_tc.dirty) return false;
+    if (force) return true;
+    if (std::chrono::steady_clock::now() - g_tc.saved < kSaveInterval) return false;
+    const std::uint64_t fresh = g_tc.bytes > g_tc.saved_bytes ? g_tc.bytes - g_tc.saved_bytes : 0;
+    return fresh >= std::max<std::uint64_t>(kSaveMinNew, g_tc.saved_bytes / 50);
+}
+
 std::atomic<std::uint64_t> g_window_hits{0}, g_window_hit_us{0}, g_window_misses{0}, g_window_miss_us{0};
 std::atomic<std::uint64_t> g_window_lift_hits{0}, g_window_lift_misses{0};
 
@@ -518,13 +542,46 @@ gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::Trans
     return t;
 }
 
+namespace {
+template <typename Lift>
+gcn::LiftResult lift_through_cache(const Key& key, const Lift& lift);
+}  // namespace
+
 gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
     const auto lift = [&] {
         return vertex ? gcn::lift_vertex_shader(prog, o, reference) : gcn::lift_pixel_shader(prog, o, reference);
     };
     if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
+    return lift_through_cache(key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel), lift);
+}
+
+gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,
+                                 const gcn::TessLift& tess) {
+    const auto lift = [&] {
+        return use == TranslationUse::kLiftLs     ? gcn::lift_ls_shader(prog, o, reference, tess)
+               : use == TranslationUse::kLiftHull ? gcn::lift_hull_shader(prog, o, reference, tess)
+                                                  : gcn::lift_domain_shader(prog, o, reference, tess);
+    };
+    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
+    KeyHasher h;
+    h.str(g_tc.switches);
+    h.u32(static_cast<std::uint32_t>(use));
+    hash_program(h, prog);
+    hash_options(h, o);
+    if (o.fetch) hash_program(h, *o.fetch);
+    h.u32(tess.attr_vec4s);
+    h.flag(tess.window);
+    h.flag(tess.own_params);
+    for (const std::uint32_t v : {tess.control_points, tess.ls_stride, tess.cp_stride, tess.patch_constants, tess.params_binding}) h.u32(v);
+    h.str(tess.constants_path);
+    for (const std::uint32_t v : tess.constants) h.u32(v);
+    return lift_through_cache(Key{h.a, h.b}, lift);
+}
+
+namespace {
+template <typename Lift>
+gcn::LiftResult lift_through_cache(const Key& key, const Lift& lift) {
     const auto t0 = std::chrono::steady_clock::now();
-    const Key key = key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel);
     gcn::LiftResult l;
     if (lookup(key, [&](Reader& r) { return read_lift(r, l); })) {
         const std::uint64_t us = us_since(t0);
@@ -546,6 +603,7 @@ gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::Tr
     store(key, w);
     return l;
 }
+}  // namespace
 
 void translation_cache_load(const std::string& path) {
     // Once: a second device start keeps the first's slots, which lookups read
@@ -613,6 +671,7 @@ void translation_cache_load(const std::string& path) {
                  dropped ? ", some keys twice" : "");
     }
     g_tc.saved = std::chrono::steady_clock::now();
+    g_tc.saved_bytes = g_tc.bytes;
     g_tc.ready.store(true, std::memory_order_release);
 }
 
@@ -625,13 +684,14 @@ void translation_cache_save(const std::string& path, bool force) {
         Slot slot;
     };
     std::vector<Out> out;
+    std::uint64_t fresh = 0;
     {
         std::lock_guard<std::mutex> lk(g_tc.mu);
-        if (!g_tc.dirty) return;
-        const auto now = std::chrono::steady_clock::now();
-        if (!force && now - g_tc.saved < kSaveInterval) return;
+        if (!save_due_locked(force)) return;
         g_tc.dirty = false;
-        g_tc.saved = now;
+        g_tc.saved = std::chrono::steady_clock::now();
+        fresh = g_tc.bytes > g_tc.saved_bytes ? g_tc.bytes - g_tc.saved_bytes : 0;
+        g_tc.saved_bytes = g_tc.bytes;
         out.reserve(g_tc.slots.size());
         for (const auto& [key, s] : g_tc.slots) {
             if (!s.bad) out.push_back({key, s});
@@ -650,30 +710,25 @@ void translation_cache_save(const std::string& path, bool force) {
     head.u32(static_cast<std::uint32_t>(keep));
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    const std::string tmp = path_tmp(path);
-    bool ok = false;
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f.write(reinterpret_cast<const char*>(head.out.data()), static_cast<std::streamsize>(head.out.size()));
-        for (std::size_t k = 0; k < keep && f; ++k) {
-            Writer e;
-            e.u64(out[k].key.a);
-            e.u64(out[k].key.b);
-            e.u32(out[k].slot.raw);
-            e.u32(out[k].slot.size);
-            f.write(reinterpret_cast<const char*>(e.out.data()), static_cast<std::streamsize>(e.out.size()));
-            f.write(reinterpret_cast<const char*>(out[k].slot.data), static_cast<std::streamsize>(out[k].slot.size));
-        }
-        ok = static_cast<bool>(f);
+    // A chunk at a time: written at once, its write-back held every other file
+    // operation on a slow disk for as long - 1.5 s over NFS.
+    HostPacedFile f(path, path_tmp(path));
+    bool ok = f.write(head.out.data(), head.out.size());
+    for (std::size_t k = 0; k < keep && ok; ++k) {
+        Writer e;
+        e.u64(out[k].key.a);
+        e.u64(out[k].key.b);
+        e.u32(out[k].slot.raw);
+        e.u32(out[k].slot.size);
+        ok = f.write(e.out.data(), e.out.size()) && f.write(out[k].slot.data, out[k].slot.size);
     }
-    if (ok) std::filesystem::rename(tmp, path, ec);
-    if (!ok || ec) {
-        std::filesystem::remove(tmp, ec);
+    if (!ok || !f.commit()) {
         host_log("render: saving the translation cache to %s failed", path.c_str());
         return;
     }
-    host_log("render: translation cache saved: %zu translations and lifts, %.1f MiB (written in %llu ms)%s", keep, bytes / 1048576.0,
-             static_cast<unsigned long long>(us_since(t0) / 1000), keep < out.size() ? ", the oldest left out" : "");
+    host_log("render: translation cache saved: %zu translations and lifts, %.1f MiB, %.1f MiB of it new (written in %llu ms)%s", keep,
+             bytes / 1048576.0, fresh / 1048576.0, static_cast<unsigned long long>(us_since(t0) / 1000),
+             keep < out.size() ? ", the oldest left out" : "");
 }
 
 void translation_cache_save_async(const std::string& path) {
@@ -681,7 +736,7 @@ void translation_cache_save_async(const std::string& path) {
     if (!g_tc.on || path.empty()) return;
     {
         std::lock_guard<std::mutex> lk(g_tc.mu);
-        if (!g_tc.dirty || std::chrono::steady_clock::now() - g_tc.saved < kSaveInterval) return;
+        if (!save_due_locked(false)) return;
     }
     if (saving.exchange(true)) return;
     std::thread([path] {
@@ -721,5 +776,9 @@ std::string translation_cache_window() {
                   static_cast<unsigned long long>(miss_us / 1000));
     return buf;
 }
+
+const char* translator_fingerprint() { return BBHOST_TRANSLATOR_FINGERPRINT; }
+
+bool translation_cache_cold() { return g_tc.ready.load(std::memory_order_acquire) && g_tc.on && g_tc.loaded == 0; }
 
 }  // namespace gpu

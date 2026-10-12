@@ -30,7 +30,7 @@ to run on a PC - it needs a place to live. bbhost provides that place:
   renderer was written for the PS4's GPU: it builds command buffers for an AMD
   GCN GPU and ships GCN shader programs. bbhost hooks FromSoftware's own
   graphics layer instead, so draws are built directly from the engine's objects,
-  and translates (and increasingly decompiles) the shaders to SPIR-V. The
+  and decompiles the shaders to typed, structured SPIR-V. The
   status table below shows what is native today and what still goes through
   the emulated GPU command processor.
 - **Game functions are being rewritten as source**, one at a time, each checked
@@ -78,10 +78,10 @@ sessions. What runs on native code and what is still emulated:
 | Online | native sockets and HTTP against a private server; peer-to-peer UDP with NAT traversal |
 | Draws | native: each draw is built from the engine's graphics objects; the command buffer only marks its place in the stream |
 | Post-processing (YEBIS) | native: every stage's resources built by bbhost |
-| Tessellation | native: the host GPU's own tessellation stages |
-| Shaders | translated from GCN to SPIR-V by bbhost's own compiler when the game creates them; pixel shaders the lifter accepts are decompiled to typed, structured SPIR-V instead |
-| Frame pacing | native: the game's frame-time manager runs as bbhost source; 30 fps by default, 60 by option |
-| Compute dispatches, labels, fences | still emulated: run through bbhost's command processor, which walks the game's PM4 command buffers |
+| Tessellation | native: the host GPU's own tessellation stages, all three stages lifted; the game's mesh hulls draw as one native pipeline, without the PS4's on-chip ring |
+| Shaders | decompiled ("lifted") from GCN to typed, structured SPIR-V when the game creates them: every shader the game ships except compute (3,206 of 3,209 pixel shader programs, all vertex and tessellation programs; 100% of draws at the 12 measured places, see [docs/rendering.md](docs/rendering.md#shader-lifting)). Compute shaders and the few programs the lifter refuses are still translated by bbhost's GCN compiler |
+| Frame pacing | native: the game's frame-time manager runs as bbhost source; 30, 60, 90, 120 or uncapped, with the game's per-frame steps following real time |
+| Compute dispatches, labels, fences | still emulated: run through bbhost's command processor, which walks the game's PM4 command buffers; GPU particle counters are kept natively, as per-buffer counters |
 | Texture memory | the game's tiled textures are detiled on the GPU; changes are tracked by watching the game's writes |
 
 Known issues:
@@ -89,6 +89,9 @@ Known issues:
 - Compute work still goes through the emulated command processor, and the
   game's GPU-visible memory (about 5 GB) stays imported into Vulkan, because
   some shaders still read it through page-table walks.
+- A new GPU particle system's counter can start uninitialized; bbhost clamps
+  such a dispatch to nothing rather than hang.
+- Slow poison runs twice as fast at 60 fps.
 - A new area compiles its pipelines on first sight, which can cause short
   hitches the first time it is visited.
 - About one in four first summons fail and have to be repeated.
@@ -165,7 +168,8 @@ third_party/     LibAtrac9, Dear ImGui, Monocypher
 - **Graphics, native throughout**: compute dispatches, clears and copies built
   from the engine's objects like the draws, so the PM4 command processor can be
   retired; resources identified by the engine's own objects rather than guest
-  addresses; every shader decompiled rather than translated.
+  addresses; compute shaders lifted too; the lifted SPIR-V emitted as HLSL and
+  compiled with DXC.
 - **Decompilation**: more of the engine rewritten as source, starting with the
   systems mods and fixes need most.
 - **Performance**: a steady 60 fps everywhere on mid-range hardware, and

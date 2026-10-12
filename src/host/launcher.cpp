@@ -192,8 +192,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                                "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
                                                "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)"};
     // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
-    static const int kCaps[] = {30, 60, 90, 0};
-    int cap_choice = frame_cap == 30 ? 0 : frame_cap == 60 ? 1 : frame_cap == 90 ? 2 : 3;
+    static const int kCaps[] = {30, 60, 90, 120, 0};
+    constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
+    int cap_choice = kCapCount - 1;
+    for (int k = 0; k < kCapCount; ++k) {
+        if (kCaps[k] == frame_cap) cap_choice = k;
+    }
+    // The follow camera's tuning above 30 fps: the setting's index, 0 FPS++, 1 Original.
+    int camera_tuning = host_opt_index("camera_tuning") == 1 ? 1 : 0;
     // The PC enhancements, through the same calls: each is read when the
     // game starts (main.cpp, config_set_enhancements).
     struct Enhancement {
@@ -317,6 +323,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
+        host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_resolution_index(resolution);
         for (const Enhancement& x : enhancements) host_opt_set(x.key, x.on);
         host_options_save_now();
@@ -620,8 +627,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Lance McDonald's free camera: hold Interact (E) and press L3 (Left Ctrl). The debug menu's LOAD TEST crashes while it is on.");
         ImGui::SetNextItemWidth(200 * scale);
-        static const char* const kCapLabels[] = {"30 fps", "60 fps", "90 fps", "Uncapped"};
-        ImGui::Combo("Frame rate", &cap_choice, kCapLabels, 4);
+        static const char* const kCapLabels[] = {"30 fps", "60 fps", "90 fps", "120 fps", "Uncapped"};
+        static_assert(sizeof(kCapLabels) / sizeof(kCapLabels[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a label for every rate");
+        ImGui::Combo("Frame rate", &cap_choice, kCapLabels, kCapCount);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off.");
         ImGui::SetNextItemWidth(200 * scale);
@@ -685,6 +693,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
         ImGui::Render();
         SDL_SetRenderDrawColor(ren, 20, 20, 24, 255);
+        SDL_SetRenderScale(
+            ren,
+            io.DisplayFramebufferScale.x,
+            io.DisplayFramebufferScale.y
+        );
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
         SDL_RenderPresent(ren);
