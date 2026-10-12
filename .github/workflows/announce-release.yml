@@ -35,4 +35,9 @@ jobs:
           DISCORD_CHANNEL_ID: '1557561169768742986'
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: python3 tools/announce_release.py "$TAG"
+        run: |
+          if [ -z "$DISCORD_BOT_TOKEN" ]; then
+            echo "no DISCORD_BOT_TOKEN secret in this repository: nothing to announce"
+            exit 0
+          fi
+          python3 tools/announce_release.py "$TAG"
