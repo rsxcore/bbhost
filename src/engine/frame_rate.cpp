@@ -22,6 +22,7 @@
 #include "hle/hle.h"
 #include "hle/modules.h"
 #include "host/frame_stats.h"
+#include "host/gfx_journal.h"
 #include "host/plugins.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -1101,12 +1102,15 @@ namespace {
 // manager's +0x28 still holds the time (gettimeofday, us) it released the last
 // frame at, until the update about to run replaces it.
 void note_main_frame_work(std::uint64_t m) {
-    if (!frame_stats_enabled()) return;
+    if (!frame_stats_enabled() && !gfxj::on()) return;
     // The same clock the guest's gettimeofday reads (hle/libc.cpp), on both
     // platforms.
     const std::int64_t now = host_clock_realtime_us();
     const std::int64_t last = get<std::int64_t>(m + 0x28);
-    if (last > 0 && now >= last && now - last < 10000000) frame_stats_main_frame(static_cast<std::uint64_t>(now - last), hle_video_flip_count());
+    if (last > 0 && now >= last && now - last < 10000000) {
+        frame_stats_main_frame(static_cast<std::uint64_t>(now - last), hle_video_flip_count());
+        gfxj::main_frame(static_cast<std::uint64_t>(now - last));  // BBHOST_GFX_LOG
+    }
 }
 
 // The uncapped mode's frame limit: BBHOST_UNCAPPED_FPS=N (30..240) if set;
