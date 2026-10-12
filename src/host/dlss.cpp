@@ -1112,7 +1112,10 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
     }();
     const VkImageView colour_view = view_of(colour->image, colour->format);
     const VkImageView depth_view = view_of(in.depth_snapshot->image, in.depth_snapshot->format);
-    if (!colour_view || !depth_view) return;
+    if (!colour_view || !depth_view) {
+        gfxj::note(gfxj::kDlssFail, 0, 0, "no view");
+        return;
+    }
     ngx::ResourceVk r_colour = resource(colour_view, colour->image, colour->format, w, h, false);
     ngx::ResourceVk r_depth = resource(depth_view, in.depth_snapshot->image, in.depth_snapshot->format, w, h, false);
     ngx::ResourceVk r_motion = resource(g_dlss.motion.view, g_dlss.motion.image, VK_FORMAT_R16G16_SFLOAT, w, h, false);
@@ -1146,8 +1149,13 @@ void dlss_after_velocity_locked(const DlssVelocityPass& in) {
     ngx::set_ui(p, "DLSS.Render.Subrect.Dimensions.Height", h);
     ngx::set_f(p, "DLSS.Pre.Exposure", 1.0f);
     ngx::set_f(p, "DLSS.Exposure.Scale", 1.0f);
-    const ngx::Result r = g_dlss.evaluate(cmd, g_dlss.feature, p, nullptr);
+    ngx::Result r;
+    {
+        gfxj::Scope gj(gfxj::kDlssEval, g_dlss.reset ? 1 : 0, g_dlss.phase);  // a: 1 when it starts its history again
+        r = g_dlss.evaluate(cmd, g_dlss.feature, p, nullptr);
+    }
     if (!ngx::ok(r)) {
+        gfxj::note(gfxj::kDlssFail, r, 0, "evaluate");
         static std::atomic<int> logs{0};
         if (logs.fetch_add(1) < 8) host_log("dlss: evaluation failed (0x%x)", r);
         return;

@@ -2990,6 +2990,7 @@ VkPipeline create_compute(VkShaderModule module, CsBuild how, const std::string&
                                                      : 0;
     VkPipeline p = VK_NULL_HANDLE;
     VkResult r;
+    gfxj::Scope gj(gfxj::kPipelineCs, static_cast<std::uint64_t>(how));  // a: how it is built
     if (how == CsBuild::kOptimizedCached) {
         r = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &p);  // VK_PIPELINE_COMPILE_REQUIRED: not there
     } else if (own_cache != VK_NULL_HANDLE) {
@@ -3967,6 +3968,7 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
     }
     g.waiting_slot.store(-1, std::memory_order_relaxed);
     waited_us = static_cast<std::uint64_t>(secs * 1e6);
+    if (gfxj::on()) gfxj::event(gfxj::kFenceWait, static_cast<std::uint64_t>(secs * 1e9), static_cast<std::uint64_t>(k));
     if (r == VK_SUCCESS) {
         if (slow) {
             host_log("gpu: submission %llu finished after %.1f s; what it held is let go now",
@@ -5107,6 +5109,7 @@ void collect_profile_locked(Gpu::Slot& sl) {
                 std::snprintf(b, sizeof(b), " %s=%.1f", top[i].first->c_str(), top[i].second / 1e6);
                 list += b;
             }
+            gfxj::event(gfxj::kGpuSlow, static_cast<std::uint64_t>(span_ms * 1e6), sl.serial, sl.qnames.size(), list.c_str());
             host_log("gpu: a slow command buffer: %.1f ms on the GPU (submission %llu, flip %llu, %zu timed entries %.1f ms, "
                      "the rest outside them):%s",
                      span_ms, static_cast<unsigned long long>(sl.serial), static_cast<unsigned long long>(hle_video_flip_count()),
@@ -5241,7 +5244,10 @@ void submit_locked() {
         cur.in_flight = true;
     } else {
         busy_submitted_locked(cur);
-        const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        const VkResult r = [&] {
+            gfxj::Scope gj(gfxj::kSubmit, cur.serial, g.queued);
+            return vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        }();
         g_stream_submitted.store(cur.serial + 1, std::memory_order_release);
         if (r != VK_SUCCESS) {
             host_log("gpu: submit of %u items failed (%d)%s", g.queued, r,
@@ -6527,6 +6533,8 @@ std::string host_gpu_image_heap_report() {
 
 // Per heap: usage and budget as the driver reports them (VK_EXT_memory_budget),
 // device-local heaps marked. Empty without the extension.
+std::int64_t host_gpu_vram_headroom_mb() { return gpu::g.device ? gpu::vram_headroom() / (1 << 20) : 0; }
+
 std::string host_gpu_memory_budget_report() {
     using namespace gpu;
     if (!g.has_memory_budget || !g.phys) return {};

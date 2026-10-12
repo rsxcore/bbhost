@@ -8,6 +8,7 @@
 
 #include "gcn/translate.h"
 #include "hle/modules.h"
+#include "host/gfx_journal.h"
 #include "host/gpu.h"
 #include "host/stream_ops.h"
 

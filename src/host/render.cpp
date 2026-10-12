@@ -1349,7 +1349,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             return &kept;
         }
         g.rt_replacements.fetch_add(1);
-        take_fill(st->second);
+        gfxj::note(gfxj::kTargetReplaced, __LINE__);        take_fill(st->second);
         destroy_rt_image(st->second);
         g_snapshots.erase(st);
         ++g_rt_gen;
@@ -1371,7 +1371,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             return &r;
         }
         g.rt_replacements.fetch_add(1);
-        if (r.format == format && r.width == width && r.height == height) {
+        gfxj::note(gfxj::kTargetReplaced, __LINE__);        if (r.format == format && r.width == width && r.height == height) {
             // More slices than before: the faces drawn so far survive. On a
             // cube's first frame this happens once per face.
             static std::atomic<int> logs{0};
@@ -1457,6 +1457,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     r.create_flags = ici.flags;
     r.usage = ici.usage;
+    gfxj::note(gfxj::kTargetMake, width, height, depth ? "depth" : "colour");
     if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) {
         host_log("render: image creation failed (format %d %ux%u)", format, width, height);
         if (grow || carry) destroy_rt_image(grown_from);
@@ -6245,6 +6246,11 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     }
     const auto ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!t_pipeline_worker) g_pl_create_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    if (gfxj::on()) {
+        // a: 1 when a worker built it (the draw did not wait), b: 1 for the no-fallback variant.
+        gfxj::event(gfxj::kPipelineGfx, static_cast<std::uint64_t>(pl_us_since(t0)) * 1000, t_pipeline_worker ? 1 : 0, pl.lean ? 1 : 0,
+                    pl.name.c_str());
+    }
     // Slow driver compiles, with what might make them slow: the stages'
     // SPIR-V sizes and whether this is the page-table fallback or the
     // no-fallback variant.
@@ -8080,6 +8086,7 @@ std::string copy_destination_describe_locked(std::uint64_t dst_base) {
 
 void note_copy_refused_locked(CopyRefusal why, const char* via, std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes) {
     g_copy_refused[why].fetch_add(1, std::memory_order_relaxed);
+    gfxj::note(gfxj::kCopyRefused, src_base, dst_base, kCopyRefusedNames[why]);
     static std::set<std::tuple<std::uint64_t, std::uint64_t, int>> seen;  // under g.mu
     static int lines = 0;
     constexpr int kMaxLines = 48;
@@ -8415,7 +8422,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         if (st != g_snapshots.end() &&
             (st->second.format != snap_format || st->second.width != src.width || st->second.height != src.height)) {
             g.rt_replacements.fetch_add(1);
-            destroy_rt_image(st->second);
+            gfxj::note(gfxj::kTargetReplaced, __LINE__);            destroy_rt_image(st->second);
             g_snapshots.erase(st);
             ++g_rt_gen;
             bump_view_epoch();
@@ -8432,7 +8439,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         // still prefer it over the snapshot. Drop it.
         if (auto rt = g_rts.find(dst_base); rt != g_rts.end()) {
             g.rt_replacements.fetch_add(1);
-            destroy_rt_image(rt->second);
+            gfxj::note(gfxj::kTargetReplaced, __LINE__);            destroy_rt_image(rt->second);
             g_rts.erase(rt);
             ++g_rt_gen;
             bump_view_epoch();

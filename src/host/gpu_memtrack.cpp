@@ -2,6 +2,7 @@
 // the Vulkan header directly, without the macros, so the real calls are made.
 #include <vulkan/vulkan.h>
 
+#include "host/gfx_journal.h"
 #include "log.h"
 
 #include <algorithm>
@@ -90,6 +91,7 @@ VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, cons
     const VkResult r = vkAllocateMemory(device, info, cb, out);
     const auto us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    if (gfxj::on()) gfxj::event(gfxj::kMemAlloc, us * 1000, info->allocationSize, info->memoryTypeIndex, site_name(file, line).c_str());
     if (limited && !(r == VK_SUCCESS && out && *out != VK_NULL_HANDLE)) {
         std::lock_guard<std::mutex> lk(g_mu);
         g_limited_bytes -= info->allocationSize;

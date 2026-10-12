@@ -39,6 +39,7 @@ bool host_gpu_draw_window(std::uint64_t, const void*, std::uint32_t) { return fa
 std::uint64_t host_gpu_guest_copy_targets() { return 0; }
 bool host_gpu_clear_target(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 GpuStats host_gpu_stats() { return {}; }
+std::int64_t host_gpu_vram_headroom_mb() { return 0; }
 void host_gpu_phase_add(int, std::uint64_t) {}
 GpuHandles host_gpu_handles() { return {}; }
 void host_gpu_lock() {}

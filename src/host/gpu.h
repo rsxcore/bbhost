@@ -491,6 +491,8 @@ void host_gpu_world_reached();
 // notice, host/window.cpp).
 std::size_t host_gpu_shader_backlog();
 std::string host_gpu_memory_budget_report();
+// The video memory this process may still take, in MiB (negative: over budget); 0 without a GPU.
+std::int64_t host_gpu_vram_headroom_mb();
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();
 void host_gpu_unlock();

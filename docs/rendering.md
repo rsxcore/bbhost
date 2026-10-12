@@ -220,4 +220,42 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 | `tools/area_check.py` | ten places in the game measured the same way every time - frame times, GPU time, draws by how their pixel shader ran, compiles, frames and lift checks - and two builds compared against their own noise ([area-check.md](area-check.md)) |
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
+| `BBHOST_GFX_LOG=1` / `2` | the graphics journal: a line for each long frame (2: every frame) in `logs/gfx-<time>.jsonl`, with what the main loop, the GPU and the events in the frame took; `tools/gfx_journal_report.py` reads it |
 | `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |
+
+## The graphics journal
+
+`BBHOST_GFX_LOG=1` writes `logs/gfx-<time>.jsonl` (`build/` without a logs
+folder; `BBHOST_GFX_LOG_DIR` names another place) to find what makes a frame
+long or wrong. Each game flip closes a frame, and the frame's line holds:
+
+- `dt`, the flip interval; `main`, the main loop's own work in it; `gpu`, how
+  long the GPU was busy (the busy meter); `draws`, `disp`, `fail` and
+  `fail_why` (draws not drawn, by reason), `fallback` (draws on the page-table
+  fallback pipeline), `pipes` (pipelines made); `cp`, the command processor's
+  time by phase;
+- `ev`, per kind of event how many, how long in all and the longest (ms), and
+  `list`, the events over `BBHOST_GFX_EVENT_MS` (0.5) one by one with their
+  thread (`th`): a pipeline built where a draw waited (`pipeline_gfx`,
+  `pipeline_cs`), a wait on a submission's fence, `submit`, a
+  `mem_alloc`, a `texture_upload`, `acquire` and `present`, a `swapchain`
+  made, a DLSS evaluation (`a` is 1 when it started its history again), video
+  memory evicted;
+- events that mark a wrong picture, and so put the frame in the journal
+  whatever its length: `target_replaced` (a render target made again, which
+  idles the device), `copy_refused` (a target copy done as memory, the image
+  kept as it was), `dlss_fail`, and any draw that failed.
+
+Mode 1 writes the frames over `BBHOST_GFX_HITCH_MS` (20) and the wrong ones,
+and a line a second (`sec`) for the rest: frames, average and worst interval,
+hitches, GPU busy %, and the free video memory, system memory, commit and
+free space of the drive the shader caches are written to. Mode 2 writes every
+frame (about 2 MB a minute). A frame over the limit is also said in the log,
+as `gfx hitch:` with the events that took its time, longest first, and the
+thread each ran on. A drive with under 1 GiB free is said once.
+
+`tools/gfx_journal_report.py <journal> [--skip S] [--hitch MS]` says how many
+frames were long and, for each, whether the main loop, the GPU or an event was
+the largest part; which frames had something wrong; and the lowest free
+memory and disk reading of the run. With `BBHOST_GPU_PROFILE=1` a command
+buffer that ran long on the GPU is an event too (`gpu_slow`), with its passes.

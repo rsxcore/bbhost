@@ -10,6 +10,7 @@
 #include "core/imports.h"
 #include "hle/modules.h"
 #include "host/frame_stats.h"
+#include "host/gfx_journal.h"
 #include "host/gpu.h"
 #include "hle/platform.h"
 
@@ -397,6 +398,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
     }
     hle_gnm_arena_flip();  // BBHOST_ARENA_MONITOR
     frame_stats_on_flip();  // BBHOST_FRAME_STATS
+    gfxj::on_flip(hle_video_flip_count());  // BBHOST_GFX_LOG
     static std::atomic<int> flip_logs{0};
     const int n = flip_logs.fetch_add(1);
     // A flip that came BBHOST_STALL_MS (100 by default; 0 turns this off) or

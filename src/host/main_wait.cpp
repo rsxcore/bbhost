@@ -2,6 +2,7 @@
 // that the sync primitives that time them link without the rest.
 
 #include "host/frame_stats.h"
+#include "host/gfx_journal.h"
 
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -176,6 +177,7 @@ void main_wait_sites_report() {
 }
 
 void frame_stats_main_frame(std::uint64_t busy_us, std::uint64_t flip) {
+    gfxj::main_frame(busy_us);  // BBHOST_GFX_LOG
     if (!g_on) return;
     // A frame of two or more: what the main loop waited for in it (by call
     // site with BBHOST_HLE_COUNT) - streaming and compile hitches, not the

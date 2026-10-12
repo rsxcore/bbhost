@@ -10,6 +10,7 @@
 #include "engine/option_menu.h"
 #include "hle/modules.h"
 #include "host/bindings.h"
+#include "host/gfx_journal.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
@@ -520,6 +521,7 @@ bool vk_create_swapchain() {
     // swapchain) loads d3d12.dll inside vkCreateSwapchainKHR, as happened in
     // shadPS4 on the Radeon 8060S (ReShade's log there, 2026-10-07).
     [[maybe_unused]] const std::string modules_before = host_graphics_modules();
+    gfxj::Scope swapchain_made(gfxj::kSwapchain, sci.imageExtent.width, sci.imageExtent.height);
     if (vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
         host_log("vulkan: swapchain creation failed");
         return false;
@@ -762,7 +764,11 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // waiting on its flips (two runs frozen 20 s into the title, "acquiring an
     // image (43.4 s)"). Past 100 ms this frame is not presented; the game goes
     // on and the next frame tries again.
-    VkResult r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    VkResult r;
+    {
+        gfxj::Scope gj(gfxj::kAcquire);
+        r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
@@ -1027,7 +1033,10 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         host_gpu_wait_submitted(ticket);
     } else {
         host_gpu_queue_lock();
-        vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        {
+            gfxj::Scope gj(gfxj::kSubmit, 0, 0, "presenter");
+            vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        }
         host_gpu_queue_unlock();
         host_gpu_unlock();
         locked = false;
@@ -1064,7 +1073,11 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     pi.pSwapchains = &g_vk.swapchain;
     pi.pImageIndices = &idx;
     present_step("presenting");
-    const VkResult pr = vkQueuePresentKHR(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    VkResult pr;
+    {
+        gfxj::Scope gj(gfxj::kPresent);
+        pr = vkQueuePresentKHR(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    }
     if (queue_held) host_gpu_queue_unlock();
     if (locked) {
         host_gpu_unlock();

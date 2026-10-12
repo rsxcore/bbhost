@@ -1049,6 +1049,7 @@ bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileG
 void check_stale_upload(const Surface& sf);
 
 bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
+    gfxj::Scope gj(gfxj::kTextureUpload, sf.total_src, (static_cast<std::uint64_t>(sf.width) << 16) | sf.height);
     // An earlier upload still being prepared fills its own staging span (the
     // submission waits for it); its hashes are superseded by this one's.
     sf.prep.reset();
@@ -3409,6 +3410,7 @@ void evict_cold_surfaces_locked() {
     bump_view_epoch();
     g_evicted_surfaces += n;
     g_evicted_bytes += freed;
+    gfxj::note(gfxj::kVramEvict, freed, n);
     static int logs = 0;
     if (logs++ < 12)
         host_log("texture: video memory down to the reserve: %llu textures not bound for %llu s evicted (%llu MiB; %llu so far, %llu MiB, "
