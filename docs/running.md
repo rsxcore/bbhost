@@ -237,16 +237,12 @@ held every frame two refreshes behind (`BBHOST_PRESENT_ON_ARRIVAL=0` brings that
 back, to compare). Every 300 flips the log's `pacing:` line says how late the
 clock's ticks woke and how long flips took from queued to shown and to
 completed.
-A flip completes - and what the frame used goes back to the game - only once
-the GPU has rendered that frame: on the console a flip is the GPU reaching it,
-and the game writes the next frames' data over what a completed frame read. A
-loading screen's flips, and those above 60 and Uncapped, do not wait for the
-clock, so they complete as soon as their frame has rendered; the log says how
-many of a loading screen's flips waited (`video: the loading screen's ...
-flips`). `BBHOST_FLIP_AFTER_GPU=0` completes a flip once the frame is recorded,
-as before: the game could then run several frames ahead of the GPU after a
-loading screen and overwrite what it had not read yet, which could hold the
-GPU for minutes.
+A flip completes once the frame is recorded. `BBHOST_FLIP_AFTER_GPU=1` makes it wait until
+the GPU has rendered that frame, as on the console: the game then cannot run
+several frames ahead of the GPU after a loading screen and overwrite what it
+had not read yet, which could hold the GPU for minutes. It is off in this
+fork: with it the game cannot run ahead of the GPU at all, and an RTX 3060
+dropped from 86 to 56 fps in the same scene.
 
 On an NVIDIA RTX card the F10 screen's Graphics section has **DLSS**: DLAA,
 NVIDIA's anti-aliasing at the render resolution, in place of the game's own

@@ -387,10 +387,13 @@ void present_flip(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh
 // read for loop counts and held the GPU for minutes. Now a frame is shown,
 // and what it used handed back to the game, once it is rendered, and how far
 // the game runs ahead is its own swap chain's business, as on the console.
-// BBHOST_FLIP_AFTER_GPU=0: complete on recording, as before.
+// BBHOST_FLIP_AFTER_GPU=1: wait for the GPU. Off by default in this fork: the
+// game could no longer run ahead of the GPU, and on an RTX 3060 the same
+// scene fell from 86 to 56 fps uncapped and missed 60 in the heavy places;
+// flips complete on recording, as before.
 const bool g_flip_after_gpu = [] {
     const char* e = std::getenv("BBHOST_FLIP_AFTER_GPU");
-    return !(e && e[0] == '0');
+    return e && e[0] == '1';
 }();
 std::atomic<std::uint64_t> g_flips_held{0};
 
@@ -445,7 +448,7 @@ void vblank_tick(std::uint64_t vcount) {
                 const std::uint64_t n = g_flips_held.fetch_add(1, std::memory_order_relaxed);
                 if (n == 0 || n % 3600 == 0) {
                     host_log("video: a flip waited a vblank for the GPU to run its frame (%llu vblanks so far; "
-                             "BBHOST_FLIP_AFTER_GPU=0 completes it on recording)",
+                             "BBHOST_FLIP_AFTER_GPU=1 is on)",
                              static_cast<unsigned long long>(n + 1));
                 }
                 continue;  // the GPU has not run the frame yet: a later vblank
@@ -1070,8 +1073,7 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
             g_screen_holds.held.fetch_add(1, std::memory_order_relaxed);
             const std::uint64_t n = g_holds.held.fetch_add(1, std::memory_order_relaxed);
             if (n == 0) {
-                host_log("video: a loading screen's or an uncapped flip waits for its frame on the GPU (BBHOST_FLIP_AFTER_GPU=0 "
-                         "completes it on recording)");
+                host_log("video: a loading screen's or an uncapped flip waits for its frame on the GPU (BBHOST_FLIP_AFTER_GPU=1 is on)");
             } else if (g_flip_uncapped.load() && (n + 1) % 36000 == 0) {
                 host_log("video: %llu of %llu uncapped and loading-screen flips waited for their frame, the longest %.1f ms",
                          static_cast<unsigned long long>(n + 1), static_cast<unsigned long long>(g_holds.flips.load()),
