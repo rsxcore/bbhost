@@ -29,9 +29,12 @@
 namespace gfxj {
 
 const int g_mode = [] {
+    // On, every frame, unless BBHOST_GFX_LOG=0 (this fork's builds are for
+    // catching what a play session did wrong).
     const char* e = std::getenv("BBHOST_GFX_LOG");
-    if (!e || !e[0] || e[0] == '0') return 0;
-    return e[0] == '2' ? 2 : 1;
+    if (!e || !e[0]) return 2;
+    if (e[0] == '0') return 0;
+    return e[0] == '1' ? 1 : 2;
 }();
 
 namespace {
@@ -85,6 +88,7 @@ struct State {
     double hitch_ms = 20.0, event_ms = 0.5;
     std::string cache_drive;  // where the shader caches are written, for the free-space reading
     std::uint64_t seq = 0;
+    std::uint64_t written = 0;
 };
 
 State& st() {
@@ -93,6 +97,25 @@ State& st() {
 }
 
 double ms_of(std::uint64_t ns) { return static_cast<double>(ns) / 1e6; }
+
+// The wall clock now, "HH:MM:SS.mmm" local time: the log has none, and what a
+// player remembers is the time of day.
+std::string wall_clock() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    const int ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
+    return buf;
+}
+
+constexpr std::uint64_t kFullFramesLimit = 400ull << 20;  // bytes: past this only the long and wrong frames
 
 void json_string(std::string& out, const char* s) {
     out += '"';
@@ -158,8 +181,8 @@ void open_file_locked(State& s) {
 #endif
     if (s.cache_drive.empty()) s.cache_drive = base;
     std::string head;
-    append(head, "{\"schema\":\"bbhost-gfx-journal\",\"version\":1,\"mode\":%d,\"hitch_ms\":%.1f,\"event_ms\":%.2f,"
-                 "\"kinds\":[", g_mode, s.hitch_ms, s.event_ms);
+    append(head, "{\"schema\":\"bbhost-gfx-journal\",\"version\":1,\"start\":\"%s\",\"mode\":%d,\"hitch_ms\":%.1f,\"event_ms\":%.2f,"
+                 "\"kinds\":[", wall_clock().c_str(), g_mode, s.hitch_ms, s.event_ms);
     for (int k = 0; k < kCount; ++k) append(head, "%s\"%s\"", k ? "," : "", kNames[k]);
     head += "]}\n";
     std::fputs(head.c_str(), s.file);
@@ -203,6 +226,7 @@ std::unordered_map<std::uint32_t, std::string> thread_names() {
 void write_line_locked(State& s, const std::string& line) {
     if (!s.file) return;
     std::fwrite(line.data(), 1, line.size(), s.file);
+    s.written += line.size();
 }
 
 void add_agg(Agg& a, std::uint64_t ns) {
@@ -292,12 +316,12 @@ void on_flip(std::uint64_t flip) {
         s.second_agg[k].max_ns = std::max(s.second_agg[k].max_ns, s.agg[k].max_ns);
     }
 
-    if (g_mode == 2 || hitch || wrong) {
+    if ((g_mode == 2 && s.written < kFullFramesLimit) || hitch || wrong) {
         std::string line;
         line.reserve(1024);
-        append(line, "{\"flip\":%llu,\"t\":%.3f,\"dt\":%.2f,\"main\":%.2f,\"gpu\":%.2f,\"draws\":%llu,\"disp\":%llu,\"fail\":%llu,\"fallback\":%llu,"
+        append(line, "{\"clk\":\"%s\",\"flip\":%llu,\"t\":%.3f,\"dt\":%.2f,\"main\":%.2f,\"gpu\":%.2f,\"draws\":%llu,\"disp\":%llu,\"fail\":%llu,\"fallback\":%llu,"
                      "\"pipes\":%llu",
-               static_cast<unsigned long long>(flip), std::chrono::duration<double>(now - s.origin).count(), dt, main_ms, gpu_ms,
+               wall_clock().c_str(), static_cast<unsigned long long>(flip), std::chrono::duration<double>(now - s.origin).count(), dt, main_ms, gpu_ms,
                static_cast<unsigned long long>(d_draws), static_cast<unsigned long long>(d_disp), static_cast<unsigned long long>(d_fail),
                static_cast<unsigned long long>(d_fallback), static_cast<unsigned long long>(d_pipes));
         // The command processor's time by phase in the frame, ms.
@@ -360,8 +384,8 @@ void on_flip(std::uint64_t flip) {
         std::sort(top.begin(), top.end(), [](const Ev* x, const Ev* y) { return x->ns > y->ns; });
         std::unordered_map<std::uint32_t, std::string> names = thread_names();
         std::string msg;
-        append(msg, "gfx hitch: flip %llu took %.1f ms (main loop %.1f, gpu busy %.1f; %llu draws, %llu failed, %llu on the fallback pipeline, %llu pipelines made)",
-               static_cast<unsigned long long>(flip), dt, main_ms, gpu_ms, static_cast<unsigned long long>(d_draws),
+        append(msg, "gfx hitch at %s: flip %llu took %.1f ms (main loop %.1f, gpu busy %.1f; %llu draws, %llu failed, %llu on the fallback pipeline, %llu pipelines made)",
+               wall_clock().c_str(), static_cast<unsigned long long>(flip), dt, main_ms, gpu_ms, static_cast<unsigned long long>(d_draws),
                static_cast<unsigned long long>(d_fail), static_cast<unsigned long long>(d_fallback), static_cast<unsigned long long>(d_pipes));
         for (std::size_t i = 0; i < top.size() && i < 5; ++i) {
             const Ev& e = *top[i];
@@ -390,9 +414,9 @@ void on_flip(std::uint64_t flip) {
     if (secs >= 1.0) {
         const SystemMem sm = system_mem();
         std::string line;
-        append(line, "{\"sec\":%llu,\"t\":%.3f,\"frames\":%llu,\"avg\":%.2f,\"worst\":%.2f,\"hitches\":%llu,\"wrong\":%llu,\"gpu_pct\":%.1f,"
+        append(line, "{\"clk\":\"%s\",\"sec\":%llu,\"t\":%.3f,\"frames\":%llu,\"avg\":%.2f,\"worst\":%.2f,\"hitches\":%llu,\"wrong\":%llu,\"gpu_pct\":%.1f,"
                      "\"vram_free_mb\":%lld,\"sys_free_mb\":%lld,\"commit_free_mb\":%lld,\"ws_mb\":%lld,\"disk_free_mb\":%lld,\"ev\":{",
-               static_cast<unsigned long long>(++s.seq), std::chrono::duration<double>(now - s.origin).count(),
+               wall_clock().c_str(), static_cast<unsigned long long>(++s.seq), std::chrono::duration<double>(now - s.origin).count(),
                static_cast<unsigned long long>(s.frames), s.frames ? s.sum_ms / static_cast<double>(s.frames) : 0.0, s.worst_ms,
                static_cast<unsigned long long>(s.hitches), static_cast<unsigned long long>(s.wrong_frames),
                100.0 * s.busy_ms / std::max(1.0, secs * 1000.0), static_cast<long long>(host_gpu_vram_headroom_mb()),

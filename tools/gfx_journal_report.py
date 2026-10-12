@@ -2,6 +2,11 @@
 """Summarises a graphics journal (BBHOST_GFX_LOG, src/host/gfx_journal.h).
 
     tools/gfx_journal_report.py logs/gfx-20261013-001240.jsonl [--skip SECONDS] [--hitch MS]
+    tools/gfx_journal_report.py logs/gfx-....jsonl --at 21:35 [--window SECONDS]
+
+--at lists the seconds and the long frames around a time of day (HH:MM or
+HH:MM:SS, the player's clock; --window, 60 by default, is the span on each
+side), second by second, with the memory readings.
 
 Skips the first SECONDS (default 45: the title and the load), then says how
 the frames went and, for each frame over the hitch limit, what the journal
@@ -37,12 +42,42 @@ def cause(f):
     return parts[0]
 
 
+def seconds_of(clk):
+    h, m, rest = clk.split(':')
+    return int(h) * 3600 + int(m) * 60 + float(rest)
+
+
+def around(path, at, window, hitch):
+    _, frames, seconds = load(path)
+    parts = [int(x) for x in at.split(':')] + [0, 0]
+    centre = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    near = lambda d: abs(seconds_of(d['clk']) - centre) <= window
+    print('seconds near %s (clock, frames, avg/worst ms, hitches, gpu %%, free MiB: video/system/commit/disk, events):' % at)
+    for sec in filter(near, seconds):
+        ev = ' '.join('%s:%d/%.0fms' % (k, v[0], v[1]) for k, v in sec.get('ev', {}).items())
+        print('  %s %3d fr %5.1f/%5.1f %2d hitch gpu %4.1f%%  %5d/%5d/%5d/%6d  %s' % (
+            sec['clk'][:8], sec['frames'], sec['avg'], sec['worst'], sec['hitches'], sec['gpu_pct'], sec['vram_free_mb'],
+            sec['sys_free_mb'], sec['commit_free_mb'], sec['disk_free_mb'], ev))
+    print('long or wrong frames near %s:' % at)
+    for f in filter(near, frames):
+        if f['dt'] >= hitch or f.get('wrong'):
+            c = cause(f)
+            print('  %s flip %-7d %6.1f ms main %5.1f gpu %5.1f draws %-5d fail %-3d fallback %-4d pipes %-3d -> %s %.1f ms%s' % (
+                f['clk'], f['flip'], f['dt'], f.get('main', 0), f['gpu'], f['draws'], f['fail'], f['fallback'], f['pipes'], c[0], c[1],
+                '  WRONG' if f.get('wrong') else ''))
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if not args:
         print(__doc__)
         return 1
     path = args[0]
+    if '--at' in args:
+        window = float(args[args.index('--window') + 1]) if '--window' in args else 60.0
+        hitch = float(args[args.index('--hitch') + 1]) if '--hitch' in args else 20.0
+        return around(path, args[args.index('--at') + 1], window, hitch)
     skip = float(args[args.index('--skip') + 1]) if '--skip' in args else 45.0
     hitch = float(args[args.index('--hitch') + 1]) if '--hitch' in args else 20.0
     head, frames, seconds = load(path)
