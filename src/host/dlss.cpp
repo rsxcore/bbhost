@@ -41,7 +41,8 @@
 //
 // Off unless asked for: BBHOST_DLSS=1 (or the setting). BBHOST_DLSS_DEBUG=mv
 // shows the motion vectors in place of the picture; BBHOST_DLSS_JITTER=0
-// keeps the viewport still (DLSS then only smooths).
+// keeps the viewport still (DLSS then only smooths). BBHOST_DLSS_PRESET=K picks
+// the render preset (letters A-Z; J and K are the transformer models).
 #include "host/gpu_internal.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -709,6 +710,16 @@ bool size_feature_locked(VkCommandBuffer cmd, std::uint32_t w, std::uint32_t h, 
     ngx::set_i(p, "PerfQualityValue", ngx::kPerfQualityDlaa);
     ngx::set_i(p, "DLSS.Feature.Create.Flags", flags);
     ngx::set_i(p, "DLSS.Enable.Output.Subrects", 0);
+    // BBHOST_DLSS_PRESET=<A-Z>: which of NVIDIA's models DLAA runs (J and K are
+    // the transformer ones). Unset, the driver picks.
+    static const unsigned preset = [] {
+        const char* e = std::getenv("BBHOST_DLSS_PRESET");
+        return e && e[0] >= 'A' && e[0] <= 'Z' && !e[1] ? static_cast<unsigned>(e[0] - 'A' + 1) : 0u;
+    }();
+    if (preset) {
+        ngx::set_ui(p, "DLSS.Hint.Render.Preset.DLAA", preset);
+        host_log("dlss: render preset %c", static_cast<char>('A' + preset - 1));
+    }
     const ngx::Result r = g_dlss.create_feature(g.device, cmd, ngx::kFeatureSuperSampling, p, &g_dlss.feature);
     if (!ngx::ok(r) || !g_dlss.feature) {
         host_log("dlss: the DLSS feature could not be made at %ux%u (0x%x)", w, h, r);

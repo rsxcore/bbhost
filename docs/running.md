@@ -259,6 +259,8 @@ SDK release and its SHA-256, kept only when the hash matches - and DLSS starts
 once it is there, in the same run. The Windows package's `get-dlss.bat`
 (`tools/win/get-dlss.ps1`) does the same by hand. Without the file, the card or a recent driver the
 log says why and the game's AA stays.
+`BBHOST_DLSS_PRESET=K` picks the render preset (J and K are the transformer
+models of DLSS 4); unset, the driver chooses.
 
 ## Online
 
